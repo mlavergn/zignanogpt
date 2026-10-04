@@ -397,6 +397,44 @@ def nanochat_import(out):
     write_safetensors(os.path.join(out, "nanochat_import.safetensors"), tensors)
 
 
+# -----------------------------------------------------------------------------
+# Phase 9: chat inference
+
+CALC_EXPRS = [
+    "2*3", "10/2", "2/3", "1,234 * 5", "1,000/4", "-7 // 2", "7 // -2", "7.5 // 2", "-7.5 // 2", "7 // -2.0",
+    "100000000000000000 * 10", "10000000000000000.0", "123456789.123456789", "0.000015", ".0001", "5.",
+    "1/3*3", "0.1 * 3", "1/7", "2/3*100000000000000000", "-1/3000000", "3.14159 * 2", "(((1+2)))",
+    "3 -- 2", "+-+5", " 12 + 3", "-0.0", "0 * -1.5", "00", "0.5", "2 ** 10", "1/0", "1//0", "1.0//0",
+    "007", "2(3)", "(2)(3)", "", "   ", "1.5.5", "1 2", "1 / / 2", "1e5",
+    "'strawberry'.count('r')", "\"banana\".count(\"an\")", "'abc'.count('')", "'a' 'b'.count('a')",
+    "'Mississippi' . count ( 'ss' )", "'abc'.upper()", "x.count('a')", "len('abc')", "__import__('os')",
+    "'open'.count('o')",
+]
+ENGINE_PROMPTS = ["The capital of France is", "Hello"]
+
+
+@fixture
+def engine(out):
+    """use_calculator on edge-case expressions; Engine greedy generations on the d2 import model."""
+    import torch
+    os.environ["NANOCHAT_BASE_DIR"] = os.path.join(out, "nanochat_base")
+    from nanochat.engine import Engine, use_calculator
+    from nanochat.checkpoint_manager import build_model
+    calculator = []
+    for expr in CALC_EXPRS:
+        result = use_calculator(expr)
+        calculator.append([expr, None if result is None else str(result)])
+    model, tokenizer, _ = build_model(os.path.join(out, "nanochat_base", "base_checkpoints", "d2"), 5, torch.device("cpu"), "eval")
+    engine = Engine(model, tokenizer)
+    generations = []
+    for prompt in ENGINE_PROMPTS:
+        tokens = tokenizer.encode(prompt, prepend=tokenizer.get_bos_token_id())
+        results, masks = engine.generate_batch(tokens, num_samples=2, max_tokens=24, temperature=0.0)
+        generations.append({"prompt": prompt, "tokens": tokens, "results": results, "masks": masks})
+    with open(os.path.join(out, "engine.json"), "w") as f:
+        json.dump({"calculator": calculator, "generations": generations}, f, indent=1)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", default="testdata", help="output directory")

@@ -214,9 +214,90 @@ pub const Gpt = struct {
         try be.embeddingBackward(grads.wte, g.demb, idx);
     }
 
-    /// Greedy decoding without a KV cache: each step runs the whole forward
-    /// pass over the sequence so far, padded to its final length (causal
-    /// attention keeps the padding from mattering), and appends the argmax.
+    /// One cached forward step (nanochat's `forward(idx, kv_cache=...)`): feeds
+    /// `[B, T]` new tokens at the cache's position, appends their keys and
+    /// values, and leaves each row's last-position logits in `bufs.logits`.
+    /// Prefill with `B = 1`, decode with `T = 1`.
+    ///
+    /// Parameters:
+    /// - `self`: the model.
+    /// - `cache`: the KV cache; its position advances by `T`.
+    /// - `bufs`: scratch sized for `[B, T]`.
+    /// - `idx`: `[B, T]` i32 token ids.
+    ///
+    /// Return: nothing; `error.CacheFull`, shape and backend errors.
+    pub fn forwardStep(self: *Self, cache: *mod.KvCache, bufs: *mod.InferenceBuffers, idx: mod.Tensor) !void {
+        const be = self.backend;
+        const cfg = self.config;
+        const w = &self.weights;
+        const eps = mod.GptConfig.rms_eps;
+        const b = bufs.batch;
+        const t = bufs.seq;
+        const bt = b * t;
+        const c = cfg.n_embd;
+        const kv = cfg.kvDim();
+        const pos = cache.pos;
+        if (idx.numel() != bt or cache.batch != b) return error.ShapeMismatch;
+        if (t > 1 and b > 1) return error.ShapeMismatch; // prefill is batch 1
+        if (pos + t > cache.max_seq) return error.CacheFull;
+
+        try be.embedding(bufs.emb, w.wte, idx);
+        try be.rmsnorm(bufs.emb_norm, bufs.emb, eps);
+        const flat = try bufs.emb_norm.reshape(&.{ bt, c });
+        if (t > 1) {
+            try be.gateLinear(bufs.gate, flat, w.smear_gate);
+            try be.smear(bufs.x0, bufs.emb_norm, bufs.gate, mod.Scalar.of(w.smear_lambda, 1));
+        } else if (cache.has_prev) {
+            try be.gateLinear(bufs.gate, flat, w.smear_gate);
+            try be.gatedAdd(bufs.x0, bufs.emb_norm, cache.prev, bufs.gate, mod.Scalar.of(w.smear_lambda, 1));
+        } else {
+            try be.copy(bufs.x0, bufs.emb_norm);
+        }
+        // The last token's pre-smear embedding is the next step's "previous".
+        try be.copy(cache.prev, try flat.rows(bt - b, b));
+        cache.has_prev = true;
+
+        try be.copy(bufs.x, bufs.x0);
+        for (w.layers, 0..) |layer, i| {
+            try be.combine(bufs.x_in, bufs.x, mod.Scalar.of(try w.resid_lambdas.rows(i, 1), 1), bufs.x0, mod.Scalar.of(try w.x0_lambdas.rows(i, 1), 1));
+            try be.rmsnorm(bufs.xn, bufs.x_in, eps);
+            try be.matmul(try bufs.q.reshape(&.{ bt, c }), bufs.xn, layer.c_q, .{ .transpose_b = true });
+            try be.matmul(try bufs.k.reshape(&.{ bt, kv }), bufs.xn, layer.c_k, .{ .transpose_b = true });
+            try be.matmul(try bufs.v.reshape(&.{ bt, kv }), bufs.xn, layer.c_v, .{ .transpose_b = true });
+            if (layer.value_embed) |table| {
+                try be.embedding(bufs.ve, table, idx);
+                try be.gateLinear(bufs.ve_gate, try bufs.xn.reshape(&.{ bt, c }), layer.ve_gate.?);
+                try be.valueMix(bufs.v, bufs.ve, bufs.ve_gate);
+            }
+            try be.rope(bufs.q, bufs.q, self.cos, self.sin, pos);
+            try be.rope(bufs.k, bufs.k, self.cos, self.sin, pos);
+            try be.rmsnorm(bufs.q, bufs.q, eps);
+            try be.rmsnorm(bufs.k, bufs.k, eps);
+            try be.scale(bufs.q, bufs.q, mod.GptConfig.qk_scale);
+            try be.scale(bufs.k, bufs.k, mod.GptConfig.qk_scale);
+            try cache.write(i, bufs.k, bufs.v);
+            const l = cache.layers[i];
+            try be.attention(bufs.y, bufs.q, l.k, l.v, null, .{ .window = cfg.windowSize(i), .keys = pos + t });
+            try be.matmul(bufs.tmp, try bufs.y.reshape(&.{ bt, c }), layer.c_proj, .{ .transpose_b = true });
+            try be.add(bufs.x_mid, bufs.x_in, bufs.tmp);
+            try be.rmsnorm(bufs.xn, bufs.x_mid, eps);
+            try be.matmul(bufs.h, bufs.xn, layer.c_fc, .{ .transpose_b = true });
+            try be.reluSquare(bufs.h, bufs.h);
+            try be.matmul(bufs.tmp, bufs.h, layer.mlp_proj, .{ .transpose_b = true });
+            try be.add(bufs.x, bufs.x_mid, bufs.tmp);
+            if (i == cfg.backoutLayer()) try be.copy(bufs.x_backout, bufs.x);
+        }
+        cache.pos += t;
+        try be.combine(bufs.x_final, bufs.x, mod.Scalar.constant(1), bufs.x_backout, mod.Scalar.of(w.backout_lambda, -1));
+        try be.rmsnorm(bufs.x_final, bufs.x_final, eps);
+        // Only each row's last position: row T-1 (B = 1) or every row (T = 1).
+        const last = try (try bufs.x_final.reshape(&.{ bt, c })).rows(bt - b, b);
+        try be.matmul(bufs.logits_pad, last, w.lm_head, .{ .transpose_b = true });
+        try be.softcap(bufs.logits, bufs.logits_pad, mod.GptConfig.softcap);
+    }
+
+    /// Greedy decoding with a KV cache (nanochat's `generate` at temperature 0),
+    /// for the training samples; chat goes through `Engine`.
     ///
     /// Parameters:
     /// - `self`: the model.
@@ -231,28 +312,36 @@ pub const Gpt = struct {
         if (prompt.len == 0) return error.EmptyPrompt;
         const len = @min(prompt.len + max_new, self.config.sequence_len);
         if (len <= prompt.len) return allocator.alloc(u32, 0);
-        var acts = try mod.GptActivations.init(allocator, self.backend, self.config, 1, len);
-        defer acts.deinit();
-        const ids = try allocator.alloc(i32, len);
+        const be = self.backend;
+        var cache = try mod.KvCache.init(allocator, be, self.config, 1, len);
+        defer cache.deinit();
+        var pre = try mod.InferenceBuffers.init(allocator, be, self.config, 1, prompt.len);
+        defer pre.deinit();
+        var step = try mod.InferenceBuffers.init(allocator, be, self.config, 1, 1);
+        defer step.deinit();
+        const ids = try allocator.alloc(i32, prompt.len);
         defer allocator.free(ids);
-        @memset(ids, 0);
-        for (prompt, 0..) |t, i| ids[i] = @intCast(t);
-        const idx = try self.backend.alloc(.i32, &.{ 1, len });
-        defer self.backend.free(idx);
+        for (prompt, ids) |t, *d| d.* = @intCast(t);
+        const idx_pre = try be.alloc(.i32, &.{ 1, prompt.len });
+        defer be.free(idx_pre);
+        const idx = try be.alloc(.i32, &.{ 1, 1 });
+        defer be.free(idx);
         const row = try allocator.alloc(f32, self.config.vocab_size);
         defer allocator.free(row);
+
+        try be.upload(idx_pre, i32, ids);
+        try self.forwardStep(&cache, &pre, idx_pre);
+        try be.download(pre.logits, f32, row);
         var out: std.ArrayList(u32) = .empty;
         errdefer out.deinit(allocator);
-        var n = prompt.len;
-        while (n < len) : (n += 1) {
-            try self.backend.upload(idx, i32, ids);
-            try self.forward(&acts, idx);
-            const logits = try acts.logits.reshape(&.{ len, self.config.vocab_size });
-            try self.backend.download(try logits.rows(n - 1, 1), f32, row);
+        while (true) {
             const next: u32 = @intCast(std.mem.indexOfMax(f32, row));
             if (stop != null and next == stop.?) break;
             try out.append(allocator, next);
-            ids[n] = @intCast(next);
+            if (prompt.len + out.items.len >= len) break;
+            try be.upload(idx, i32, &.{@as(i32, @intCast(next))});
+            try self.forwardStep(&cache, &step, idx);
+            try be.download(step.logits, f32, row);
         }
         return out.toOwnedSlice(allocator);
     }
@@ -535,6 +624,73 @@ test "gpt loss and every parameter gradient match pytorch" {
     const after = try downloadAlloc(allocator, &backend, grads.lm_head);
     defer allocator.free(after);
     for (before, after) |b, a| try std.testing.expectApproxEqAbs(2 * b, a, 1e-6 + 1e-5 * @abs(b));
+}
+
+test "gpt cached steps reproduce the full forward pass" {
+    const allocator = std.testing.allocator;
+    var file = try mod.SafeTensors.load(allocator, std.testing.io, mod.build_options.source_root ++ "/testdata/gpt.safetensors");
+    defer file.deinit();
+    const config = try fixtureConfig(&file);
+    var backend = try mod.Backend.init(allocator, std.testing.io, .{});
+    defer backend.deinit();
+    var model = try mod.Gpt.init(allocator, &backend, config);
+    defer model.deinit();
+    try model.weights.load(allocator, &file, "");
+    const want = try file.readAlloc(allocator, "logits", f32); // [2, seq, V], full forward
+    defer allocator.free(want);
+    const ids = try file.readAlloc(allocator, "idx", i32);
+    defer allocator.free(ids);
+    const seq = try file.metadataInt(usize, "seq");
+    const vocab = config.vocab_size;
+
+    // Row 0: prefill most of it (past the short window), then decode the rest one by one.
+    var cache = try mod.KvCache.init(allocator, &backend, config, 1, seq);
+    defer cache.deinit();
+    const prefill = seq - 20;
+    var pre = try mod.InferenceBuffers.init(allocator, &backend, config, 1, prefill);
+    defer pre.deinit();
+    var step = try mod.InferenceBuffers.init(allocator, &backend, config, 1, 1);
+    defer step.deinit();
+    const idx_pre = try backend.alloc(.i32, &.{ 1, prefill });
+    defer backend.free(idx_pre);
+    const idx_one = try backend.alloc(.i32, &.{ 1, 1 });
+    defer backend.free(idx_one);
+    const got = try allocator.alloc(f32, vocab);
+    defer allocator.free(got);
+    try backend.upload(idx_pre, i32, ids[0..prefill]);
+    try model.forwardStep(&cache, &pre, idx_pre);
+    try backend.download(pre.logits, f32, got);
+    try expectMatches("prefill", want[(prefill - 1) * vocab ..][0..vocab], got, 5e-5);
+    for (prefill..seq) |p| {
+        try backend.upload(idx_one, i32, ids[p..][0..1]);
+        try model.forwardStep(&cache, &step, idx_one);
+        try backend.download(step.logits, f32, got);
+        try expectMatches("decode", want[p * vocab ..][0..vocab], got, 5e-5);
+    }
+    try std.testing.expectError(error.CacheFull, model.forwardStep(&cache, &step, idx_one));
+
+    // Row 1: one shared prefill copied into two rows, then a batched decode step.
+    var shared = try mod.KvCache.init(allocator, &backend, config, 1, 64);
+    defer shared.deinit();
+    var short = try mod.InferenceBuffers.init(allocator, &backend, config, 1, 40);
+    defer short.deinit();
+    const idx40 = try backend.alloc(.i32, &.{ 1, 40 });
+    defer backend.free(idx40);
+    try backend.upload(idx40, i32, ids[seq..][0..40]);
+    try model.forwardStep(&shared, &short, idx40);
+    var both = try mod.KvCache.init(allocator, &backend, config, 2, 64);
+    defer both.deinit();
+    try both.copyFrom(&shared);
+    var step2 = try mod.InferenceBuffers.init(allocator, &backend, config, 2, 1);
+    defer step2.deinit();
+    const idx2 = try backend.alloc(.i32, &.{ 2, 1 });
+    defer backend.free(idx2);
+    const got2 = try allocator.alloc(f32, 2 * vocab);
+    defer allocator.free(got2);
+    try backend.upload(idx2, i32, &.{ ids[seq + 40], ids[seq + 40] });
+    try model.forwardStep(&both, &step2, idx2);
+    try backend.download(step2.logits, f32, got2);
+    for (0..2) |r| try expectMatches("batched decode", want[(seq + 40) * vocab ..][0..vocab], got2[r * vocab ..][0..vocab], 5e-5);
 }
 
 test "gpt init weights follows nanochat's scheme" {

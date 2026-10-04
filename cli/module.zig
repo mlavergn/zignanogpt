@@ -8,6 +8,13 @@ pub const nanogpt = @import("zignanogpt");
 pub const vaxis = @import("zigvaxis");
 
 pub const Args = @import("args.zig").Args;
+pub const Chat = @import("chat.zig").Chat;
+pub const ChatJob = @import("chat_job.zig").ChatJob;
+pub const ChatRole = @import("chat_job.zig").ChatRole;
+pub const ChatSettings = @import("chat.zig").ChatSettings;
+pub const ChatSnapshot = @import("chat_job.zig").ChatSnapshot;
+pub const ChatState = @import("chat_job.zig").ChatState;
+pub const ChatTurn = @import("chat_job.zig").ChatTurn;
 pub const Command = @import("command.zig").Command;
 pub const Console = @import("console.zig").Console;
 pub const ConsoleApp = @import("console_app.zig").ConsoleApp;

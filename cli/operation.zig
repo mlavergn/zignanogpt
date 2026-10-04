@@ -95,7 +95,20 @@ pub const Operation = struct {
                 .{ .flag = "", .label = "more options", .hint = "any other base_train flags, e.g. --matrix-lr 0.03" },
             },
         },
-        .{ .title = "Chat", .summary = "Talk to a trained model.", .command = .chat },
+        .{
+            .title = "Chat",
+            .summary = "Talk to a trained model (chat_cli.py); runs beside other jobs.",
+            .command = .chat,
+            .fields = &.{
+                .{ .flag = "source", .label = "source", .hint = "base, sft or rl; empty: sft, or base while there is none" },
+                .{ .flag = "model-tag", .label = "model tag", .hint = "empty: the largest d<N>" },
+                .{ .flag = "step", .label = "step", .hint = "empty: the last" },
+                .{ .flag = "temperature", .label = "temperature", .default = "0.6", .hint = "0 is greedy" },
+                .{ .flag = "top-k", .label = "top-k", .default = "50", .hint = "0 samples from every token" },
+                .{ .flag = "max-tokens", .label = "max tokens", .default = "256", .hint = "per reply" },
+                .{ .flag = "threads", .label = "threads", .hint = "empty: one per CPU" },
+            },
+        },
         .{ .title = "Evaluate model", .summary = "Base model bpb and CORE.", .command = .eval },
         .{ .title = "Fine-tune (SFT)", .summary = "Supervised fine-tuning on conversations.", .command = .sft },
         .{ .title = "Evaluate chat", .summary = "ARC, MMLU and GSM8K.", .command = .@"chat-eval" },
@@ -168,5 +181,6 @@ test "operation forms become command-line arguments" {
     const toggled = try import.args(arena.allocator(), &.{ "", "base", "", "", "yes" });
     try std.testing.expectEqualStrings("--tokenizer-only", toggled[2]);
     for (Operation.all) |op| try std.testing.expect(op.fields.len <= Operation.max_fields);
-    try std.testing.expectEqual(@as(?u8, 9), Operation.all[Operation.indexOf(.chat).?].phase());
+    try std.testing.expectEqual(@as(?u8, null), Operation.all[Operation.indexOf(.chat).?].phase());
+    try std.testing.expectEqual(@as(?u8, 10), Operation.all[Operation.indexOf(.sft).?].phase());
 }

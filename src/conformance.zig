@@ -42,7 +42,7 @@ pub const Conformance = struct {
         "rmsnormBackward",   "ropeBackward",       "attentionBackward", "reluSquareBackward",
         "dot",               "gateLinearBackward", "smearBackward",     "valueMixBackward",
         "embeddingBackward", "adamwStep",          "muonMomentum",      "muonPrepare",
-        "muonFinish",        "crossEntropyRows",
+        "muonFinish",        "crossEntropyRows",   "gatedAdd",
     };
 
     /// Fails compilation when `B` misses part of the contract.
@@ -187,6 +187,18 @@ pub const Conformance = struct {
         const b = 0.5 * sigmoid(-1);
         try expectClose(&.{ 1, 2, 9, 3 + a * 1, 4 + a * 2, 9 + a * 9, 5 + b * 3, 6 + b * 4, 9 + b * 9 }, sm, 1e-6);
         try std.testing.expectError(error.Aliasing, backend.smear(x, x, g1, mod.Scalar.of(lam, 1)));
+
+        // gatedAdd: out = x + lambda * sigmoid(gate) * y, row by row (in place).
+        const ga = try tensorFrom(B, backend, f32, &.{ 2, 2 }, &.{ 1, 2, 3, 4 });
+        defer backend.free(ga);
+        const gb = try tensorFrom(B, backend, f32, &.{ 2, 2 }, &.{ 10, 20, 30, 40 });
+        defer backend.free(gb);
+        const gg = try tensorFrom(B, backend, f32, &.{ 2, 1 }, &.{ 0, -1 });
+        defer backend.free(gg);
+        try backend.gatedAdd(ga, ga, gb, gg, mod.Scalar.of(lam, 1));
+        const added = try hostCopy(B, backend, allocator, ga);
+        defer allocator.free(added);
+        try expectClose(&.{ 1 + a * 10, 2 + a * 20, 3 + b * 30, 4 + b * 40 }, added, 1e-5);
 
         // v: [R=3, H=2, D=1] += 3 * sigmoid(gate) * ve
         const v = try tensorFrom(B, backend, f32, &.{ 3, 2 }, &.{ 1, 1, 1, 1, 1, 1 });

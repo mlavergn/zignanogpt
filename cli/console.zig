@@ -41,6 +41,13 @@ pub const Console = struct {
             job.deinit();
             init.gpa.destroy(job);
         };
+        const chat = try init.gpa.create(cli.ChatJob);
+        chat.init(init.gpa, init.io);
+        // Stops a reply; waits for a load to finish.
+        defer {
+            chat.deinit();
+            init.gpa.destroy(chat);
+        }
 
         var stopping_train = false;
         {
@@ -60,7 +67,7 @@ pub const Console = struct {
 
             const console = try init.gpa.create(cli.ConsoleApp);
             defer init.gpa.destroy(console);
-            console.* = try cli.ConsoleApp.create(init.gpa, init, job);
+            console.* = try cli.ConsoleApp.create(init.gpa, init, job, chat);
             defer console.deinit();
             console.pending_start = start;
             try app.run(console.widget(), .{});

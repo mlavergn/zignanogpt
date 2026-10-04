@@ -1,7 +1,8 @@
 // ---------------------------------------------------------------------------
 // zig build bench: backend matmul throughput (GFLOP/s) on the shapes the model
 // runs, single-threaded and on every core. Always built ReleaseFast.
-// Shapes follow the CPU preset (depth 6, n_embd 384, batch 32 x seq 512).
+// Shapes follow the CPU preset (depth 6, n_embd 384, batch 32 x seq 512),
+// plus single-token decoding at d20.
 // ---------------------------------------------------------------------------
 
 const std = @import("std");
@@ -27,6 +28,9 @@ const cases = [_]Case{
     .{ .name = "input grad dy@W ", .m = 16384, .n = 384, .k = 1536 },
     .{ .name = "wgrad   dy^T@x +=", .m = 1536, .n = 384, .k = 16384, .options = .{ .transpose_a = true, .accumulate = true } },
     .{ .name = "square 1024", .m = 1024, .n = 1024, .k = 1024 },
+    // Chat decoding: one token through a d20 model (n_embd 1280), memory-bound.
+    .{ .name = "decode fc  x@W^T", .m = 1, .n = 5120, .k = 1280, .options = .{ .transpose_b = true } },
+    .{ .name = "decode head x@W^T", .m = 1, .n = 32768, .k = 1280, .options = .{ .transpose_b = true } },
 };
 
 const runs = 5;

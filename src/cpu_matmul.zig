@@ -16,6 +16,11 @@ const tn = 256;
 
 const Vec = @Vector(nr, f32);
 
+/// Rows of A at most for the matrix-vector path (decoding one token per row).
+const gemv_rows = 4;
+/// Columns of C per matrix-vector work item.
+const gemv_cols = 32;
+
 /// Whether the target fuses multiply-add; without it `@mulAdd` is a libcall.
 const has_fma = switch (builtin.cpu.arch) {
     .aarch64 => true,
@@ -31,6 +36,10 @@ const has_fma = switch (builtin.cpu.arch) {
 /// then a `mr x nr` register-blocked kernel sweeps them. With `mr = 6`,
 /// `nr = 16` the accumulators fit the vector registers of both NEON (32 x 128
 /// bit) and AVX2 (16 x 256 bit).
+///
+/// A few rows times a transposed weight (`x @ W^T` while decoding) is memory
+/// bound instead: there each output is a contiguous dot product, and work
+/// items are column blocks, so every weight row is streamed once.
 pub const CpuMatmul = struct {
     const Self = @This();
 
@@ -61,9 +70,47 @@ pub const CpuMatmul = struct {
             if (!self.options.accumulate) @memset(self.c[0 .. self.m * self.n], 0);
             return;
         }
+        if (self.m <= gemv_rows and self.options.transpose_b and !self.options.transpose_a) {
+            return parallel.run(divCeil(self.n, gemv_cols), self, gemvWork);
+        }
         const tiles = divCeil(self.m, tm);
         const tiles_n = divCeil(self.n, tn);
         try parallel.run(tiles * tiles_n, self, tileWork);
+    }
+
+    /// `Parallel` work item: `gemv_cols` columns of C, every row.
+    fn gemvWork(self: *const Self, index: usize, worker: usize) void {
+        _ = worker;
+        const col0 = index * gemv_cols;
+        for (col0..@min(col0 + gemv_cols, self.n)) |j| {
+            const w = self.b[j * self.k ..][0..self.k];
+            for (0..self.m) |i| {
+                const v = self.options.alpha * dot(self.a[i * self.k ..][0..self.k], w);
+                const dst = &self.c[i * self.n + j];
+                dst.* = if (self.options.accumulate) dst.* + v else v;
+            }
+        }
+    }
+
+    /// `sum(x * w)` with four vector accumulators.
+    fn dot(x: []const f32, w: []const f32) f32 {
+        var acc: [4]Vec = @splat(@as(Vec, @splat(0)));
+        var i: usize = 0;
+        while (i + 4 * nr <= x.len) : (i += 4 * nr) {
+            inline for (0..4) |u| {
+                const xv: Vec = x[i + u * nr ..][0..nr].*;
+                const wv: Vec = w[i + u * nr ..][0..nr].*;
+                acc[u] = if (has_fma) @mulAdd(Vec, xv, wv, acc[u]) else acc[u] + xv * wv;
+            }
+        }
+        while (i + nr <= x.len) : (i += nr) {
+            const xv: Vec = x[i..][0..nr].*;
+            const wv: Vec = w[i..][0..nr].*;
+            acc[0] = if (has_fma) @mulAdd(Vec, xv, wv, acc[0]) else acc[0] + xv * wv;
+        }
+        var sum = @reduce(.Add, (acc[0] + acc[1]) + (acc[2] + acc[3]));
+        while (i < x.len) : (i += 1) sum += x[i] * w[i];
+        return sum;
     }
 
     /// `Parallel` work item: one tile.
@@ -246,6 +293,7 @@ test "cpu matmul matches the reference for every layout and edge size" {
 
 test "cpu matmul scales and accumulates" {
     try checkCase(50, 40, 30, .{ .alpha = -0.5, .accumulate = true }, 2);
+    try checkCase(3, 70, 200, .{ .transpose_b = true, .alpha = 2, .accumulate = true }, 2);
     try checkCase(50, 40, 300, .{ .transpose_a = true, .accumulate = true }, 1);
 }
 

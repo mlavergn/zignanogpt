@@ -8,7 +8,7 @@ const Span = vxfw.RichText.TextSpan;
 const Style = cli.TuiStyle;
 
 /// Which pane the keys go to.
-pub const Focus = enum { nav, form };
+pub const Focus = enum { nav, form, chat };
 
 /// A job to start as soon as the console is up (`zignanogpt train` on a terminal).
 pub const ConsoleStart = struct {
@@ -35,6 +35,7 @@ pub const ConsoleApp = struct {
     allocator: std.mem.Allocator,
     init: std.process.Init,
     job: *cli.Job,
+    chat: *cli.ChatJob,
     overview: cli.Overview,
     nav: usize = 0,
     focus: Focus = .nav,
@@ -48,6 +49,9 @@ pub const ConsoleApp = struct {
     quit_armed: bool = false,
     last_state: cli.JobState = .idle,
     pending_start: ?ConsoleStart = null,
+    /// The chat page's message being typed.
+    input: std.ArrayList(u8) = .empty,
+    last_chat: cli.ChatState = .idle,
 
     /// Creates the console with every form at its defaults.
     ///
@@ -55,10 +59,11 @@ pub const ConsoleApp = struct {
     /// - `allocator`: owns the form values.
     /// - `init`: process state for jobs and the overview.
     /// - `job`: the job slot (stable address).
+    /// - `chat`: the chat (stable address).
     ///
     /// Return: the app; allocation errors.
-    pub fn create(allocator: std.mem.Allocator, init: std.process.Init, job: *cli.Job) !Self {
-        var self = Self{ .allocator = allocator, .init = init, .job = job, .overview = cli.Overview.init(allocator), .values = undefined };
+    pub fn create(allocator: std.mem.Allocator, init: std.process.Init, job: *cli.Job, chat: *cli.ChatJob) !Self {
+        var self = Self{ .allocator = allocator, .init = init, .job = job, .chat = chat, .overview = cli.Overview.init(allocator), .values = undefined };
         for (&self.values, operations) |*row, op| {
             for (row, 0..) |*v, i| {
                 v.* = .empty;
@@ -71,6 +76,7 @@ pub const ConsoleApp = struct {
     pub fn deinit(self: *Self) void {
         for (&self.values) |*row| for (row) |*v| v.deinit(self.allocator);
         self.edit.deinit(self.allocator);
+        self.input.deinit(self.allocator);
         self.overview.deinit();
     }
 
@@ -151,8 +157,15 @@ pub const ConsoleApp = struct {
                     if (state != .running) self.overview.refresh(self.init);
                     self.last_state = state;
                 }
+                const chat = self.chat.currentState();
+                if (chat != self.last_chat) {
+                    // A finished load opens the conversation.
+                    if (self.last_chat == .loading and chat == .ready and operations[self.nav].command == .chat and self.focus != .nav) self.focus = .chat;
+                    self.last_chat = chat;
+                }
                 ctx.redraw = true;
-                try ctx.tick(if (state == .running) 250 else 1000, self.widget());
+                const interval: u32 = if (chat == .replying) 100 else if (state == .running or chat == .loading) 250 else 1000;
+                try ctx.tick(interval, self.widget());
             },
             .key_press => |key| {
                 try self.handleKey(ctx, key);
@@ -168,6 +181,7 @@ pub const ConsoleApp = struct {
             return;
         }
         if (self.editing) return self.handleEditKey(key);
+        if (self.focus == .chat) return self.handleChatKey(key);
         const armed = self.quit_armed;
         self.quit_armed = false;
         self.notice = null;
@@ -182,7 +196,9 @@ pub const ConsoleApp = struct {
                     self.nav = (self.nav + 1) % operations.len;
                     self.field = 0;
                 } else if (key.matches(vaxis.Key.right, .{}) or key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.tab, .{})) {
-                    if (op.command != null and op.phase() == null) self.focus = .form;
+                    if (op.command == .chat and self.chatOpen()) {
+                        self.focus = .chat;
+                    } else if (op.command != null and op.phase() == null) self.focus = .form;
                 } else if (key.matches('r', .{})) {
                     if (op.command == null) self.overview.refresh(self.init) else try self.run(self.nav);
                 } else if (key.matches('q', .{}) or key.matches(vaxis.Key.escape, .{})) {
@@ -196,7 +212,7 @@ pub const ConsoleApp = struct {
                 } else if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{}) or key.matches(vaxis.Key.tab, .{})) {
                     self.field = (self.field + 1) % rows;
                 } else if (key.matches(vaxis.Key.left, .{}) or key.matches(vaxis.Key.escape, .{})) {
-                    self.focus = .nav;
+                    self.focus = if (op.command == .chat and self.chatOpen()) .chat else .nav;
                 } else if (key.matches('r', .{})) {
                     try self.run(self.nav);
                 } else if (key.matches(vaxis.Key.enter, .{}) or key.matches(' ', .{})) {
@@ -219,7 +235,58 @@ pub const ConsoleApp = struct {
                     return self.quit(ctx, armed);
                 }
             },
+            .chat => unreachable,
         }
+    }
+
+    /// The chat page's keys: typing, enter sends (`quit`/`exit` leave,
+    /// `clear` forgets the conversation), esc stops a reply or leaves.
+    fn handleChatKey(self: *Self, key: vaxis.Key) !void {
+        self.notice = null;
+        const state = self.chat.currentState();
+        if (key.matches(vaxis.Key.escape, .{})) {
+            if (state == .replying) {
+                self.chat.requestStop();
+            } else self.focus = .nav;
+        } else if (key.matches(vaxis.Key.tab, .{})) {
+            self.focus = .form;
+        } else if (key.matches(vaxis.Key.enter, .{})) {
+            const text = std.mem.trim(u8, self.input.items, " \t");
+            if (std.ascii.eqlIgnoreCase(text, "quit") or std.ascii.eqlIgnoreCase(text, "exit")) {
+                self.input.clearRetainingCapacity();
+                self.focus = .nav;
+                return;
+            }
+            if (state != .ready) {
+                self.setNotice(true, if (state == .replying) "wait for the reply (esc stops it)" else "load a model first (tab: settings)");
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(text, "clear")) {
+                try self.chat.clear();
+            } else if (text.len > 0) {
+                try self.chat.send(text);
+            }
+            self.input.clearRetainingCapacity();
+        } else if (key.matches(vaxis.Key.backspace, .{})) {
+            var n = self.input.items.len;
+            while (n > 0) {
+                n -= 1;
+                if (self.input.items[n] & 0xC0 != 0x80) break;
+            }
+            self.input.shrinkRetainingCapacity(n);
+        } else if (key.matches('u', .{ .ctrl = true })) {
+            self.input.clearRetainingCapacity();
+        } else if (key.text) |text| {
+            try self.input.appendSlice(self.allocator, text);
+        }
+    }
+
+    /// Whether the chat has a model (loading, ready or replying).
+    fn chatOpen(self: *Self) bool {
+        return switch (self.chat.currentState()) {
+            .loading, .ready, .replying => true,
+            .idle, .failed => false,
+        };
     }
 
     fn handleEditKey(self: *Self, key: vaxis.Key) !void {
@@ -253,15 +320,27 @@ pub const ConsoleApp = struct {
             self.setNotice(true, try std.fmt.allocPrint(self.init.arena.allocator(), "{s} arrives in PLAN.md phase {d}", .{ op.title, p }));
             return;
         }
-        if (self.job.running()) {
-            self.setNotice(true, "a job is already running (s stops training)");
-            return;
-        }
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         var values: [cli.Operation.max_fields][]const u8 = undefined;
         for (op.fields, 0..) |_, i| values[i] = self.values[index][i].items;
         const args = try op.args(arena.allocator(), values[0..op.fields.len]);
+        if (command == .chat) {
+            // The chat runs beside jobs, on its own worker.
+            if (self.chat.busy()) {
+                self.setNotice(true, "the chat is busy (esc stops a reply)");
+                return;
+            }
+            try self.chat.load(self.init, args);
+            self.last_chat = .loading;
+            self.input.clearRetainingCapacity();
+            self.setNotice(false, "loading the model");
+            return;
+        }
+        if (self.job.running()) {
+            self.setNotice(true, "a job is already running (s stops training)");
+            return;
+        }
         log.debug("starting {s} with {d} arguments", .{ op.title, args.len });
         try self.job.start(self.init, index, command, args);
         self.last_state = .running;
@@ -281,6 +360,7 @@ pub const ConsoleApp = struct {
 
     /// Quits; while a job runs, only on the second `q` (`armed`).
     fn quit(self: *Self, ctx: *vxfw.EventContext, armed: bool) void {
+        self.chat.requestStop();
         if (self.job.running() and !armed) {
             self.quit_armed = true;
             self.setNotice(true, "a job is running: q again quits (training saves a checkpoint first)");
@@ -340,7 +420,12 @@ pub const ConsoleApp = struct {
         });
         const dim = entry.phase() != null;
         try spans.append(a, .{ .text = entry.title, .style = .{ .fg = if (dim) Style.secondaryText.color() else Style.primaryText.color(), .bold = on_cursor } });
-        const tag: Span = if (self.job.operation == index) switch (self.job.currentState()) {
+        const tag: Span = if (entry.command == .chat) switch (self.chat.currentState()) {
+            .loading, .replying => .{ .text = "●", .style = Style.warningText.style() },
+            .ready => .{ .text = "✔", .style = Style.successText.style() },
+            .failed => .{ .text = "✗", .style = Style.errorText.style() },
+            .idle => .{ .text = "" },
+        } else if (self.job.operation == index) switch (self.job.currentState()) {
             .running => .{ .text = "●", .style = Style.warningText.style() },
             .succeeded => .{ .text = "✔", .style = Style.successText.style() },
             .failed => .{ .text = "✗", .style = Style.errorText.style() },
@@ -376,27 +461,18 @@ pub const ConsoleApp = struct {
             return self.block(ctx, row, col, width, height, lines.items);
         }
 
-        const form_focus = self.focus == .form;
-        for (op.fields, 0..) |f, i| {
-            const selected = form_focus and self.field == i;
-            var spans: std.ArrayList(Span) = .empty;
-            try spans.append(a, .{ .text = if (selected) "› " else "  ", .style = .{ .fg = Style.cursor.color(), .bold = true } });
-            try spans.append(a, .{ .text = try pad(a, f.label, label_width), .style = Style.secondaryText.style() });
-            if (selected and self.editing) {
-                try spans.append(a, .{ .text = try a.dupe(u8, self.edit.items), .style = .{ .fg = Style.primaryText.color(), .bold = true } });
-                try spans.append(a, .{ .text = "▏", .style = Style.cursor.style() });
-            } else {
-                const value = self.values[self.nav][i].items;
-                try spans.append(a, if (value.len == 0)
-                    .{ .text = "—", .style = Style.secondaryText.style() }
-                else
-                    .{ .text = try a.dupe(u8, value), .style = .{ .fg = Style.primaryText.color(), .bold = selected } });
-            }
-            if (selected and f.hint.len > 0) try spans.append(a, .{ .text = try std.fmt.allocPrint(a, "   {s}", .{f.hint}), .style = Style.secondaryText.style() });
-            try lines.append(a, spans.items);
-        }
+        if (op.command == .chat) return self.chatPane(ctx, row, col, width, height, lines);
+        return self.formPane(ctx, row, col, width, height, lines);
+    }
+
+    /// The form rows and the Run row, then this operation's output.
+    fn formPane(self: *Self, ctx: vxfw.DrawContext, row: u16, col: u16, width: u16, height: u16, start: std.ArrayList([]const Span)) !vxfw.SubSurface {
+        const a = ctx.arena;
+        const op = operations[self.nav];
+        var lines = start;
+        try self.formLines(a, &lines);
         const running_here = self.job.operation == self.nav and self.job.currentState() == .running;
-        const on_run = form_focus and self.field == op.fields.len;
+        const on_run = self.focus == .form and self.field == op.fields.len;
         try lines.append(a, try a.dupe(Span, &.{
             .{ .text = if (on_run) "› " else "  ", .style = .{ .fg = Style.cursor.color(), .bold = true } },
             if (running_here)
@@ -426,6 +502,126 @@ pub const ConsoleApp = struct {
             return self.stack(ctx, row, col, width, height, top, body, used);
         }
         return self.block(ctx, row, col, width, height, lines.items);
+    }
+
+    /// The chat page: the settings form until a model is loaded (or while it
+    /// is being edited), then the transcript and the message being typed.
+    fn chatPane(self: *Self, ctx: vxfw.DrawContext, row: u16, col: u16, width: u16, height: u16, start: std.ArrayList([]const Span)) !vxfw.SubSurface {
+        const a = ctx.arena;
+        const op = operations[self.nav];
+        var lines = start;
+        const snap = try self.chat.snapshot(a);
+        const open = snap.state == .loading or snap.state == .ready or snap.state == .replying;
+        if (!open or self.focus == .form) {
+            try self.formLines(a, &lines);
+            const on_run = self.focus == .form and self.field == op.fields.len;
+            try lines.append(a, try a.dupe(Span, &.{
+                .{ .text = if (on_run) "› " else "  ", .style = .{ .fg = Style.cursor.color(), .bold = true } },
+                .{ .text = if (open) "▶ Load another model" else "▶ Load model", .style = .{ .fg = Style.keyHint.color(), .bold = on_run } },
+            }));
+            try lines.append(a, &.{});
+        }
+        try lines.append(a, &.{switch (snap.state) {
+            .idle => .{ .text = "" },
+            .loading => .{ .text = "● loading the model", .style = Style.warningText.style() },
+            .ready, .replying => .{ .text = try std.fmt.allocPrint(a, "✔ {s}", .{snap.label}), .style = Style.successText.style() },
+            .failed => .{ .text = try std.fmt.allocPrint(a, "✗ failed: {s}", .{snap.failure orelse "error"}), .style = Style.errorText.style() },
+        }});
+        const used: u16 = @intCast(@min(lines.items.len, height));
+        const top = try self.block(ctx, row, col, width, used, lines.items);
+        const body = try self.chatView(ctx, snap, width, height -| used);
+        return self.stack(ctx, row, col, width, height, top, body, used);
+    }
+
+    /// The transcript's last lines above the input line.
+    fn chatView(self: *Self, ctx: vxfw.DrawContext, snap: cli.ChatSnapshot, width: u16, height: u16) !vxfw.Surface {
+        const a = ctx.arena;
+        var lines: std.ArrayList([]const Span) = .empty;
+        const text_width: usize = @max(@as(usize, width) -| 2, 8);
+        for (snap.turns, 0..) |turn, i| {
+            const last = i + 1 == snap.turns.len;
+            switch (turn.role) {
+                .user => try lines.append(a, &.{.{ .text = "You", .style = .{ .fg = Style.keyHint.color(), .bold = true } }}),
+                .assistant => try lines.append(a, &.{.{ .text = "Assistant", .style = .{ .fg = Style.successText.color(), .bold = true } }}),
+                .note => {},
+            }
+            const style = if (turn.role == .note) Style.secondaryText.style() else Style.primaryText.style();
+            var text = std.mem.trimEnd(u8, turn.text, "\n");
+            if (turn.role == .assistant and last and snap.state == .replying) text = try std.fmt.allocPrint(a, "{s}▍", .{text});
+            for (try wrap(a, text, text_width)) |l| try lines.append(a, try a.dupe(Span, &.{ .{ .text = "  " }, .{ .text = l, .style = style } }));
+            try lines.append(a, &.{});
+        }
+        const chatting = self.focus == .chat and operations[self.nav].command == .chat;
+        const input_line: []const Span = if (chatting)
+            try a.dupe(Span, &.{
+                .{ .text = "› ", .style = .{ .fg = Style.cursor.color(), .bold = true } },
+                .{ .text = try a.dupe(u8, self.input.items), .style = .{ .fg = Style.primaryText.color(), .bold = true } },
+                .{ .text = "▏", .style = Style.cursor.style() },
+            })
+        else if (snap.state == .ready or snap.state == .replying)
+            &.{.{ .text = "  enter or → to type a message", .style = Style.secondaryText.style() }}
+        else
+            &.{};
+        const room: usize = height -| 1;
+        const shown = lines.items[lines.items.len -| room..];
+        var all: std.ArrayList([]const Span) = .empty;
+        try all.appendSlice(a, shown);
+        for (shown.len..room) |_| try all.append(a, &.{});
+        try all.append(a, input_line);
+        return (try self.block(ctx, 0, 0, width, height, all.items)).surface;
+    }
+
+    /// Splits text into lines of at most `width` code points, at newlines and
+    /// otherwise at the last space that fits.
+    fn wrap(a: std.mem.Allocator, text: []const u8, width: usize) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        var paragraphs = std.mem.splitScalar(u8, text, '\n');
+        while (paragraphs.next()) |para| {
+            var rest = para;
+            while (true) {
+                var count: usize = 0;
+                var end: usize = 0;
+                var space: ?usize = null;
+                while (end < rest.len and count < width) {
+                    if (rest[end] == ' ') space = end;
+                    end += std.unicode.utf8ByteSequenceLength(rest[end]) catch 1;
+                    count += 1;
+                }
+                end = @min(end, rest.len);
+                if (end == rest.len) {
+                    try out.append(a, rest);
+                    break;
+                }
+                const cut = if (space) |sp| (if (sp > 0) sp else end) else end;
+                try out.append(a, rest[0..cut]);
+                rest = std.mem.trimStart(u8, rest[cut..], " ");
+            }
+        }
+        return out.items;
+    }
+
+    /// The operation's form rows.
+    fn formLines(self: *Self, a: std.mem.Allocator, lines: *std.ArrayList([]const Span)) !void {
+        const op = operations[self.nav];
+        const form_focus = self.focus == .form;
+        for (op.fields, 0..) |f, i| {
+            const selected = form_focus and self.field == i;
+            var spans: std.ArrayList(Span) = .empty;
+            try spans.append(a, .{ .text = if (selected) "› " else "  ", .style = .{ .fg = Style.cursor.color(), .bold = true } });
+            try spans.append(a, .{ .text = try pad(a, f.label, label_width), .style = Style.secondaryText.style() });
+            if (selected and self.editing) {
+                try spans.append(a, .{ .text = try a.dupe(u8, self.edit.items), .style = .{ .fg = Style.primaryText.color(), .bold = true } });
+                try spans.append(a, .{ .text = "▏", .style = Style.cursor.style() });
+            } else {
+                const value = self.values[self.nav][i].items;
+                try spans.append(a, if (value.len == 0)
+                    .{ .text = "—", .style = Style.secondaryText.style() }
+                else
+                    .{ .text = try a.dupe(u8, value), .style = .{ .fg = Style.primaryText.color(), .bold = selected } });
+            }
+            if (selected and f.hint.len > 0) try spans.append(a, .{ .text = try std.fmt.allocPrint(a, "   {s}", .{f.hint}), .style = Style.secondaryText.style() });
+            try lines.append(a, spans.items);
+        }
     }
 
     /// The last lines of the job's output.
@@ -516,6 +712,7 @@ pub const ConsoleApp = struct {
         const badge = if (self.editing) "editing" else switch (self.focus) {
             .nav => "operations",
             .form => "form",
+            .chat => "chat",
         };
         try spans.append(a, .{ .text = try std.fmt.allocPrint(a, "▸▸ {s}  ", .{badge}), .style = .{ .fg = Style.statusText.color(), .bold = true } });
         if (self.notice) |text| {
@@ -533,6 +730,13 @@ pub const ConsoleApp = struct {
                 .{ .key = "r", .does = "run" },
                 .{ .key = "s", .does = "stop training" },
                 .{ .key = "q", .does = "quit" },
+            },
+            .chat => &.{
+                .{ .key = "enter", .does = "send" },
+                .{ .key = "esc", .does = "stop reply / leave" },
+                .{ .key = "tab", .does = "settings" },
+                .{ .key = "ctrl-u", .does = "clear line" },
+                .{ .key = "clear", .does = "new conversation" },
             },
             .form => &.{
                 .{ .key = "↑↓", .does = "field" },
@@ -627,6 +831,7 @@ const TestSupport = struct {
     env: std.process.Environ.Map,
     arena: std.heap.ArenaAllocator,
     job: cli.Job,
+    chat: cli.ChatJob,
 
     fn create(allocator: std.mem.Allocator, self: *TestSupport) !void {
         self.env = std.process.Environ.Map.init(allocator);
@@ -634,6 +839,7 @@ const TestSupport = struct {
         try self.env.put(mod.Config.nanochat_dir_env, "/nonexistent-nanochat");
         self.arena = std.heap.ArenaAllocator.init(allocator);
         self.job.init(allocator, std.testing.io);
+        self.chat.init(allocator, std.testing.io);
     }
 
     fn processInit(self: *TestSupport, allocator: std.mem.Allocator) std.process.Init {
@@ -641,6 +847,7 @@ const TestSupport = struct {
     }
 
     fn destroy(self: *TestSupport) void {
+        self.chat.deinit();
         self.job.deinit();
         self.arena.deinit();
         self.env.deinit();
@@ -660,7 +867,7 @@ test "console navigates operations and edits a form field" {
     var support: TestSupport = undefined;
     try TestSupport.create(allocator, &support);
     defer support.destroy();
-    var app = try ConsoleApp.create(allocator, support.processInit(allocator), &support.job);
+    var app = try ConsoleApp.create(allocator, support.processInit(allocator), &support.job, &support.chat);
     defer app.deinit();
     var ctx = TestSupport.context(allocator);
     defer ctx.cmds.deinit(allocator);
@@ -692,7 +899,7 @@ test "console fills a form from command-line arguments" {
     var support: TestSupport = undefined;
     try TestSupport.create(allocator, &support);
     defer support.destroy();
-    var app = try ConsoleApp.create(allocator, support.processInit(allocator), &support.job);
+    var app = try ConsoleApp.create(allocator, support.processInit(allocator), &support.job, &support.chat);
     defer app.deinit();
     // The job fails at once (no tokenizer here); what matters is the form.
     try app.startWith(.{ .command = .train, .args = &.{ "--preset", "cpu", "--num-iterations=20", "--matrix-lr", "0.03" } });
@@ -710,7 +917,7 @@ test "console draws titles, panes, rules and the status line" {
     var support: TestSupport = undefined;
     try TestSupport.create(allocator, &support);
     defer support.destroy();
-    var app = try ConsoleApp.create(allocator, support.processInit(allocator), &support.job);
+    var app = try ConsoleApp.create(allocator, support.processInit(allocator), &support.job, &support.chat);
     defer app.deinit();
     app.overview.refresh(app.init);
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -726,4 +933,65 @@ test "console draws titles, panes, rules and the status line" {
         try std.testing.expectEqual(@as(usize, 2 + 1 + 1 + 26 + 1 + 1 + 1), surface.children.len);
         try std.testing.expectEqual(@as(u16, 29), surface.children[surface.children.len - 1].origin.row);
     }
+}
+
+test "console chat page loads a model, sends a message and draws the transcript" {
+    const allocator = std.testing.allocator;
+    var support: TestSupport = undefined;
+    try TestSupport.create(allocator, &support);
+    defer support.destroy();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    {
+        var backend = try mod.Backend.init(allocator, std.testing.io, .{});
+        defer backend.deinit();
+        const imported = try mod.TorchImport.importCheckpoint(allocator, &backend, mod.Storage.init(allocator, std.testing.io), mod.build_options.source_root ++ "/testdata/nanochat_base", base, .base, null, null);
+        allocator.free(imported.tag);
+    }
+    try support.env.put(mod.Config.base_dir_env, base);
+    var app = try ConsoleApp.create(allocator, support.processInit(allocator), &support.job, &support.chat);
+    defer app.deinit();
+    var ctx = TestSupport.context(allocator);
+    defer ctx.cmds.deinit(allocator);
+
+    try app.startWith(.{ .command = .chat, .args = &.{ "--temperature", "0", "--max-tokens", "3" } });
+    support.chat.thread.?.join();
+    support.chat.thread = null;
+    try app.handleEvent(&ctx, .tick);
+    try std.testing.expectEqual(Focus.chat, app.focus);
+    try std.testing.expectEqualStrings("0", app.values[app.nav][3].items);
+    for ("Hi") |c| try press(&app, &ctx, .{ .codepoint = c, .text = &.{c} });
+    try press(&app, &ctx, .{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqual(@as(usize, 0), app.input.items.len);
+    support.chat.thread.?.join();
+    support.chat.thread = null;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const snap = try support.chat.snapshot(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 3), snap.turns.len);
+    try std.testing.expectEqualStrings("Hi", snap.turns[1].text);
+    vxfw.DrawContext.init(.unicode);
+    const draw_ctx: vxfw.DrawContext = .{ .arena = arena.allocator(), .min = .{ .width = 0, .height = 0 }, .max = .{ .width = 100, .height = 30 }, .cell_size = .{ .width = 10, .height = 20 } };
+    const surface = try app.draw(draw_ctx);
+    try std.testing.expectEqual(@as(u16, 100), surface.size.width);
+    // "quit" leaves the conversation; tab opens the settings.
+    try press(&app, &ctx, .{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqual(Focus.form, app.focus);
+    try press(&app, &ctx, .{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(Focus.chat, app.focus);
+    for ("quit") |c| try press(&app, &ctx, .{ .codepoint = c, .text = &.{c} });
+    try press(&app, &ctx, .{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqual(Focus.nav, app.focus);
+}
+
+test "console wraps chat text at spaces and newlines" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const lines = try ConsoleApp.wrap(arena.allocator(), "the quick brown fox\njumps", 10);
+    const want = [_][]const u8{ "the quick", "brown fox", "jumps" };
+    try std.testing.expectEqual(want.len, lines.len);
+    for (want, lines) |w, l| try std.testing.expectEqualStrings(w, l);
 }

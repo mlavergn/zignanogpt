@@ -552,6 +552,43 @@ pub const CpuBackend = struct {
         try self.forRows(x.shape.rows(), cols, ctx, Ctx.body);
     }
 
+    /// `out[r] = x[r] + s * sigmoid(gate[r]) * y[r]`, row by row: smear for a
+    /// single decoded token, whose previous token comes from the KV cache.
+    ///
+    /// Parameters:
+    /// - `self`: the backend.
+    /// - `out`: `[R, C]` (any shape with R rows); may alias `x`.
+    /// - `x`: same shape.
+    /// - `y`: same shape.
+    /// - `gate`: `R` gate logits.
+    /// - `s`: the strength (`smear_lambda`).
+    ///
+    /// Return: nothing; shape/dtype errors.
+    pub fn gatedAdd(self: *Self, out: mod.Tensor, x: mod.Tensor, y: mod.Tensor, gate: mod.Tensor, s: mod.Scalar) !void {
+        try checkSame(out, x);
+        try checkSame(out, y);
+        try s.validate();
+        if (gate.dtype != .f32) return error.DtypeMismatch;
+        const rows = x.shape.rows();
+        if (gate.numel() != rows) return mismatch("gatedAdd", x.shape, gate.shape);
+        const Ctx = struct {
+            out: []f32,
+            x: []const f32,
+            y: []const f32,
+            gate: []const f32,
+            s: f32,
+            cols: usize,
+            fn body(ctx: @This(), start: usize, end: usize) void {
+                for (start..end) |r| {
+                    const g = ctx.s * sigmoid(ctx.gate[r]);
+                    for (ctx.out[r * ctx.cols ..][0..ctx.cols], ctx.x[r * ctx.cols ..][0..ctx.cols], ctx.y[r * ctx.cols ..][0..ctx.cols]) |*o, a, b| o.* = a + g * b;
+                }
+            }
+        };
+        const cols = x.shape.cols();
+        try self.forRows(rows, cols, Ctx{ .out = elems(f32, out), .x = elems(f32, x), .y = elems(f32, y), .gate = elems(f32, gate), .s = resolve(s), .cols = cols }, Ctx.body);
+    }
+
     /// nanochat's value residual: `v[r, h, :] += 3 * sigmoid(gate[r, h]) * ve[r, h, :]`.
     ///
     /// Parameters:

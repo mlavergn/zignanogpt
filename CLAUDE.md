@@ -66,6 +66,8 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   is unique among concurrent workers, so per-worker scratch needs no lock). Elementwise
   ops run in 64K-element chunks. No `std.Thread.Pool` in 0.16.
 - Run `make bench` after touching `CpuMatmul`; phase 1 baseline on an M5 Max is in PLAN.md.
+  A with at most 4 rows times a transposed B (decoding) takes a separate matrix-vector path
+  (column blocks, contiguous SIMD dots); the bench's `decode` cases cover it.
 
 ## Model code
 
@@ -126,6 +128,24 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   passes). Resume is approximate by design (data restarts at the next row group). Checkpoints
   and `metrics.jsonl` live in `<base>/base_checkpoints/<tag>/`.
 
+## Inference
+
+- `Gpt.forwardStep(cache, bufs, idx)` is the cached forward: prefill `[1, T]` or decode
+  `[B, 1]`; `KvCache` holds `[B, Tmax, Hkv, D]` per layer, the shared position and the last
+  token's pre-smear embedding (`prev`); `InferenceBuffers` is per-step scratch (one set reused
+  by every layer). Logits come out for each row's last position only.
+- `Engine.generate` returns a `Generation` iterator (`next` -> token column + masks): one batch-1
+  prefill copied into `num_samples` rows (`KvCache.copyFrom`), `RowState` per row (forced
+  tokens, calculator block). The forward for a column runs lazily at the next `next` call, so
+  nothing is computed after the last token. Only greedy is comparable with Python (different
+  RNG); `testdata/engine.json` (fixture group `engine`) pins greedy tokens and calculator results.
+- `Calculator` replaces Python `eval` for exactly what `use_calculator`'s filter admits; keep
+  its output byte-identical to Python's `str()` (the fixture lists edge cases).
+- `LoadedModel` loads `<base>/<kind>_checkpoints/<tag>/model_<step>.safetensors` + the
+  tokenizer; it must not move after `init` (config strings live in its arena). `ChatSession`
+  is `chat_cli.py`'s conversation; `cli/chat.zig` (CLI) and `cli/chat_job.zig` (console) both
+  drive it.
+
 ## Console (TUI)
 
 - `zignanogpt` with no arguments on a terminal (or `zignanogpt tui`) opens the console;
@@ -135,6 +155,10 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   line of live keys. Built on zigvaxis `vxfw` (`ConsoleApp` is the root widget).
 - `Operation.all` is the left pane: each entry is a `Command` plus form `Field`s that map to
   its flags (`Operation.args`). A new command gets an entry there and a case in `Runner`.
+- Chat is the exception: the console's Chat page uses `ChatJob` (its own worker, one thread per
+  load or reply, transcript behind a mutex) instead of `Job`, so it can run beside training.
+  `zignanogpt chat` on a terminal opens that page (short flags are spelled out first, since
+  the form only knows long names); `-p` or `--no-tui` stay line-based.
 - `Job` runs one command on a worker thread through `Runner.execute` (the same dispatch the
   CLI uses), writing to a mutex-guarded log via a `std.Io.Writer`; training feeds it through
   `TrainObserver`. While the console holds the terminal, `std.log` goes into the job's log
