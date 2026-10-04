@@ -435,6 +435,326 @@ def engine(out):
         json.dump({"calculator": calculator, "generations": generations}, f, indent=1)
 
 
+# -----------------------------------------------------------------------------
+# Phase 10: SFT and eval tasks
+
+# (repo, subset, split, rows kept, row group size, data page version) sliced from the real
+# Hugging Face parquet exports into testdata/task_base/task_data/ (load_hub_dataset's layout).
+TASK_SOURCES = [
+    ("HuggingFaceTB/smol-smoltalk", "default", "test", 24, 10, "2.0"),
+    ("cais/mmlu", "all", "test", 40, 16, "1.0"),
+    ("allenai/ai2_arc", "ARC-Easy", "test", 30, 12, "1.0"),
+    ("openai/gsm8k", "main", "test", 30, 8, "1.0"),
+    # chat_sft's training splits
+    ("HuggingFaceTB/smol-smoltalk", "default", "train", 24, 10, "1.0"),
+    ("cais/mmlu", "all", "auxiliary_train", 30, 16, "1.0"),
+    ("openai/gsm8k", "main", "train", 20, 8, "1.0"),
+]
+GSM8K_ANSWERS = [
+    "so 5 + 3 = 8\n#### 8", "#### -1,234.5", "no marker 42", "#### 7\n#### 9", "####8", "#### .5,",
+]
+
+
+@fixture
+def tasks(out):
+    """Small slices of the task datasets, and the Python tasks' conversations, renders and evaluations."""
+    import tempfile
+    import pyarrow.parquet as pq
+    cache = os.path.join(tempfile.gettempdir(), "zignanogpt-fixture-cache")
+    os.environ["NANOCHAT_BASE_DIR"] = cache
+    from tasks.common import load_hub_dataset, TaskMixture
+    base = os.path.join(out, "task_base")
+    for repo, subset, split, rows, group, version in TASK_SOURCES:
+        load_hub_dataset(repo, subset, split)  # downloads the full split into the cache once
+        src = os.path.join(cache, "task_data", repo.replace("/", "--"), subset, split, "00000.parquet")
+        dst_dir = os.path.join(base, "task_data", repo.replace("/", "--"), subset, split)
+        os.makedirs(dst_dir, exist_ok=True)
+        table = pq.read_table(src).slice(0, rows)
+        # two shards, to cover the manifest order
+        half = rows // 2
+        pq.write_table(table.slice(0, half), os.path.join(dst_dir, "00000.parquet"), compression="snappy", row_group_size=group, data_page_version=version)
+        pq.write_table(table.slice(half), os.path.join(dst_dir, "00001.parquet"), compression="snappy", row_group_size=group, data_page_version=version)
+        with open(os.path.join(dst_dir, "manifest.json"), "w") as f:
+            json.dump(["00000.parquet", "00001.parquet"], f)
+    os.environ["NANOCHAT_BASE_DIR"] = base
+    import importlib, tasks.common
+    importlib.reload(tasks.common)
+    from tasks.smoltalk import SmolTalk
+    from tasks.mmlu import MMLU
+    from tasks.arc import ARC
+    from tasks.gsm8k import GSM8K, extract_answer
+    tok, _ = _tokenizer_from_fixture(out)
+    made = {
+        "SmolTalk": SmolTalk(split="test"),
+        "MMLU": MMLU(subset="all", split="test"),
+        "ARC-Easy": ARC(subset="ARC-Easy", split="test"),
+        "GSM8K": GSM8K(subset="main", split="test", start=2, stop=25, step=3),
+    }
+    result = {"tasks": {}}
+    for name, task in made.items():
+        rows = []
+        for i in range(len(task)):
+            conv = task[i]
+            ids, mask = tok.render_conversation(conv)
+            row = {"ids": ids, "mask": mask, "completion": tok.render_for_completion(conv)}
+            if "letters" in conv:
+                row["letters"] = list(conv["letters"])
+                row["correct"] = [bool(task.evaluate(conv, l)) for l in conv["letters"]]
+            if name == "GSM8K":
+                row["parts"] = [[p["type"], p["text"]] for p in conv["messages"][-1]["content"]]
+                row["evaluate"] = [task.evaluate(conv, r) for r in GSM8K_ANSWERS]
+            rows.append(row)
+        result["tasks"][name] = {"len": len(task), "rows": rows}
+    result["extract"] = [[a, extract_answer(a)] for a in GSM8K_ANSWERS]
+    mixture = TaskMixture([made["SmolTalk"], made["MMLU"], made["MMLU"], made["GSM8K"]])
+    result["mixture"] = [[t, l] for t, l in mixture.index_map]
+    with open(os.path.join(out, "tasks.json"), "w") as f:
+        json.dump(result, f)
+
+
+
+@fixture
+def chat_eval(out):
+    """chat_eval's categorical and generative loops on the d2 import model over the task slices."""
+    import torch
+    os.environ["NANOCHAT_BASE_DIR"] = os.path.join(out, "nanochat_base")
+    from nanochat.checkpoint_manager import build_model
+    from nanochat.engine import Engine
+    model, tokenizer, _ = build_model(os.path.join(out, "nanochat_base", "base_checkpoints", "d2"), 5, torch.device("cpu"), "eval")
+    engine = Engine(model, tokenizer)
+    os.environ["NANOCHAT_BASE_DIR"] = os.path.join(out, "task_base")
+    from tasks.mmlu import MMLU
+    from tasks.arc import ARC
+    from tasks.gsm8k import GSM8K
+    from scripts.chat_eval import run_categorical_eval, run_generative_eval
+    mmlu, arc, gsm = MMLU(subset="all", split="test"), ARC(subset="ARC-Easy", split="test"), GSM8K(subset="main", split="test")
+    result = {
+        "MMLU": run_categorical_eval(mmlu, tokenizer, model, batch_size=8),
+        "ARC-Easy": run_categorical_eval(arc, tokenizer, model, batch_size=8, max_problems=20),
+        "GSM8K": run_generative_eval(gsm, tokenizer, model, engine, 1, 20, 0.0, 50, max_problems=6),
+        "completions": [],
+    }
+    for i in range(6):
+        prompt = tokenizer.render_for_completion(gsm[i])
+        results, _ = engine.generate_batch(prompt, num_samples=1, max_tokens=20, temperature=0.0, top_k=50)
+        result["completions"].append(tokenizer.decode(results[0][len(prompt):]))
+    with open(os.path.join(out, "chat_eval.json"), "w") as f:
+        json.dump(result, f, indent=1)
+
+
+
+def sft_batches(dataset, tokenizer, batch_size, seq_len, num_iterations, split, render_cap):
+    """chat_sft.py's sft_data_generator_bos_bestfit (single rank), copied because the
+    script trains on import. `render_cap` is the port's one change: conversations are
+    rendered with max_tokens=render_cap (Python: 2048) so that none can outgrow a row."""
+    state = dict(last_step=False, approx_progress=0.0, current_epoch=1)
+    dataset_size = len(dataset)
+    row_capacity = seq_len + 1
+    bos_token = tokenizer.get_bos_token_id()
+    conv_buffer = []
+    cursor, consumed, epoch, it = 0, 0, 1, 0
+    while True:
+        rows, mask_rows, row_lengths = [], [], []
+        for _ in range(batch_size):
+            row, mask_row, padded = [], [], False
+            while len(row) < row_capacity:
+                while len(conv_buffer) < 100:
+                    ids, mask = tokenizer.render_conversation(dataset[cursor], max_tokens=render_cap)
+                    conv_buffer.append((ids, mask))
+                    cursor += 1
+                    if cursor >= dataset_size:
+                        cursor = cursor % dataset_size
+                        epoch += 1
+                remaining = row_capacity - len(row)
+                best_idx, best_len = -1, 0
+                for i, (conv, _) in enumerate(conv_buffer):
+                    if len(conv) <= remaining and len(conv) > best_len:
+                        best_idx, best_len = i, len(conv)
+                if best_idx >= 0:
+                    conv, conv_mask = conv_buffer.pop(best_idx)
+                    row.extend(conv)
+                    mask_row.extend(conv_mask)
+                    consumed += 1
+                else:
+                    content_len = len(row)
+                    row.extend([bos_token] * remaining)
+                    mask_row.extend([0] * remaining)
+                    padded = True
+                    break
+            row_lengths.append(content_len if padded else row_capacity)
+            rows.append(row[:row_capacity])
+            mask_rows.append(mask_row[:row_capacity])
+        it += 1
+        if 0 < num_iterations <= it and split == "train":
+            state["last_step"] = True
+        if split == "train":
+            state["current_epoch"] = epoch
+            state["approx_progress"] = it / num_iterations if num_iterations > 0 else consumed / dataset_size
+            if consumed >= dataset_size:
+                state["last_step"] = True
+        inputs = [r[:-1] for r in rows]
+        targets = [[t if m else -1 for t, m in zip(r[1:], mr[1:])] for r, mr in zip(rows, mask_rows)]
+        for i, content_len in enumerate(row_lengths):
+            if content_len < row_capacity:
+                for j in range(content_len - 1 if content_len > 0 else seq_len - 1, seq_len):
+                    targets[i][j] = -1
+        yield inputs, targets, dict(state)
+
+
+@fixture
+def sft_loader(out):
+    """SFT best-fit-pad batches over a mixture of the task slices (upstream at 2048, capped at 128)."""
+    os.environ["NANOCHAT_BASE_DIR"] = os.path.join(out, "task_base")
+    from tasks.common import TaskMixture
+    from tasks.smoltalk import SmolTalk
+    from tasks.mmlu import MMLU
+    from tasks.gsm8k import GSM8K
+    tok, _ = _tokenizer_from_fixture(out)
+    mixture = TaskMixture([SmolTalk(split="test"), MMLU(subset="all", split="test"), GSM8K(subset="main", split="test")])
+    result = {}
+    for name, seq, batches, iters in [("upstream", 2048, 4, 0), ("capped", 128, 12, 0), ("iterations", 128, 3, 2)]:
+        gen = sft_batches(mixture, tok, 2, seq, iters, "train", min(2048, seq + 1))
+        result[name] = {"seq": seq, "num_iterations": iters, "batches": []}
+        for _ in range(batches):
+            x, y, st = next(gen)
+            result[name]["batches"].append({"inputs": x, "targets": y, **st})
+    with open(os.path.join(out, "sft_loader.json"), "w") as f:
+        json.dump(result, f)
+
+
+SFT_SEQ = 256
+SFT_ARGS = ["--device-type=cpu", "--num-iterations=4", f"--max-seq-len={SFT_SEQ}", "--device-batch-size=2",
+            f"--total-batch-size={2 * SFT_SEQ}", "--eval-every=2", f"--eval-tokens={2 * SFT_SEQ}", "--chatcore-every=-1",
+            "--mmlu-epochs=1", "--gsm8k-epochs=2"]
+
+
+@fixture
+def sft(out):
+    """chat_sft.py itself, on the d2 import model and the task slices: step losses, val bpb, final logits."""
+    import contextlib, io, re, runpy, shutil, sys, tempfile
+    import torch
+    work = tempfile.mkdtemp(prefix="zignanogpt-sft-")
+    shutil.copytree(os.path.join(out, "nanochat_base", "base_checkpoints", "d2"), os.path.join(work, "base_checkpoints", "d2"))
+    shutil.copytree(os.path.join(out, "nanochat_base", "tokenizer"), os.path.join(work, "tokenizer"))
+    os.symlink(os.path.abspath(os.path.join(out, "task_base", "task_data")), os.path.join(work, "task_data"))
+    os.environ["NANOCHAT_BASE_DIR"] = work
+    # token_bytes.pt, as tok_train.py writes it
+    from nanochat.tokenizer import get_tokenizer
+    tok = get_tokenizer()
+    special_ids = set(tok.encode_special(t) for t in tok.get_special_tokens())
+    counts = [0 if i in special_ids else len(tok.decode_single_token_bytes(i)) for i in range(tok.get_vocab_size())]
+    torch.save(torch.tensor(counts, dtype=torch.int32), os.path.join(work, "tokenizer", "token_bytes.pt"))
+    # The port's one change to the loader: render at most max_seq_len + 1 tokens.
+    import nanochat.tokenizer as nt
+    render = nt.RustBPETokenizer.render_conversation
+    nt.RustBPETokenizer.render_conversation = lambda self, conv, max_tokens=2048: render(self, conv, max_tokens=min(max_tokens, SFT_SEQ + 1))
+    # The slices are smaller than chat_sft's validation stops (MMLU 5200, GSM8K 420): clamp
+    # them to the data, a no-op on the real splits (the port's Task.len does the same).
+    import tasks.common as tc
+    def clamped_len(self):
+        stop = self.num_examples() if self.stop is None else min(self.stop, self.num_examples())
+        return max(0, (stop - self.start + self.step - 1) // self.step)
+    tc.Task.__len__ = clamped_len
+    sys.argv = ["chat_sft"] + SFT_ARGS
+    log = io.StringIO()
+    with contextlib.redirect_stdout(log):
+        runpy.run_module("scripts.chat_sft", run_name="__main__")
+    text = log.getvalue()
+    with open(os.path.join(tempfile.gettempdir(), "zignanogpt-sft.log"), "w") as f:
+        f.write(text)
+    losses = [float(m) for m in re.findall(r"^step \d+ .*\| loss: ([0-9.naif]+)", text, re.M)]
+    bpbs = [[int(a), float(b)] for a, b in re.findall(r"^Step (\d+) \| Validation bpb: ([0-9.]+)", text, re.M)]
+    from nanochat.checkpoint_manager import build_model, find_last_step
+    ckpt = os.path.join(work, "chatsft_checkpoints", "d2")
+    step = find_last_step(ckpt)
+    model, _, _ = build_model(ckpt, step, torch.device("cpu"), "eval")
+    torch.manual_seed(7)
+    idx = torch.randint(0, 1033, (1, 24))
+    with torch.no_grad():
+        logits = model(idx)
+    write_safetensors(os.path.join(out, "sft.safetensors"), {"idx": idx.to(torch.int32), "logits": logits},
+                      {"losses": json.dumps(losses), "bpbs": json.dumps(bpbs), "step": str(step), "args": json.dumps(SFT_ARGS)})
+    shutil.rmtree(work)
+    print(f"sft: {len(losses)} steps, losses {losses}, bpb {bpbs}")
+
+
+# (label, dataset_uri, fewshot, type, delimiter) for a mini eval bundle: real CORE data,
+# fewer lines and shots so the prompts fit the d2 model's rotary table.
+CORE_TASKS = [
+    ("hellaswag_zeroshot", "language_understanding/hellaswag.jsonl", 0, "multiple_choice", None),
+    ("arc_easy", "world_knowledge/arc_easy.jsonl", 2, "multiple_choice", "\nAnswer: "),
+    ("copa", "commonsense_reasoning/copa.jsonl", 0, "multiple_choice", None),
+    ("winograd", "language_understanding/winograd_wsc.jsonl", 0, "schema", None),
+    ("jeopardy", "world_knowledge/jeopardy_all.jsonl", 2, "language_modeling", "\nAnswer: "),
+    ("lambada_openai", "language_understanding/lambada_openai.jsonl", 0, "language_modeling", None),
+]
+CORE_LINES, CORE_MAX = 24, 10
+
+
+@fixture
+def core(out):
+    """A mini eval_bundle.zip (deflated) and nanochat's CORE results on it with the d2 model."""
+    import random, shutil, tempfile, urllib.request, zipfile
+    import torch
+    cache = os.path.join(tempfile.gettempdir(), "zignanogpt-fixture-cache")
+    os.makedirs(cache, exist_ok=True)
+    full = os.path.join(cache, "eval_bundle.zip")
+    if not os.path.exists(full):
+        urllib.request.urlretrieve("https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip", full)
+    src = zipfile.ZipFile(full)
+    yaml_lines = ["icl_tasks:"]
+    members = {"eval_bundle/eval_meta_data.csv": src.read("eval_bundle/eval_meta_data.csv")}
+    for label, uri, shots, kind, delim in CORE_TASKS:
+        lines = src.read(f"eval_bundle/eval_data/{uri}").decode("utf-8").splitlines(keepends=True)[:CORE_LINES]
+        members[f"eval_bundle/eval_data/{uri}"] = "".join(lines).encode("utf-8")
+        yaml_lines += ["-", f"  label: {label}", f"  dataset_uri: {uri}", f"  num_fewshot: [{shots}]", f"  icl_task_type: {kind}"]
+        if delim is not None:
+            yaml_lines.append(f"  continuation_delimiter: {json.dumps(delim)}")  # escaped, as in core.yaml
+    members["eval_bundle/core.yaml"] = ("\n".join(yaml_lines) + "\n").encode("utf-8")
+    bundle_zip = os.path.join(out, "eval_bundle.zip")
+    with zipfile.ZipFile(bundle_zip, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("eval_bundle/", "")
+        for name, data in members.items():
+            z.writestr(name, data)
+
+    work = tempfile.mkdtemp(prefix="zignanogpt-core-")
+    zipfile.ZipFile(bundle_zip).extractall(work)
+    os.environ["NANOCHAT_BASE_DIR"] = os.path.join(out, "nanochat_base")
+    from nanochat.checkpoint_manager import build_model
+    model, tokenizer, _ = build_model(os.path.join(out, "nanochat_base", "base_checkpoints", "d2"), 5, torch.device("cpu"), "eval")
+    os.environ["NANOCHAT_BASE_DIR"] = work
+    from scripts.base_eval import evaluate_core
+    from nanochat import core_eval
+    result = evaluate_core(model, tokenizer, torch.device("cpu"), max_per_task=CORE_MAX)
+    # Per-example detail: tokens, spans and the outcome.
+    examples = {}
+    import yaml
+    for task in yaml.safe_load(members["eval_bundle/core.yaml"])["icl_tasks"]:
+        meta = {"task_type": task["icl_task_type"], "num_fewshot": task["num_fewshot"][0], "continuation_delimiter": task.get("continuation_delimiter", " ")}
+        data = [json.loads(l) for l in members[f"eval_bundle/eval_data/{task['dataset_uri']}"].decode("utf-8").splitlines()]
+        random.Random(1337).shuffle(data)
+        data = data[:CORE_MAX]
+        rows = []
+        for idx in range(len(data)):
+            item = data[idx]
+            fewshot = []
+            if meta["num_fewshot"] > 0:
+                rng = random.Random(1234 + idx)
+                avail = [i for i in range(len(data)) if i != idx]
+                fewshot = [data[i] for i in rng.sample(avail, meta["num_fewshot"])]
+            render = {"multiple_choice": core_eval.render_prompts_mc, "schema": core_eval.render_prompts_schema, "language_modeling": core_eval.render_prompts_lm}[meta["task_type"]]
+            batch = {"multiple_choice": core_eval.batch_sequences_mc, "schema": core_eval.batch_sequences_schema, "language_modeling": core_eval.batch_sequences_lm}[meta["task_type"]]
+            prompts = render(item, meta["continuation_delimiter"], fewshot)
+            tokens, starts, ends = batch(tokenizer, prompts)
+            correct = core_eval.evaluate_example(idx, model, tokenizer, data, torch.device("cpu"), meta)
+            rows.append({"prompts": prompts, "tokens": tokens, "starts": starts, "ends": ends, "correct": bool(correct)})
+        examples[task["label"]] = rows
+    shutil.rmtree(work)
+    with open(os.path.join(out, "core.json"), "w") as f:
+        json.dump({"results": result["results"], "centered": result["centered_results"], "core": result["core_metric"], "examples": examples, "max_per_task": CORE_MAX}, f)
+    print("core:", result["results"], result["core_metric"])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", default="testdata", help="output directory")

@@ -8,15 +8,22 @@ const Codec = enum(i32) { uncompressed = 0, snappy = 1, zstd = 6, _ };
 const PageType = enum(i32) { data = 0, index = 1, dictionary = 2, data_v2 = 3, _ };
 /// Parquet value encodings this reader decodes.
 const Encoding = enum(i32) { plain = 0, plain_dictionary = 2, rle = 3, rle_dictionary = 8, _ };
-/// The physical type of byte-array (string) columns.
-const byte_array_type = 6;
+/// Parquet physical types this reader decodes.
+const PhysicalType = enum(i32) { int32 = 1, int64 = 2, byte_array = 6, _ };
 
-/// A leaf column: its name and whether it can hold nulls.
+/// A leaf column: its path and how deeply it nests.
 pub const ParquetColumn = struct {
+    /// The dotted path, as pyarrow's `path_in_schema` (e.g. `choices.list.item`).
     name: []const u8,
+    /// The path without list wrappers (e.g. `choices`): writers name the
+    /// repeated group and its element differently (`list.item`, `list.element`).
+    logical: []const u8,
     physical_type: i32,
-    /// 1 for an optional column (definition levels present), 0 for required.
+    /// Optional or repeated ancestors, the column included: a value is present
+    /// at definition level `max_def`.
     max_def: u8,
+    /// Repeated ancestors: 0 for a flat column, 1 for a list.
+    max_rep: u8,
 };
 
 /// One column chunk's location in the file.
@@ -66,11 +73,68 @@ pub const ParquetStrings = struct {
     }
 };
 
+/// One column chunk's values and levels. Only present values are stored
+/// (strings for byte arrays, `ints` for int32/int64); `def` and `rep` hold one
+/// level per entry (empty when the column has none). `rowStarts` turns the
+/// levels into rows for list columns.
+pub const ParquetValues = struct {
+    const Self = @This();
+
+    strings: ParquetStrings = .{},
+    ints: std.ArrayList(i64) = .empty,
+    def: std.ArrayList(u8) = .empty,
+    rep: std.ArrayList(u8) = .empty,
+
+    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        self.strings.deinit(allocator);
+        self.ints.deinit(allocator);
+        self.def.deinit(allocator);
+        self.rep.deinit(allocator);
+    }
+
+    pub fn clear(self: *Self) void {
+        self.strings.clear();
+        self.ints.clearRetainingCapacity();
+        self.def.clearRetainingCapacity();
+        self.rep.clearRetainingCapacity();
+    }
+
+    /// Where each row's values start: row `r` holds values
+    /// `starts[r] .. starts[r + 1]` (a list column's items; for a flat column
+    /// one value, or none when null).
+    ///
+    /// Parameters:
+    /// - `self`: the values read for `column`.
+    /// - `allocator`: owns the result.
+    /// - `column`: the column they came from.
+    ///
+    /// Return: `rows + 1` offsets; allocation errors.
+    pub fn rowStarts(self: *const Self, allocator: std.mem.Allocator, column: ParquetColumn) ![]usize {
+        var starts: std.ArrayList(usize) = .empty;
+        errdefer starts.deinit(allocator);
+        const entries = @max(self.def.items.len, self.rep.items.len);
+        if (entries == 0) {
+            // Required flat column: one value per row.
+            const count = @max(self.strings.len(), self.ints.items.len);
+            for (0..count + 1) |i| try starts.append(allocator, i);
+            return starts.toOwnedSlice(allocator);
+        }
+        var value: usize = 0;
+        for (0..entries) |e| {
+            if (column.max_rep == 0 or self.rep.items[e] == 0) try starts.append(allocator, value);
+            if (column.max_def == 0 or self.def.items[e] == column.max_def) value += 1;
+        }
+        try starts.append(allocator, value);
+        return starts.toOwnedSlice(allocator);
+    }
+};
+
 /// A Parquet file read through zigstorage: the footer once, then one ranged
-/// read per column chunk. Decodes flat (non-nested) byte-array columns: data
-/// pages v1 and v2, PLAIN and dictionary encodings, definition levels for
-/// optional columns (nulls are skipped), UNCOMPRESSED / SNAPPY / ZSTD codecs.
-/// That covers nanochat's pretraining shards (`text`, ZSTD, PLAIN).
+/// read per column chunk. Decodes byte-array, int32 and int64 leaf columns,
+/// nested ones included (repetition and definition levels): data pages v1 and
+/// v2, PLAIN and dictionary encodings, UNCOMPRESSED / SNAPPY / ZSTD codecs.
+/// That covers nanochat's pretraining shards (`text`, ZSTD, PLAIN) and the
+/// Hugging Face parquet exports of its SFT and eval tasks (SNAPPY, dictionary).
 pub const ParquetFile = struct {
     const Self = @This();
 
@@ -137,12 +201,12 @@ pub const ParquetFile = struct {
     ///
     /// Parameters:
     /// - `self`: the file.
-    /// - `name`: the column name.
+    /// - `name`: the column's path or logical path (`choices` for `choices.list.item`).
     ///
     /// Return: the index, or `error.MissingColumn`.
     pub fn column(self: *const Self, name: []const u8) !usize {
         for (self.columns, 0..) |c, i| {
-            if (std.mem.eql(u8, c.name, name)) return i;
+            if (std.mem.eql(u8, c.name, name) or std.mem.eql(u8, c.logical, name)) return i;
         }
         log.warn("no parquet column named {s}", .{name});
         return error.MissingColumn;
@@ -158,14 +222,37 @@ pub const ParquetFile = struct {
     ///
     /// Return: nothing; storage, decoding and unsupported-feature errors.
     pub fn readStrings(self: *Self, row_group: usize, col: usize, out: *ParquetStrings) !void {
+        if (@as(PhysicalType, @enumFromInt(self.columns[col].physical_type)) != .byte_array) return unsupported("non byte-array column");
+        var values = ParquetValues{ .strings = out.* };
+        defer {
+            out.* = values.strings;
+            values.strings = .{};
+            values.deinit(self.allocator);
+        }
+        try self.readColumn(row_group, col, &values);
+    }
+
+    /// Reads one row group of a leaf column: present values plus levels.
+    ///
+    /// Parameters:
+    /// - `self`: the file.
+    /// - `row_group`: the row group index.
+    /// - `col`: the column index (`column`).
+    /// - `out`: receives the values and levels, appended.
+    ///
+    /// Return: nothing; storage, decoding and unsupported-feature errors.
+    pub fn readColumn(self: *Self, row_group: usize, col: usize, out: *ParquetValues) !void {
         const info = self.columns[col];
-        if (info.physical_type != byte_array_type) return unsupported("non byte-array column");
+        switch (@as(PhysicalType, @enumFromInt(info.physical_type))) {
+            .byte_array, .int32, .int64 => {},
+            _ => return unsupported("physical type"),
+        }
         const chunk = self.row_groups[row_group].chunks[col];
         const bytes = try self.node.read(.{ .offset = chunk.offset, .length = chunk.size });
         defer self.allocator.free(bytes);
         if (bytes.len != chunk.size) return error.InvalidParquet;
 
-        var dictionary: ParquetStrings = .{};
+        var dictionary: ParquetValues = .{};
         defer dictionary.deinit(self.allocator);
         var pos: usize = 0;
         var values_left = chunk.num_values;
@@ -179,7 +266,7 @@ pub const ParquetFile = struct {
             switch (header.type) {
                 .dictionary => {
                     const page = try self.decompress(@enumFromInt(chunk.codec), body, header.uncompressed_size);
-                    try readPlain(self.allocator, page, std.math.cast(usize, header.num_values) orelse return error.InvalidParquet, &dictionary);
+                    try readPlain(self.allocator, info, page, std.math.cast(usize, header.num_values) orelse return error.InvalidParquet, &dictionary);
                 },
                 .data, .data_v2 => {
                     try self.decodeDataPage(info, @enumFromInt(chunk.codec), header, body, &dictionary, out);
@@ -191,57 +278,79 @@ pub const ParquetFile = struct {
     }
 
     /// Decodes one data page (v1 or v2) into `out`.
-    fn decodeDataPage(self: *Self, info: ParquetColumn, codec: Codec, header: PageHeader, body: []const u8, dictionary: *const ParquetStrings, out: *ParquetStrings) !void {
+    fn decodeDataPage(self: *Self, info: ParquetColumn, codec: Codec, header: PageHeader, body: []const u8, dictionary: *const ParquetValues, out: *ParquetValues) !void {
         const n: usize = @intCast(header.num_values);
-        var levels: []const u8 = &.{};
+        var rep_levels: []const u8 = &.{};
+        var def_levels: []const u8 = &.{};
         var values: []const u8 = undefined;
         if (header.type == .data_v2) {
-            if (header.rep_bytes != 0) return unsupported("repeated column");
-            if (header.def_bytes > body.len) return error.InvalidParquet;
-            levels = body[0..header.def_bytes];
-            const rest = body[header.def_bytes..];
+            if (header.rep_bytes + header.def_bytes > body.len) return error.InvalidParquet;
+            rep_levels = body[0..header.rep_bytes];
+            def_levels = body[header.rep_bytes..][0..header.def_bytes];
+            const rest = body[header.rep_bytes + header.def_bytes ..];
             values = if (header.is_compressed)
-                try self.decompress(codec, rest, header.uncompressed_size - header.def_bytes)
+                try self.decompress(codec, rest, header.uncompressed_size - header.rep_bytes - header.def_bytes)
             else
                 rest;
         } else {
-            const page = try self.decompress(codec, body, header.uncompressed_size);
-            values = page;
-            if (info.max_def > 0) {
-                if (page.len < 4) return error.InvalidParquet;
-                const level_len = std.mem.readInt(u32, page[0..4], .little);
-                if (level_len > page.len - 4) return error.InvalidParquet;
-                levels = page[4..][0..level_len];
-                values = page[4 + level_len ..];
-            }
+            values = try self.decompress(codec, body, header.uncompressed_size);
+            // v1: each level stream is prefixed by its 4-byte length, repetition first.
+            if (info.max_rep > 0) rep_levels = try takeLevels(&values);
+            if (info.max_def > 0) def_levels = try takeLevels(&values);
         }
 
-        // Which of the n slots hold a value.
-        const present = try self.allocator.alloc(bool, n);
-        defer self.allocator.free(present);
-        if (info.max_def > 0) {
-            try decodeLevels(levels, 1, present);
-        } else {
-            @memset(present, true);
+        if (info.max_rep > 0) {
+            const start = out.rep.items.len;
+            try out.rep.resize(self.allocator, start + n);
+            try decodeLevels(rep_levels, bitWidth(info.max_rep), out.rep.items[start..]);
         }
-        var count: usize = 0;
-        for (present) |p| count += @intFromBool(p);
+        var count = n;
+        if (info.max_def > 0) {
+            const start = out.def.items.len;
+            try out.def.resize(self.allocator, start + n);
+            const levels = out.def.items[start..];
+            try decodeLevels(def_levels, bitWidth(info.max_def), levels);
+            count = 0;
+            for (levels) |l| count += @intFromBool(l == info.max_def);
+        }
+        if (count == 0) return;
 
         switch (header.encoding) {
-            .plain => try readPlain(self.allocator, values, count, out),
+            .plain => try readPlain(self.allocator, info, values, count, out),
             .plain_dictionary, .rle_dictionary => {
                 if (values.len == 0) return error.InvalidParquet;
                 const width = values[0];
                 const indices = try self.allocator.alloc(u32, count);
                 defer self.allocator.free(indices);
                 try decodeHybrid(values[1..], width, indices);
+                const strings = @as(PhysicalType, @enumFromInt(info.physical_type)) == .byte_array;
                 for (indices) |i| {
-                    if (i >= dictionary.len()) return error.InvalidParquet;
-                    try out.append(self.allocator, dictionary.get(i));
+                    if (strings) {
+                        if (i >= dictionary.strings.len()) return error.InvalidParquet;
+                        try out.strings.append(self.allocator, dictionary.strings.get(i));
+                    } else {
+                        if (i >= dictionary.ints.items.len) return error.InvalidParquet;
+                        try out.ints.append(self.allocator, dictionary.ints.items[i]);
+                    }
                 }
             },
             else => return unsupported("value encoding"),
         }
+    }
+
+    /// Splits a v1 level stream (u32 length, then the levels) off the front of `page`.
+    fn takeLevels(page: *[]const u8) ![]const u8 {
+        if (page.len < 4) return error.InvalidParquet;
+        const len = std.mem.readInt(u32, page.*[0..4], .little);
+        if (len > page.len - 4) return error.InvalidParquet;
+        const levels = page.*[4..][0..len];
+        page.* = page.*[4 + len ..];
+        return levels;
+    }
+
+    /// Bits needed for levels up to `max`.
+    fn bitWidth(max: u8) u8 {
+        return 8 - @clz(max);
     }
 
     /// Decompresses a page body into the shared page buffer.
@@ -283,18 +392,35 @@ pub const ParquetFile = struct {
             const f = try r.field();
             if (f.type == .stop) break;
             switch (f.id) {
-                2 => { // schema: list<SchemaElement>, the root first
+                2 => { // schema: list<SchemaElement>, depth first, the root first
                     const list = try r.listHeader();
+                    // Open groups: children left, their levels and path.
+                    const Group = struct { left: i32, def: u8, rep: u8, path: []const u8, logical: []const u8, repeated: bool };
+                    var stack: std.ArrayList(Group) = .empty;
                     for (0..list.len) |i| {
                         const element = try parseSchemaElement(&r);
-                        if (i == 0) continue;
-                        if (element.num_children > 0) return unsupported("nested schema");
-                        try columns.append(arena, .{
-                            .name = element.name,
-                            .physical_type = element.type,
-                            .max_def = if (element.repetition == 1) 1 else 0,
-                        });
-                        if (element.repetition == 2) return unsupported("repeated column");
+                        if (i == 0) {
+                            try stack.append(arena, .{ .left = element.num_children, .def = 0, .rep = 0, .path = "", .logical = "", .repeated = false });
+                            continue;
+                        }
+                        while (stack.items.len > 0 and stack.items[stack.items.len - 1].left == 0) _ = stack.pop();
+                        if (stack.items.len == 0) return error.InvalidParquet;
+                        const parent = &stack.items[stack.items.len - 1];
+                        parent.left -= 1;
+                        // repetition: 0 required, 1 optional, 2 repeated
+                        const def = parent.def + @intFromBool(element.repetition != 0);
+                        const rep_level = parent.rep + @intFromBool(element.repetition == 2);
+                        const path = try join(arena, parent.path, element.name);
+                        // A list is `<name>` / repeated group / element: the logical
+                        // path keeps `<name>` and drops the other two.
+                        const repeated_group = element.repetition == 2 and element.num_children > 0;
+                        const logical = if (repeated_group or parent.repeated) parent.logical else try join(arena, parent.logical, element.name);
+                        if (element.num_children > 0) {
+                            try stack.append(arena, .{ .left = element.num_children, .def = def, .rep = rep_level, .path = path, .logical = logical, .repeated = repeated_group });
+                        } else {
+                            if (rep_level > 1) return unsupported("lists of lists");
+                            try columns.append(arena, .{ .name = path, .logical = logical, .physical_type = element.type, .max_def = def, .max_rep = rep_level });
+                        }
                     }
                 },
                 3 => self.num_rows = try r.readI64(),
@@ -310,6 +436,10 @@ pub const ParquetFile = struct {
         for (self.row_groups) |rg| {
             if (rg.chunks.len != self.columns.len) return error.InvalidParquet;
         }
+    }
+
+    fn join(arena: std.mem.Allocator, prefix: []const u8, name: []const u8) ![]const u8 {
+        return if (prefix.len == 0) name else std.mem.concat(arena, u8, &.{ prefix, ".", name });
     }
 
     const SchemaElement = struct { type: i32 = 0, repetition: i32 = 0, name: []const u8 = "", num_children: i32 = 0 };
@@ -446,27 +576,41 @@ pub const ParquetFile = struct {
         return h;
     }
 
-    /// PLAIN byte arrays: a 4-byte little-endian length before each value.
-    fn readPlain(allocator: std.mem.Allocator, data: []const u8, count: usize, out: *ParquetStrings) !void {
-        var pos: usize = 0;
-        for (0..count) |_| {
-            if (data.len - pos < 4) return error.InvalidParquet;
-            const n = std.mem.readInt(u32, data[pos..][0..4], .little);
-            pos += 4;
-            if (n > data.len - pos) return error.InvalidParquet;
-            try out.append(allocator, data[pos..][0..n]);
-            pos += n;
+    /// PLAIN values: byte arrays with a 4-byte little-endian length before
+    /// each, or little-endian int32/int64.
+    fn readPlain(allocator: std.mem.Allocator, info: ParquetColumn, data: []const u8, count: usize, out: *ParquetValues) !void {
+        switch (@as(PhysicalType, @enumFromInt(info.physical_type))) {
+            .byte_array => {
+                var pos: usize = 0;
+                for (0..count) |_| {
+                    if (data.len - pos < 4) return error.InvalidParquet;
+                    const n = std.mem.readInt(u32, data[pos..][0..4], .little);
+                    pos += 4;
+                    if (n > data.len - pos) return error.InvalidParquet;
+                    try out.strings.append(allocator, data[pos..][0..n]);
+                    pos += n;
+                }
+            },
+            .int32 => {
+                if (data.len < count * 4) return error.InvalidParquet;
+                for (0..count) |i| try out.ints.append(allocator, std.mem.readInt(i32, data[i * 4 ..][0..4], .little));
+            },
+            .int64 => {
+                if (data.len < count * 8) return error.InvalidParquet;
+                for (0..count) |i| try out.ints.append(allocator, std.mem.readInt(i64, data[i * 8 ..][0..8], .little));
+            },
+            _ => return unsupported("physical type"),
         }
     }
 
-    /// Definition levels (bit width 1): which slots are present.
-    fn decodeLevels(data: []const u8, width: u8, present: []bool) !void {
+    /// Repetition or definition levels.
+    fn decodeLevels(data: []const u8, width: u8, levels: []u8) !void {
         var buf: [256]u32 = undefined;
         var done: usize = 0;
         var r = Hybrid{ .data = data, .width = width };
-        while (done < present.len) {
-            const got = try r.next(buf[0..@min(buf.len, present.len - done)]);
-            for (buf[0..got], present[done..][0..got]) |v, *p| p.* = v == 1;
+        while (done < levels.len) {
+            const got = try r.next(buf[0..@min(buf.len, levels.len - done)]);
+            for (buf[0..got], levels[done..][0..got]) |v, *l| l.* = std.math.cast(u8, v) orelse return error.InvalidParquet;
             done += got;
         }
     }

@@ -51,7 +51,7 @@ pub const Train = struct {
             }
             options = mod.TrainOptions.cpu;
         }
-        try parseOptions(args, &options);
+        try args.fill(mod.TrainOptions, &options);
         const data_path = try args.string("data");
         const tag_arg = try args.string("model-tag");
         const resume_from = try args.int(i64, "resume-from-step", -1);
@@ -103,33 +103,6 @@ pub const Train = struct {
         try trainer.run();
         return 0;
     }
-
-    /// Fills `options` from `--kebab-case` flags named after its fields.
-    fn parseOptions(args: *cli.Args, options: *mod.TrainOptions) !void {
-        inline for (@typeInfo(mod.TrainOptions).@"struct".fields) |field| {
-            const flag = comptime blk: {
-                var name: [field.name.len]u8 = undefined;
-                for (field.name, 0..) |c, i| name[i] = if (c == '_') '-' else c;
-                const final = name;
-                break :blk &final;
-            };
-            switch (field.type) {
-                usize => {
-                    // Python's -1 sentinel means "disabled", which is 0 here.
-                    const v = try args.int(i64, flag, @intCast(@field(options, field.name)));
-                    @field(options, field.name) = if (v < 0) 0 else @intCast(v);
-                },
-                f64 => {
-                    const v = try args.float(flag, @field(options, field.name));
-                    @field(options, field.name) = if (v < 0) 0 else v;
-                },
-                []const u8 => if (try args.string(flag)) |v| {
-                    @field(options, field.name) = v;
-                },
-                else => @compileError("unhandled option type for " ++ field.name),
-            }
-        }
-    }
 };
 
 // -----------------------------------------------------------------------------
@@ -139,7 +112,7 @@ test "train maps base_train.py flags onto the options" {
     var args = try cli.Args.init(std.testing.allocator, &.{ "--depth", "8", "--window-pattern=SL", "--num-iterations", "-1", "--matrix-lr=0.05" });
     defer args.deinit();
     var options = mod.TrainOptions.cpu;
-    try cli.Train.parseOptions(&args, &options);
+    try args.fill(mod.TrainOptions, &options);
     try args.finish();
     try std.testing.expectEqual(@as(usize, 8), options.depth);
     try std.testing.expectEqualStrings("SL", options.window_pattern);

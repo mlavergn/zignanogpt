@@ -350,7 +350,7 @@ pub const ConsoleApp = struct {
     fn stopJob(self: *Self) void {
         if (!self.job.running()) return;
         const op = operations[self.job.operation orelse return];
-        if (op.command != .train) {
+        if (op.command != .train and op.command != .sft) {
             self.setNotice(true, "only training can be stopped; others run to the end");
             return;
         }
@@ -476,7 +476,7 @@ pub const ConsoleApp = struct {
         try lines.append(a, try a.dupe(Span, &.{
             .{ .text = if (on_run) "› " else "  ", .style = .{ .fg = Style.cursor.color(), .bold = true } },
             if (running_here)
-                .{ .text = if (op.command == .train) "■ running (s stops and saves)" else "■ running", .style = Style.warningText.style() }
+                .{ .text = if (op.command == .train or op.command == .sft) "■ running (s stops and saves)" else "■ running", .style = Style.warningText.style() }
             else
                 .{ .text = "▶ Run", .style = .{ .fg = Style.keyHint.color(), .bold = on_run } },
         }));
@@ -495,7 +495,7 @@ pub const ConsoleApp = struct {
             const top = try self.block(ctx, row, col, width, used, lines.items);
             const rest = height -| used;
             const snap = try self.job.snapshot(a);
-            const body = if (op.command == .train and snap.report != null)
+            const body = if ((op.command == .train or op.command == .sft) and snap.report != null)
                 try self.trainView(ctx, snap, width, rest)
             else
                 try self.logView(ctx, width, rest);

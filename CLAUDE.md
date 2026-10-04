@@ -146,6 +146,19 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   is `chat_cli.py`'s conversation; `cli/chat.zig` (CLI) and `cli/chat_job.zig` (console) both
   drive it.
 
+## Tasks, SFT and evals
+
+- `HubDataset` loads Hugging Face parquet exports by logical column path (`messages.role`,
+  `choices.text`): writers name list elements `item` or `element`. Rows are ordered by
+  `NumpyRandom` (numpy's PCG64 `permutation`); mixtures and few-shot picks by `PythonRandom`
+  (CPython's MT19937). Changes must keep `testdata/tasks.json` and `core.json` passing.
+- Fixtures under `testdata/task_base/task_data` are real slices in `load_hub_dataset`'s
+  layout; tests point `Config.base_dir` (or `nanochat_dir`, the read-only fallback) at them.
+- `SftLoader` caps renders at `min(2048, seq + 1)` (PLAN.md phase 10): the `sft` fixture runs
+  nanochat's chat_sft.py through `runpy` with that one patch and `Task.__len__` clamped.
+- `CoreEval` renders nanochat's three Jinja templates by hand (few-shot blocks joined by
+  a blank line, `trim` = Python `str.strip`); `../zigjinja` exists if general templates are needed.
+
 ## Console (TUI)
 
 - `zignanogpt` with no arguments on a terminal (or `zignanogpt tui`) opens the console;

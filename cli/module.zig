@@ -8,7 +8,9 @@ pub const nanogpt = @import("zignanogpt");
 pub const vaxis = @import("zigvaxis");
 
 pub const Args = @import("args.zig").Args;
+pub const BaseEval = @import("base_eval.zig").BaseEval;
 pub const Chat = @import("chat.zig").Chat;
+pub const ChatEval = @import("chat_eval.zig").ChatEval;
 pub const ChatJob = @import("chat_job.zig").ChatJob;
 pub const ChatRole = @import("chat_job.zig").ChatRole;
 pub const ChatSettings = @import("chat.zig").ChatSettings;
@@ -29,6 +31,7 @@ pub const OperationField = @import("operation.zig").Field;
 pub const Overview = @import("overview.zig").Overview;
 pub const OverviewLine = @import("overview.zig").OverviewLine;
 pub const Runner = @import("runner.zig").Runner;
+pub const Sft = @import("sft.zig").Sft;
 pub const TokEval = @import("tok_eval.zig").TokEval;
 pub const TokTrain = @import("tok_train.zig").TokTrain;
 pub const Train = @import("train.zig").Train;

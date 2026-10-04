@@ -109,9 +109,54 @@ pub const Operation = struct {
                 .{ .flag = "threads", .label = "threads", .hint = "empty: one per CPU" },
             },
         },
-        .{ .title = "Evaluate model", .summary = "Base model bpb and CORE.", .command = .eval },
-        .{ .title = "Fine-tune (SFT)", .summary = "Supervised fine-tuning on conversations.", .command = .sft },
-        .{ .title = "Evaluate chat", .summary = "ARC, MMLU and GSM8K.", .command = .@"chat-eval" },
+        .{
+            .title = "Evaluate model",
+            .summary = "base_eval.py: samples, train/val bpb and the CORE metric (eval bundle ~26 MB on first run).",
+            .command = .eval,
+            .fields = &.{
+                .{ .flag = "eval", .label = "modes", .default = "core,bpb,sample", .hint = "any of core, bpb, sample" },
+                .{ .flag = "model-tag", .label = "model tag", .hint = "empty: the largest d<N>" },
+                .{ .flag = "step", .label = "step", .hint = "empty: the last" },
+                .{ .flag = "max-per-task", .label = "max per task", .default = "16", .hint = "CORE examples per task (runcpu.sh: 16); empty: all" },
+                .{ .flag = "device-batch-size", .label = "bpb batch", .default = "1", .hint = "runcpu.sh: 1" },
+                .{ .flag = "split-tokens", .label = "bpb tokens", .default = "16384", .hint = "per split (runcpu.sh: 16384)" },
+                .{ .flag = "threads", .label = "threads", .hint = "empty: one per CPU" },
+            },
+        },
+        .{
+            .title = "Fine-tune (SFT)",
+            .summary = "chat_sft.py: SmolTalk + MMLU + GSM8K from a base checkpoint (data ~1 GB on first run). `s` saves and stops.",
+            .command = .sft,
+            .fields = &.{
+                .{ .flag = "model-tag", .label = "base model tag", .hint = "empty: the largest d<N>" },
+                .{ .flag = "model-step", .label = "base step", .hint = "empty: the last" },
+                .{ .flag = "num-iterations", .label = "iterations", .default = "1500", .hint = "runcpu.sh: 1500; empty or -1: one epoch" },
+                .{ .flag = "max-seq-len", .label = "max seq len", .hint = "empty: the base run's" },
+                .{ .flag = "device-batch-size", .label = "device batch", .hint = "empty: the base run's" },
+                .{ .flag = "total-batch-size", .label = "total batch", .hint = "empty: the base run's" },
+                .{ .flag = "eval-every", .label = "eval every", .default = "200" },
+                .{ .flag = "eval-tokens", .label = "eval tokens", .default = "524288", .hint = "runcpu.sh: 524288 (chat_sft.py: 20971520)" },
+                .{ .flag = "chatcore-every", .label = "ChatCORE every", .default = "200", .hint = "-1 disables" },
+                .{ .flag = "chatcore-max-cat", .label = "ChatCORE max cat", .hint = "problems per multiple-choice task; empty: all" },
+                .{ .flag = "chatcore-max-sample", .label = "ChatCORE max gen", .default = "24", .hint = "GSM8K problems" },
+                .{ .flag = "threads", .label = "threads", .hint = "empty: one per CPU" },
+                .{ .flag = "", .label = "more options", .hint = "any other chat_sft flags, e.g. --mmlu-epochs 1" },
+            },
+        },
+        .{
+            .title = "Evaluate chat",
+            .summary = "chat_eval.py: ARC-Easy, ARC-Challenge, MMLU (letter logits) and GSM8K (sampled); task data downloads on first use.",
+            .command = .@"chat-eval",
+            .fields = &.{
+                .{ .flag = "source", .label = "source", .hint = "base, sft or rl; empty: sft, or base while there is none" },
+                .{ .flag = "task-name", .label = "tasks", .hint = "e.g. ARC-Easy|MMLU; empty: all four" },
+                .{ .flag = "max-problems", .label = "max problems", .hint = "per task; empty: all" },
+                .{ .flag = "model-tag", .label = "model tag", .hint = "empty: the largest d<N>" },
+                .{ .flag = "step", .label = "step", .hint = "empty: the last" },
+                .{ .flag = "max-new-tokens", .label = "max new tokens", .default = "512", .hint = "GSM8K" },
+                .{ .flag = "threads", .label = "threads", .hint = "empty: one per CPU" },
+            },
+        },
         .{ .title = "Reinforcement (RL)", .summary = "RL on GSM8K.", .command = .rl },
     };
 
@@ -182,5 +227,5 @@ test "operation forms become command-line arguments" {
     try std.testing.expectEqualStrings("--tokenizer-only", toggled[2]);
     for (Operation.all) |op| try std.testing.expect(op.fields.len <= Operation.max_fields);
     try std.testing.expectEqual(@as(?u8, null), Operation.all[Operation.indexOf(.chat).?].phase());
-    try std.testing.expectEqual(@as(?u8, 10), Operation.all[Operation.indexOf(.sft).?].phase());
+    try std.testing.expectEqual(@as(?u8, 10), Operation.all[Operation.indexOf(.rl).?].phase());
 }

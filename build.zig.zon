@@ -1,7 +1,7 @@
 .{
     .name = .zignanogpt,
     .description = "Nanochat in pure Zig",
-    .version = "0.0.3",
+    .version = "0.0.4",
     .fingerprint = 0x40a6373274f306b8,
     .minimum_zig_version = "0.16.0",
     .paths = .{

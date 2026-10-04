@@ -109,6 +109,52 @@ pub const Args = struct {
         return false;
     }
 
+    /// Fills a struct from `--kebab-case` flags named after its fields
+    /// (`max_seq_len` <- `--max-seq-len`). `usize` and `f64` fields map Python's
+    /// negative "disabled" sentinel to 0; optional fields stay null when absent.
+    ///
+    /// Parameters:
+    /// - `self`: the parser.
+    /// - `T`: a struct of `usize`, `i64`, `f64`, `[]const u8` and optional fields.
+    /// - `options`: updated in place.
+    ///
+    /// Return: nothing; `error.InvalidValue`, `error.MissingValue`.
+    pub fn fill(self: *Self, comptime T: type, options: *T) !void {
+        inline for (@typeInfo(T).@"struct".fields) |field| {
+            const name_flag = comptime blk: {
+                var name: [field.name.len]u8 = undefined;
+                for (field.name, 0..) |c, i| name[i] = if (c == '_') '-' else c;
+                const final = name;
+                break :blk &final;
+            };
+            const target = &@field(options, field.name);
+            switch (field.type) {
+                usize => {
+                    const v = try self.int(i64, name_flag, @intCast(target.*));
+                    target.* = if (v < 0) 0 else @intCast(v);
+                },
+                i64 => target.* = try self.int(i64, name_flag, target.*),
+                f64 => {
+                    const v = try self.float(name_flag, target.*);
+                    target.* = if (v < 0) 0 else v;
+                },
+                []const u8 => if (try self.string(name_flag)) |v| {
+                    target.* = v;
+                },
+                ?usize => if (try self.string(name_flag)) |_| {
+                    const v = try self.int(i64, name_flag, 0);
+                    target.* = if (v < 0) null else @intCast(v);
+                },
+                ?f64 => if (try self.string(name_flag)) |_| {
+                    const v = try self.float(name_flag, 0);
+                    target.* = if (v < 0) null else v;
+                },
+                ?[]const u8 => target.* = try self.string(name_flag),
+                else => @compileError("unhandled option type for " ++ field.name),
+            }
+        }
+    }
+
     /// Fails on any argument no option consumed.
     ///
     /// Parameters:

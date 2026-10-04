@@ -74,8 +74,9 @@ pub const GptActivations = struct {
     /// Return: the activations; allocation errors, `error.SequenceTooLong`.
     pub fn init(allocator: std.mem.Allocator, backend: *mod.Backend, config: mod.GptConfig, batch: usize, seq: usize) !Self {
         log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
-        if (seq > config.sequence_len) {
-            log.warn("sequence {d} exceeds the model's {d}", .{ seq, config.sequence_len });
+        // As PyTorch's `assert T <= cos.size(1)`: the rotary table, not sequence_len, is the limit.
+        if (seq > config.rotarySeqLen()) {
+            log.warn("sequence {d} exceeds the model's rotary table ({d})", .{ seq, config.rotarySeqLen() });
             return error.SequenceTooLong;
         }
         var self: Self = undefined;
@@ -163,5 +164,5 @@ test "gpt activations size every buffer from the config" {
     defer acts.deinit();
     try std.testing.expectEqual(@as(usize, 2 * 8 * 128), acts.logits_pad.numel());
     try std.testing.expect(acts.layers[0].ve != null and acts.layers[1].ve == null and acts.layers[2].ve != null);
-    try std.testing.expectError(error.SequenceTooLong, mod.GptActivations.init(std.testing.allocator, &backend, config, 1, 17));
+    try std.testing.expectError(error.SequenceTooLong, mod.GptActivations.init(std.testing.allocator, &backend, config, 1, config.rotarySeqLen() + 1));
 }

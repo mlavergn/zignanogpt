@@ -74,7 +74,7 @@ pub const Console = struct {
 
             if (job.running()) {
                 const op = cli.Operation.all[job.operation orelse 0];
-                if (op.command == .train) {
+                if (op.command == .train or op.command == .sft) {
                     job.requestStop();
                     stopping_train = true;
                 } else {

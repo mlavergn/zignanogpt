@@ -27,6 +27,9 @@ pub const Runner = struct {
             .import => cli.Import.run(init, &args, out),
             .train => cli.Train.run(init, &args, out, observer),
             .chat => cli.Chat.run(init, &args, out, observer),
+            .@"chat-eval" => cli.ChatEval.run(init, &args, out),
+            .sft => cli.Sft.run(init, &args, out, observer),
+            .eval => cli.BaseEval.run(init, &args, out),
             else => {
                 try out.print("{s}: not implemented yet (PLAN.md phase {d})\n", .{ @tagName(command), command.phase() orelse 0 });
                 return error.NotImplemented;

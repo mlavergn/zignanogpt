@@ -193,6 +193,21 @@ pub const MuonAdamW = struct {
         }
     }
 
+    /// Multiplies every group's learning rate, and makes the result its new
+    /// initial LR (`chat_sft.py`'s `init_lr_frac`).
+    ///
+    /// Parameters:
+    /// - `self`: the optimizer.
+    /// - `factor`: the multiplier.
+    ///
+    /// Return: nothing.
+    pub fn scaleLearningRates(self: *Self, factor: f64) void {
+        for (self.groups) |*group| {
+            group.lr *= factor;
+            group.initial_lr = group.lr;
+        }
+    }
+
     /// One optimizer step. Muon groups use `grads` as scratch (they hold the
     /// orthogonalized update afterwards); zero them before the next step.
     ///

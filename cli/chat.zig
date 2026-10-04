@@ -164,7 +164,7 @@ pub const Chat = struct {
                 allocator.free(tags);
             }
             if (tags.len > 0) break :blk mod.CheckpointKind.sft;
-            try out.writeAll("No sft model yet: chatting with the base model (it continues text rather than answering).\n");
+            try out.writeAll("No sft model yet: using the base model (it continues text rather than answering).\n");
             break :blk mod.CheckpointKind.base;
         };
         try loaded.init(allocator, backend, storage, config.base_dir, .{ .kind = kind, .tag = settings.tag, .step = settings.step });

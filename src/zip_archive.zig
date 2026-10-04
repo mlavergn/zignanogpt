@@ -13,8 +13,8 @@ pub const ZipEntry = struct {
 
 /// A zip archive read through zigstorage ranged reads: the central directory
 /// once, then each member on demand. Zip64 is supported (multi-GB PyTorch
-/// checkpoints use it); only stored (uncompressed) members can be read, which
-/// is what `torch.save` writes.
+/// checkpoints use it). Members are stored (what `torch.save` writes) or
+/// deflated (e.g. nanochat's `eval_bundle.zip`).
 pub const ZipArchive = struct {
     const Self = @This();
 
@@ -96,16 +96,16 @@ pub const ZipArchive = struct {
         return error.MissingZipEntry;
     }
 
-    /// Reads a stored member.
+    /// Reads a member, inflating it when deflated.
     ///
     /// Parameters:
     /// - `self`: the archive.
     /// - `entry`: from `entries` or `find`.
     ///
-    /// Return: the bytes, owned by the caller; `error.UnsupportedZip` for a compressed member.
+    /// Return: the bytes, owned by the caller; `error.UnsupportedZip` for other compression methods.
     pub fn read(self: *Self, entry: ZipEntry) ![]u8 {
-        if (entry.method != 0) {
-            log.warn("zip member {s} is compressed (method {d}); only stored members are supported", .{ entry.name, entry.method });
+        if (entry.method != 0 and entry.method != 8) {
+            log.warn("zip member {s} uses compression method {d}; only stored and deflate are supported", .{ entry.name, entry.method });
             return error.UnsupportedZip;
         }
         const header = try self.node.read(.{ .offset = entry.local_header_offset, .length = 30 });
@@ -113,7 +113,23 @@ pub const ZipArchive = struct {
         if (header.len < 30 or !std.mem.eql(u8, header[0..4], "PK\x03\x04")) return error.InvalidZip;
         const name_len = std.mem.readInt(u16, header[26..28], .little);
         const extra_len = std.mem.readInt(u16, header[28..30], .little);
-        const data = try self.node.read(.{ .offset = entry.local_header_offset + 30 + name_len + extra_len, .length = entry.size });
+        const offset = entry.local_header_offset + 30 + name_len + extra_len;
+        if (entry.method == 8) {
+            const packed_bytes = try self.node.read(.{ .offset = offset, .length = entry.compressed_size });
+            defer self.allocator.free(packed_bytes);
+            if (packed_bytes.len != entry.compressed_size) return error.InvalidZip;
+            var in: std.Io.Reader = .fixed(packed_bytes);
+            var inflate: std.compress.flate.Decompress = .init(&in, .raw, &.{});
+            var out: std.Io.Writer.Allocating = .init(self.allocator);
+            errdefer out.deinit();
+            _ = inflate.reader.streamRemaining(&out.writer) catch |err| {
+                log.warn("zip member {s} failed to inflate [{t}]", .{ entry.name, inflate.err orelse err });
+                return error.InvalidZip;
+            };
+            if (out.written().len != entry.size) return error.InvalidZip;
+            return out.toOwnedSlice();
+        }
+        const data = try self.node.read(.{ .offset = offset, .length = entry.size });
         errdefer self.allocator.free(data);
         if (data.len != entry.size) return error.InvalidZip;
         return data;
