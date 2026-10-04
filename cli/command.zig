@@ -7,6 +7,7 @@ pub const Command = enum {
     const Self = @This();
 
     help,
+    tui,
     version,
     config,
     download,
@@ -41,10 +42,7 @@ pub const Command = enum {
     /// Return: the phase number, or null when the command already works.
     pub fn phase(self: Self) ?u8 {
         return switch (self) {
-            .help, .version, .config, .@"tok-train", .@"tok-eval" => null,
-            .download => 6,
-            .import => 7,
-            .train => 8,
+            .help, .tui, .version, .config, .@"tok-train", .@"tok-eval", .download, .import, .train => null,
             .chat => 9,
             .eval, .sft, .@"chat-eval", .rl => 10,
         };
@@ -59,6 +57,7 @@ pub const Command = enum {
     pub fn summary(self: Self) []const u8 {
         return switch (self) {
             .help => "Show this help",
+            .tui => "Open the console (the default on a terminal)",
             .version => "Print the version",
             .config => "Print the resolved base directories",
             .download => "Download ClimbMix pretraining shards",

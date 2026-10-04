@@ -32,6 +32,57 @@ pub const GptConfig = struct {
     /// Window per layer, tiled: `L` full context, `S` a quarter; the last layer is always `L`.
     window_pattern: []const u8 = "SSSL",
 
+    /// Reads nanochat's `model_config` JSON (as saved in a checkpoint's meta).
+    /// A missing `window_pattern` means `L`, as `checkpoint_manager.py` patches
+    /// old checkpoints.
+    ///
+    /// Parameters:
+    /// - `arena`: copies the window pattern (it must outlive the config).
+    /// - `value`: the `model_config` object.
+    ///
+    /// Return: the config; `error.InvalidConfig` on a missing or bad field.
+    pub fn fromJson(arena: std.mem.Allocator, value: std.json.Value) !Self {
+        if (value != .object) return error.InvalidConfig;
+        const field = struct {
+            fn int(v: std.json.Value, key: []const u8) !usize {
+                const x = v.object.get(key) orelse {
+                    log.warn("model_config lacks {s}", .{key});
+                    return error.InvalidConfig;
+                };
+                if (x != .integer or x.integer <= 0) return error.InvalidConfig;
+                return @intCast(x.integer);
+            }
+        };
+        const pattern = if (value.object.get("window_pattern")) |p| (if (p == .string) p.string else return error.InvalidConfig) else "L";
+        const self = Self{
+            .sequence_len = try field.int(value, "sequence_len"),
+            .vocab_size = try field.int(value, "vocab_size"),
+            .n_layer = try field.int(value, "n_layer"),
+            .n_head = try field.int(value, "n_head"),
+            .n_kv_head = try field.int(value, "n_kv_head"),
+            .n_embd = try field.int(value, "n_embd"),
+            .window_pattern = try arena.dupe(u8, pattern),
+        };
+        try self.validate();
+        return self;
+    }
+
+    /// Writes the config as nanochat's `model_config` JSON object.
+    ///
+    /// Parameters:
+    /// - `self`: the config.
+    /// - `jw`: a JSON writer positioned where the object goes.
+    ///
+    /// Return: nothing; write errors.
+    pub fn jsonStringify(self: Self, jw: anytype) !void {
+        try jw.beginObject();
+        inline for (.{ "sequence_len", "vocab_size", "n_layer", "n_head", "n_kv_head", "n_embd", "window_pattern" }) |name| {
+            try jw.objectField(name);
+            try jw.write(@field(self, name));
+        }
+        try jw.endObject();
+    }
+
     /// Checks the dimensions fit together.
     ///
     /// Parameters:
@@ -120,6 +171,12 @@ pub const GptConfig = struct {
         return total;
     }
 
+    /// The parameters nanochat's scaling laws count: every transformer block
+    /// parameter plus `lm_head` (`num_scaling_params`' `transformer_matrices + lm_head`).
+    pub fn numScalingParams(self: Self) usize {
+        return self.numMatmulParams() - smear_channels;
+    }
+
     /// Every parameter (`sum(p.numel())`).
     pub fn numParams(self: Self) usize {
         var total = self.numMatmulParams() + self.paddedVocab() * self.n_embd; // + wte
@@ -155,7 +212,23 @@ test "gpt config counts match the python fixture" {
     try std.testing.expectEqual(@as(usize, 320), config.paddedVocab());
     try std.testing.expectEqual(@as(usize, 241746), config.numParams());
     try std.testing.expectEqual(@as(usize, 1892784), config.flopsPerToken());
+    try std.testing.expectEqual(@as(usize, 241746 - 320 * 64 - 2 * 320 * 32 - 2 * 4 - 2 - 24), config.numScalingParams());
     try std.testing.expect(config.hasValueEmbed(1) and config.hasValueEmbed(3) and !config.hasValueEmbed(0));
+}
+
+test "gpt config round-trips nanochat's model_config json" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"sequence_len": 64, "vocab_size": 1033, "n_layer": 1, "n_head": 4, "n_kv_head": 2, "n_embd": 64}
+    , .{});
+    defer parsed.deinit();
+    const config = try mod.GptConfig.fromJson(arena.allocator(), parsed.value);
+    try std.testing.expectEqualStrings("L", config.window_pattern); // legacy default
+    const text = try std.json.Stringify.valueAlloc(allocator, config, .{});
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"window_pattern\":\"L\"") != null);
 }
 
 test "gpt config rejects inconsistent shapes" {

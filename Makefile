@@ -8,7 +8,7 @@
 
 .DEFAULT_GOAL := all
 
-.PHONY: all validate build dist run demo linux windows targets test bench format lint fixtures docs tag st open github clone claude clean
+.PHONY: all validate build dist run cli demo linux windows targets test bench format lint fixtures docs tag st open github clone claude clean
 
 # ---------------------------------------------
 # Configuration
@@ -59,6 +59,12 @@ dist:
 # Build and run the CLI. Pass arguments with `make run ARGS="Zig"`.
 run:
 	zig build run -- $(ARGS)
+
+# Open the console (the TUI) on this terminal, from a ReleaseFast build: training
+# in Debug is many times slower. Point it elsewhere with ZIGNANOGPT_BASE_DIR=<dir>.
+cli:
+	zig build --release=fast
+	./zig-out/bin/zignanogpt tui
 
 # Build and run the web console on a random port; it opens a browser itself.
 demo:

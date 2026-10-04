@@ -369,7 +369,7 @@ pub const Tokenizer = struct {
         const path = try std.fs.path.join(allocator, &.{ dir, file_name });
         defer allocator.free(path);
         const text = storage.read(path) catch |err| {
-            log.err("no tokenizer at {s}; run `zignanogpt tok-train` first [{t}]", .{ path, err });
+            log.warn("no tokenizer at {s}; run `zignanogpt tok-train` first [{t}]", .{ path, err });
             return err;
         };
         defer allocator.free(text);

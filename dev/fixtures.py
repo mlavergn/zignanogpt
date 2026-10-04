@@ -258,6 +258,145 @@ def tokenizer(out):
         json.dump(data, f, ensure_ascii=False)
 
 
+# -----------------------------------------------------------------------------
+# Phase 6: parquet and the dataloader
+
+def _tokenizer_from_fixture(out):
+    """The phase-5 fixture tokenizer, rebuilt as a nanochat RustBPETokenizer."""
+    import tiktoken
+    from nanochat.tokenizer import RustBPETokenizer, SPLIT_PATTERN, SPECIAL_TOKENS
+    with open(os.path.join(out, "tokenizer.json"), encoding="utf-8") as f:
+        data = json.load(f)
+    ranks = {bytes(b): i for i, b in enumerate(data["ranks"])}
+    specials = {s: len(ranks) + i for i, s in enumerate(SPECIAL_TOKENS)}
+    enc = tiktoken.Encoding(name="fixture", pat_str=SPLIT_PATTERN, mergeable_ranks=ranks, special_tokens=specials)
+    return RustBPETokenizer(enc, "<|bos|>"), data["docs"]
+
+
+@fixture
+def parquet(out):
+    """Small parquet files covering the encodings the reader supports, and their strings."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    os.makedirs(os.path.join(out, "parquet"), exist_ok=True)
+    rng_texts = [f"document {i}: " + "word " * (i % 37) + "é" * (i % 3) for i in range(100)]
+    with_nulls = [None if i % 11 == 5 else t for i, t in enumerate(rng_texts)]
+    repeated = [["alpha", "beta", "gamma", "δέλτα"][i % 4] for i in range(100)]
+    variants = {
+        "v1_zstd_nulls": (with_nulls, True, dict(compression="zstd", data_page_version="1.0", use_dictionary=False, data_page_size=512)),
+        "v2_zstd": (rng_texts, True, dict(compression="zstd", data_page_version="2.0", use_dictionary=False, data_page_size=512)),
+        "dict_snappy": (repeated, True, dict(compression="snappy", data_page_version="1.0", use_dictionary=True)),
+        "plain_required": (rng_texts, False, dict(compression="none", use_dictionary=False)),
+    }
+    expected = {}
+    for name, (texts, nullable, opts) in variants.items():
+        schema = pa.schema([pa.field("text", pa.string(), nullable=nullable)])
+        table = pa.table({"text": pa.array(texts, type=pa.string())}, schema=schema)
+        pq.write_table(table, os.path.join(out, "parquet", f"{name}.parquet"), row_group_size=32, **opts)
+        pf = pq.ParquetFile(os.path.join(out, "parquet", f"{name}.parquet"))
+        expected[name] = [[t for t in pf.read_row_group(i).column("text").to_pylist() if t is not None]
+                          for i in range(pf.num_row_groups)]
+    with open(os.path.join(out, "parquet", "expected.json"), "w", encoding="utf-8") as f:
+        json.dump(expected, f, ensure_ascii=False)
+
+
+LOADER_B, LOADER_T, LOADER_TOK_BATCH, LOADER_BUFFER = 2, 48, 8, 24
+
+
+@fixture
+def dataloader(out):
+    """A 3-shard dataset (2 train + val) and the bestfit loader's batches, resume included."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import nanochat.dataloader as dl
+    tok, docs = _tokenizer_from_fixture(out)
+    shard_dir = os.path.join(out, "shards")
+    os.makedirs(shard_dir, exist_ok=True)
+    thirds = [docs[:250], docs[250:450], docs[450:]]
+    paths = []
+    for i, part in enumerate(thirds):
+        path = os.path.join(shard_dir, f"shard_{i:05d}.parquet")
+        pq.write_table(pa.table({"text": part}), path, row_group_size=16, compression="zstd")
+        paths.append(path)
+    dl.list_parquet_files = lambda *a, **k: list(paths)
+
+    def run(split, n, resume=None):
+        loader = dl.tokenizing_distributed_data_loader_with_state_bos_bestfit(
+            tok, LOADER_B, LOADER_T, split, tokenizer_batch_size=LOADER_TOK_BATCH, device="cpu",
+            resume_state_dict=resume, buffer_size=LOADER_BUFFER)
+        batches = []
+        for _ in range(n):
+            x, y, state = next(loader)
+            batches.append({"inputs": x.flatten().tolist(), "targets": y.flatten().tolist(), "state": state})
+        return batches
+
+    train = run("train", 300)  # crosses both train files and into epoch 3
+    resumed = run("train", 10, resume=train[130]["state"])
+    val = run("val", 5)
+    data = dict(B=LOADER_B, T=LOADER_T, tokenizer_batch_size=LOADER_TOK_BATCH, buffer_size=LOADER_BUFFER,
+                train=train, resume_from=130, resumed=resumed, val=val)
+    with open(os.path.join(out, "dataloader.json"), "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+
+# -----------------------------------------------------------------------------
+# Phase 7: importing Python checkpoints
+
+IMPORT_CONFIGS = {
+    # d2: a current checkpoint, as base_train writes it on a GPU (bf16 embeddings).
+    "d2": dict(sequence_len=64, vocab_size=1033, n_layer=2, n_head=4, n_kv_head=2, n_embd=64, window_pattern="SL"),
+    # d1: a legacy checkpoint: torch.compile key prefix, no resid/x0 lambdas, no window_pattern.
+    "d1": dict(sequence_len=64, vocab_size=1033, n_layer=1, n_head=4, n_kv_head=2, n_embd=64),
+}
+
+
+@fixture
+def nanochat_import(out):
+    """A fake nanochat base dir (checkpoints, meta, tokenizer.pkl) and build_model's logits."""
+    import shutil
+    import torch
+    from nanochat.gpt import GPT, GPTConfig
+    base = os.path.join(out, "nanochat_base")
+    shutil.rmtree(base, ignore_errors=True)
+    tok, _ = _tokenizer_from_fixture(out)
+    tok.save(os.path.join(base, "tokenizer"))
+    torch.manual_seed(99)
+    idx = torch.randint(0, 1033, (1, 20))
+    tensors = {"idx": idx.to(torch.int32)}
+    for tag, cfg in IMPORT_CONFIGS.items():
+        model = GPT(GPTConfig(**cfg))
+        model.init_weights()
+        with torch.no_grad():
+            for p in model.parameters():
+                p.add_(torch.randn_like(p) * 0.1)
+        sd = model.state_dict()
+        if tag == "d1":
+            sd = {f"_orig_mod.{k}": v for k, v in sd.items() if k not in ("resid_lambdas", "x0_lambdas")}
+            meta_cfg = {k: v for k, v in cfg.items()}
+        else:
+            sd = {k: (v.to(torch.bfloat16) if k.startswith(("transformer.wte", "value_embeds")) else v) for k, v in sd.items()}
+            meta_cfg = dict(cfg)
+        ckpt = os.path.join(base, "base_checkpoints", tag)
+        os.makedirs(ckpt, exist_ok=True)
+        torch.save(sd, os.path.join(ckpt, "model_000005.pt"))
+        meta = {"step": 5, "val_bpb": 1.25, "model_config": meta_cfg, "user_config": {"depth": cfg["n_layer"]},
+                "device_batch_size": 4, "max_seq_len": cfg["sequence_len"], "total_batch_size": 256,
+                "dataloader_state_dict": {"pq_idx": 0, "rg_idx": 3, "epoch": 1},
+                "loop_state": {"min_val_bpb": 1.25, "smooth_train_loss": 3.5, "total_training_time": 12.0}}
+        with open(os.path.join(ckpt, "meta_000005.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+        if tag == "d2":
+            open(os.path.join(ckpt, "model_000003.pt"), "wb").close()  # older step; never loaded
+    # Expected logits come from nanochat's own loader, which upcasts bf16 and patches legacy keys.
+    os.environ["NANOCHAT_BASE_DIR"] = base
+    from nanochat.checkpoint_manager import build_model
+    for tag in IMPORT_CONFIGS:
+        model, _, _ = build_model(os.path.join(base, "base_checkpoints", tag), 5, torch.device("cpu"), "eval")
+        with torch.no_grad():
+            tensors[f"logits.{tag}"] = model(idx)
+    write_safetensors(os.path.join(out, "nanochat_import.safetensors"), tensors)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", default="testdata", help="output directory")

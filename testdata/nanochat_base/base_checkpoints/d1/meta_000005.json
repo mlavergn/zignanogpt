@@ -1,0 +1,28 @@
+{
+  "step": 5,
+  "val_bpb": 1.25,
+  "model_config": {
+    "sequence_len": 64,
+    "vocab_size": 1033,
+    "n_layer": 1,
+    "n_head": 4,
+    "n_kv_head": 2,
+    "n_embd": 64
+  },
+  "user_config": {
+    "depth": 1
+  },
+  "device_batch_size": 4,
+  "max_seq_len": 64,
+  "total_batch_size": 256,
+  "dataloader_state_dict": {
+    "pq_idx": 0,
+    "rg_idx": 3,
+    "epoch": 1
+  },
+  "loop_state": {
+    "min_val_bpb": 1.25,
+    "smooth_train_loss": 3.5,
+    "total_training_time": 12.0
+  }
+}

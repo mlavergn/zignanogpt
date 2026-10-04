@@ -658,6 +658,39 @@ pub const CpuBackend = struct {
         elems(f32, loss)[0] = @floatCast(total / count);
     }
 
+    /// Per-row cross-entropy (`reduction='none'`): `-log softmax(logits[r])[targets[r]]`,
+    /// 0 where the target is -1.
+    ///
+    /// Parameters:
+    /// - `self`: the backend.
+    /// - `losses`: `R` outputs.
+    /// - `logits`: `[R, V]`.
+    /// - `targets`: `R` i32 classes, or -1.
+    ///
+    /// Return: nothing; shape/dtype errors, `error.OutOfBounds`.
+    pub fn crossEntropyRows(self: *Self, losses: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor) !void {
+        const rows, const vocab = try self.checkTargets(logits, targets);
+        if (losses.dtype != .f32) return error.DtypeMismatch;
+        if (losses.numel() != rows) return mismatch("crossEntropyRows", losses.shape, logits.shape);
+        const Ctx = struct {
+            losses: []f32,
+            logits: []const f32,
+            targets: []const i32,
+            vocab: usize,
+            fn body(ctx: @This(), start: usize, end: usize) void {
+                for (start..end) |r| {
+                    if (ctx.targets[r] < 0) {
+                        ctx.losses[r] = 0;
+                        continue;
+                    }
+                    const row = ctx.logits[r * ctx.vocab ..][0..ctx.vocab];
+                    ctx.losses[r] = @floatCast(logSumExp(row) - row[@intCast(ctx.targets[r])]);
+                }
+            }
+        };
+        try self.forRows(rows, vocab, Ctx{ .losses = elems(f32, losses), .logits = elems(f32, logits), .targets = elems(i32, targets), .vocab = vocab }, Ctx.body);
+    }
+
     /// Gradient of `scale * crossEntropy(softcap(logits_pad))` with respect to
     /// the padded, uncapped logits: `(softmax - onehot) * scale / count`, times
     /// the soft cap's derivative `1 - (z / cap)^2`; ignored rows and padding

@@ -7,8 +7,8 @@ const mod = cli.nanogpt;
 /// and writes it to `<base dir>/tokenizer/tokenizer.tiktoken`.
 pub const TokTrain = struct {
     pub const usage =
-        \\usage: zignanogpt tok-train --data <file> [--vocab-size 32768] [--max-chars 2000000000] [--doc-cap 10000]
-        \\  --data        text file; documents are separated by blank lines
+        \\usage: zignanogpt tok-train [--data <file>] [--vocab-size 32768] [--max-chars 2000000000] [--doc-cap 10000]
+        \\  --data        text file (documents separated by blank lines); default: the train shards
         \\  --vocab-size  total vocabulary including the 9 special tokens
         \\  --max-chars   stop after this many characters
         \\  --doc-cap     crop each document to this many characters
@@ -26,10 +26,7 @@ pub const TokTrain = struct {
     pub fn run(init: std.process.Init, args: *cli.Args, out: *std.Io.Writer) !u8 {
         log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
         const allocator = init.gpa;
-        const data = try args.string("data") orelse {
-            try out.writeAll(usage);
-            return 2;
-        };
+        const data = try args.string("data");
         const vocab_size = try args.int(usize, "vocab-size", 32768);
         const max_chars = try args.int(usize, "max-chars", 2_000_000_000);
         const doc_cap = try args.int(usize, "doc-cap", 10_000);
@@ -40,24 +37,24 @@ pub const TokTrain = struct {
             return 2;
         }
 
-        var config = try mod.Config.init(allocator, init.environ_map);
+        var config = try mod.Config.load(allocator, init.environ_map, mod.Storage.init(allocator, init.io));
         defer config.deinit();
         const storage = mod.Storage.init(allocator, init.io);
-        var dataset = try mod.TextDataset.load(allocator, storage, data);
-        defer dataset.deinit();
         try out.print("max_chars: {d}\ndoc_cap: {d}\nvocab_size: {d}\n", .{ max_chars, doc_cap, vocab_size });
         try out.flush();
 
         const start = std.Io.Clock.awake.now(init.io);
         var trainer = mod.TokenizerTrainer.init(allocator, mod.Tokenizer.nanochat_max_digits);
         defer trainer.deinit();
-        var chars: usize = 0;
-        for (dataset.docs) |doc| {
-            const capped = capChars(doc, doc_cap);
-            try trainer.addText(capped.text);
-            chars += capped.chars;
-            if (chars > max_chars) break;
+        var feed = Feed{ .trainer = &trainer, .doc_cap = doc_cap, .max_chars = max_chars };
+        if (data) |path| {
+            var text = try mod.TextDataset.load(allocator, storage, path);
+            defer text.deinit();
+            for (text.docs) |doc| if (!try feed.add(doc)) break;
+        } else {
+            try feedShards(allocator, init.io, &config, &feed, out);
         }
+        const chars = feed.chars;
         try out.print("{d} characters, {d} unique pieces\n", .{ chars, trainer.uniquePieces() });
         try out.flush();
         const tokens = try trainer.train(allocator, vocab_size - specials);
@@ -84,6 +81,49 @@ pub const TokTrain = struct {
         if (!std.mem.eql(u8, decoded, sample)) return error.RoundTripFailed;
         try out.print("Round trip ok: {d} bytes -> {d} tokens\n", .{ sample.len, ids.len });
         return 0;
+    }
+
+    /// Counts documents into the trainer until `max_chars`, as tok_train.py's iterator.
+    const Feed = struct {
+        trainer: *mod.TokenizerTrainer,
+        doc_cap: usize,
+        max_chars: usize,
+        chars: usize = 0,
+
+        /// Adds one document; false once the character budget is spent.
+        fn add(self: *Feed, doc: []const u8) !bool {
+            const capped = capChars(doc, self.doc_cap);
+            try self.trainer.addText(capped.text);
+            self.chars += capped.chars;
+            return self.chars <= self.max_chars;
+        }
+    };
+
+    /// One pass over the train shards (all but the last), row group by row group.
+    fn feedShards(allocator: std.mem.Allocator, io: std.Io, config: *const mod.Config, feed: *Feed, out: *std.Io.Writer) !void {
+        var dataset = try mod.Dataset.init(allocator, io, config);
+        defer dataset.deinit();
+        const paths = try dataset.list(allocator);
+        defer {
+            for (paths) |p| allocator.free(p);
+            allocator.free(paths);
+        }
+        if (paths.len < 2) {
+            try out.print("need at least one train shard and the val shard; run `zignanogpt download -n 8`\n", .{});
+            return error.NoShards;
+        }
+        var strings: mod.ParquetStrings = .{};
+        defer strings.deinit(allocator);
+        for (paths[0 .. paths.len - 1]) |path| {
+            var file = try mod.ParquetFile.open(allocator, io, path);
+            defer file.deinit();
+            const col = try file.column("text");
+            for (0..file.row_groups.len) |rg| {
+                strings.clear();
+                try file.readStrings(rg, col, &strings);
+                for (0..strings.len()) |i| if (!try feed.add(strings.get(i))) return;
+            }
+        }
     }
 
     const Capped = struct { text: []const u8, chars: usize };

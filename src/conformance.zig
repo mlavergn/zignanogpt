@@ -42,7 +42,7 @@ pub const Conformance = struct {
         "rmsnormBackward",   "ropeBackward",       "attentionBackward", "reluSquareBackward",
         "dot",               "gateLinearBackward", "smearBackward",     "valueMixBackward",
         "embeddingBackward", "adamwStep",          "muonMomentum",      "muonPrepare",
-        "muonFinish",
+        "muonFinish",        "crossEntropyRows",
     };
 
     /// Fails compilation when `B` misses part of the contract.
@@ -650,6 +650,18 @@ pub const Conformance = struct {
         for (0..4) |r| try std.testing.expectEqual(@as(f32, 0), g[r * 6 + 5]); // padding column
         for (0..6) |c| try std.testing.expectEqual(@as(f32, 0), g[6 + c]); // ignored row
         try gradCheck(B, backend, allocator, "crossEntropy", pad, hp, loss, &.{1}, g, ctx);
+
+        // Per-row losses average to the mean loss over the non-ignored rows.
+        const rows = try backend.alloc(.f32, &.{4});
+        defer backend.free(rows);
+        try ctx.run();
+        try backend.crossEntropyRows(rows, capped, targets);
+        var row_losses: [4]f32 = undefined;
+        try backend.download(rows, f32, &row_losses);
+        var mean: [1]f32 = undefined;
+        try backend.download(loss, f32, &mean);
+        try std.testing.expectEqual(@as(f32, 0), row_losses[1]);
+        try std.testing.expectApproxEqAbs(mean[0], (row_losses[0] + row_losses[2] + row_losses[3]) / 3, 1e-6);
         try backend.crossEntropyBackward(dpad, capped, targets, 3, 0.5);
         const half = try hostCopy(B, backend, allocator, dpad);
         defer allocator.free(half);

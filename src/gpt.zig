@@ -214,6 +214,49 @@ pub const Gpt = struct {
         try be.embeddingBackward(grads.wte, g.demb, idx);
     }
 
+    /// Greedy decoding without a KV cache: each step runs the whole forward
+    /// pass over the sequence so far, padded to its final length (causal
+    /// attention keeps the padding from mattering), and appends the argmax.
+    ///
+    /// Parameters:
+    /// - `self`: the model.
+    /// - `allocator`: allocates the result and scratch.
+    /// - `prompt`: the starting tokens (e.g. BOS + prompt), non-empty.
+    /// - `max_new`: tokens to generate at most (capped by `sequence_len`).
+    /// - `stop`: a token that ends generation (not appended), or null.
+    ///
+    /// Return: the generated tokens (without the prompt), owned by the caller.
+    pub fn greedy(self: *Self, allocator: std.mem.Allocator, prompt: []const u32, max_new: usize, stop: ?u32) ![]u32 {
+        log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
+        if (prompt.len == 0) return error.EmptyPrompt;
+        const len = @min(prompt.len + max_new, self.config.sequence_len);
+        if (len <= prompt.len) return allocator.alloc(u32, 0);
+        var acts = try mod.GptActivations.init(allocator, self.backend, self.config, 1, len);
+        defer acts.deinit();
+        const ids = try allocator.alloc(i32, len);
+        defer allocator.free(ids);
+        @memset(ids, 0);
+        for (prompt, 0..) |t, i| ids[i] = @intCast(t);
+        const idx = try self.backend.alloc(.i32, &.{ 1, len });
+        defer self.backend.free(idx);
+        const row = try allocator.alloc(f32, self.config.vocab_size);
+        defer allocator.free(row);
+        var out: std.ArrayList(u32) = .empty;
+        errdefer out.deinit(allocator);
+        var n = prompt.len;
+        while (n < len) : (n += 1) {
+            try self.backend.upload(idx, i32, ids);
+            try self.forward(&acts, idx);
+            const logits = try acts.logits.reshape(&.{ len, self.config.vocab_size });
+            try self.backend.download(try logits.rows(n - 1, 1), f32, row);
+            const next: u32 = @intCast(std.mem.indexOfMax(f32, row));
+            if (stop != null and next == stop.?) break;
+            try out.append(allocator, next);
+            ids[n] = @intCast(next);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
     /// One block's backward: on entry `g.dx` is the gradient of the block
     /// output; on exit it is the gradient of the block input `x_in`.
     fn blockBackward(self: *Self, layer: mod.GptLayer, grad: *mod.GptLayer, la: mod.GptLayerActivations, g: *mod.GptGradBuffers, idx: mod.Tensor, window: usize) !void {

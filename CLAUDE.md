@@ -96,19 +96,68 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   rejects typos. User-facing problems log at `warn` (tests fail on `log.err`).
 - `Storage` (src/storage.zig) is the one place files are read/written (zigstorage, atomic).
 
+## Data
+
+- `Dataset` lists/downloads ClimbMix shards (`shard_NNNNN.parquet`, last = val);
+  `DocumentStream` is nanochat's `_document_batches` as a state machine (files -> row groups ->
+  batches, epochs, resume skips to the row group after the saved one); `DataLoader` is the
+  BOS-aligned best-fit packer. Its doc buffer must stay ordered (`orderedRemove`): selection
+  ties go to the first match, exactly as Python's list scan.
+- `ParquetFile` decodes flat byte-array columns only; nested columns (HF chat datasets) are
+  phase 10. `zig` keywords bite: `resume` is reserved, `i0`/`u8`-style names are types.
+
+## Checkpoints
+
+- Layout follows nanochat: `<base>/{base,chatsft,chatrl}_checkpoints/<tag>/{model,optim,meta}_<step:06>`;
+  this port writes `.safetensors` (f32, PyTorch names), Python's are `.pt`. `Checkpoint` finds
+  the largest `d<N>` tag and last step. `zignanogpt import` converts Python checkpoints
+  (`TorchImport`); it overwrites `<base>/tokenizer` with the checkpoint's tokenizer.
+- zigstorage treats a scheme-less relative path as a URL host: build paths from `Config.load`
+  (absolute) and pass user paths through `Storage.absolute`. `Storage` methods do this already;
+  code that opens `zigstorage.Node` directly (Parquet, zip, safetensors, listings) does not.
+
+## Training
+
+- `TrainPlan` reproduces `base_train.py`'s derivations (model shape from depth, d12-relative
+  scaling laws, batch-size LR and weight-decay scaling, iterations, grad accumulation); its
+  tests pin Python's numbers for the CPU preset and default d20. `TrainOptions` fields map 1:1
+  to `--kebab-case` flags (`cli/train.zig` reflects over them); 0 means Python's -1.
+- `Trainer.run` mirrors base_train's loop (eval/sample/save at the top, `num_iterations + 1`
+  passes). Resume is approximate by design (data restarts at the next row group). Checkpoints
+  and `metrics.jsonl` live in `<base>/base_checkpoints/<tag>/`.
+
+## Console (TUI)
+
+- `zignanogpt` with no arguments on a terminal (or `zignanogpt tui`) opens the console;
+  piped, it prints usage. `zignanogpt train` on a terminal opens the console on the Train
+  page and starts the run there (`--no-tui` for plain logs). Layout after `../../inferise/zigprompt/cli`:
+  operations left, the selected one's form + output (or live training view) right, a status
+  line of live keys. Built on zigvaxis `vxfw` (`ConsoleApp` is the root widget).
+- `Operation.all` is the left pane: each entry is a `Command` plus form `Field`s that map to
+  its flags (`Operation.args`). A new command gets an entry there and a case in `Runner`.
+- `Job` runs one command on a worker thread through `Runner.execute` (the same dispatch the
+  CLI uses), writing to a mutex-guarded log via a `std.Io.Writer`; training feeds it through
+  `TrainObserver`. While the console holds the terminal, `std.log` goes into the job's log
+  (`Console.captureLog`, wired in `main.zig`'s `logFn`). Quitting during training stops and
+  saves; other running jobs are abandoned to the process exit (never freed under the thread).
+- Tests drive `ConsoleApp` headlessly (`handleEvent` with key presses, `draw` into a vxfw
+  `DrawContext`); flattening a drawn surface's cell buffers to text is a quick layout check.
+  Live terminal behavior (raw mode, resize, colors) still needs a real terminal.
+
 ## Commands
 
 - `make validate`: clean, format, lint, build, test (the gate). `make test`: tests only.
 - Single test: `zig build test -Dtest-filter="<test name substring>"`.
-- `make lint` needs `styleguide/zlint.json`. Until the `styleguide` submodule is added, run
-  `make validate STYLEGUIDE=../zigmicrogpt/styleguide`. zlint warnings are errors, and it
+- `make lint` reads `styleguide/zlint.json` (the `styleguide` submodule; `git submodule update
+  --init` after a fresh clone). zlint warnings are errors, and it
   rejects `catch {}` and `catch unreachable` (flush explicitly; write `(a + b - 1) / b`, not
   `divCeil(...) catch unreachable`). It also fails on an unused `log`: a file with only hot
   functions logs on a cold path (an error branch) instead.
 - `make format` / `make lint` cover `ZIG_SOURCES` (`build.zig`, `src/`, `cli/`, `web/`, `bench/`); add new
   source directories there, never `.` (that sweeps in `nanochat/`).
 - `make linux`: cross-compiles x86_64 and aarch64 (DGX Spark). `make docs`: autodoc on :8080.
-- `make run ARGS="config"` or `./zig-out/bin/zignanogpt <command>`.
+- `make cli`: ReleaseFast build, then the console (TUI). `make run ARGS="config"` or
+  `./zig-out/bin/zignanogpt <command>` for a single command.
 - `make fixtures` (or `make fixtures ONLY=gpt`): runs `dev/fixtures.py` with
   `/usr/local/inferise/uv/bin/uv` (`UV=` to override), `--frozen`, venv at `./.venv` (kept out
   of the submodule). Regenerate only when a fixture group changes; the files are committed.

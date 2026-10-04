@@ -29,7 +29,7 @@ pub const Args = struct {
         self.allocator.free(self.used);
     }
 
-    /// The value of `--name`, if given.
+    /// The value of `--name` (or `-n` for a one-letter name), if given.
     ///
     /// Parameters:
     /// - `self`: the parser.
@@ -38,8 +38,10 @@ pub const Args = struct {
     /// Return: the value; `error.MissingValue` for a trailing `--name`.
     pub fn string(self: *Self, name: []const u8) !?[]const u8 {
         for (self.items, 0..) |item, i| {
-            if (!std.mem.startsWith(u8, item, "--") or !std.mem.startsWith(u8, item[2..], name)) continue;
-            const rest = item[2 + name.len ..];
+            // `--name`, or `-n` for a one-letter name.
+            const dashes: usize = if (std.mem.startsWith(u8, item, "--")) 2 else if (name.len == 1 and std.mem.startsWith(u8, item, "-")) 1 else continue;
+            if (!std.mem.startsWith(u8, item[dashes..], name)) continue;
+            const rest = item[dashes + name.len ..];
             if (rest.len > 0 and rest[0] == '=') {
                 self.used[i] = true;
                 return rest[1..];
@@ -127,7 +129,7 @@ pub const Args = struct {
 // Unit Tests
 
 test "args parse both spellings, flags, and reject leftovers" {
-    var args = try cli.Args.init(std.testing.allocator, &.{ "--vocab-size=512", "--data", "x.txt", "--verbose", "--max-chars", "10" });
+    var args = try cli.Args.init(std.testing.allocator, &.{ "--vocab-size=512", "--data", "x.txt", "--verbose", "--max-chars", "10", "-n", "3" });
     defer args.deinit();
     try std.testing.expectEqual(@as(usize, 512), try args.int(usize, "vocab-size", 0));
     try std.testing.expectEqualStrings("x.txt", (try args.string("data")).?);
@@ -135,5 +137,6 @@ test "args parse both spellings, flags, and reject leftovers" {
     try std.testing.expectEqual(@as(usize, 7), try args.int(usize, "doc-cap", 7));
     try std.testing.expectError(error.UnknownArgument, args.finish());
     _ = try args.int(usize, "max-chars", 0);
+    try std.testing.expectEqual(@as(usize, 3), try args.int(usize, "n", 0));
     try args.finish();
 }

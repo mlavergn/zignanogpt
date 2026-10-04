@@ -226,6 +226,62 @@ pub const MuonAdamW = struct {
         }
     }
 
+    /// Queues the optimizer state for a checkpoint: per parameter
+    /// `adamw.{m,v,step}.<name>` or `muon.{momentum,second}.<name>`.
+    ///
+    /// Parameters:
+    /// - `self`: the optimizer.
+    /// - `writer`: receives the tensors.
+    /// - `weights`: names the parameters (the layout the optimizer was built for).
+    ///
+    /// Return: nothing; allocation errors.
+    pub fn addState(self: *const Self, writer: *mod.SafeTensorsWriter, weights: *const mod.GptWeights) !void {
+        var name_buf: [128]u8 = undefined;
+        for (self.states, weights.params) |state, p| {
+            if (state.m) |m| {
+                try writer.addTensor(try std.fmt.bufPrint(&name_buf, "adamw.m.{s}", .{p.name}), m);
+                try writer.addTensor(try std.fmt.bufPrint(&name_buf, "adamw.v.{s}", .{p.name}), state.v.?);
+                try writer.addHost(try std.fmt.bufPrint(&name_buf, "adamw.step.{s}", .{p.name}), i32, &.{1}, &.{@intCast(state.step)});
+            }
+            if (state.momentum) |b| {
+                try writer.addTensor(try std.fmt.bufPrint(&name_buf, "muon.momentum.{s}", .{p.name}), b);
+                try writer.addTensor(try std.fmt.bufPrint(&name_buf, "muon.second.{s}", .{p.name}), state.second.?);
+            }
+        }
+    }
+
+    /// Restores state written by `addState`.
+    ///
+    /// Parameters:
+    /// - `self`: the optimizer, built for the same weights.
+    /// - `file`: the optimizer checkpoint.
+    /// - `weights`: names the parameters.
+    ///
+    /// Return: nothing; `error.MissingTensor`, shape errors.
+    pub fn loadState(self: *Self, file: *const mod.SafeTensors, weights: *const mod.GptWeights) !void {
+        log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
+        var name_buf: [128]u8 = undefined;
+        for (self.states, weights.params) |*state, p| {
+            if (state.m) |m| {
+                try self.loadTensor(file, try std.fmt.bufPrint(&name_buf, "adamw.m.{s}", .{p.name}), m);
+                try self.loadTensor(file, try std.fmt.bufPrint(&name_buf, "adamw.v.{s}", .{p.name}), state.v.?);
+                var step_value: [1]i32 = undefined;
+                try file.read(try std.fmt.bufPrint(&name_buf, "adamw.step.{s}", .{p.name}), i32, &step_value);
+                state.step = std.math.cast(u32, step_value[0]) orelse return error.InvalidCheckpoint;
+            }
+            if (state.momentum) |b| {
+                try self.loadTensor(file, try std.fmt.bufPrint(&name_buf, "muon.momentum.{s}", .{p.name}), b);
+                try self.loadTensor(file, try std.fmt.bufPrint(&name_buf, "muon.second.{s}", .{p.name}), state.second.?);
+            }
+        }
+    }
+
+    fn loadTensor(self: *Self, file: *const mod.SafeTensors, name: []const u8, tensor: mod.Tensor) !void {
+        const host = try file.readAlloc(self.allocator, name, f32);
+        defer self.allocator.free(host);
+        try self.backend.upload(tensor, f32, host);
+    }
+
     /// Muon on one matrix.
     fn muonStep(self: *Self, group: ParamGroup, p: mod.Tensor, g: mod.Tensor, state: ParamState) !void {
         const be = self.backend;
@@ -363,6 +419,67 @@ test "muon adamw steps match pytorch on the fixture" {
         }
     }
     try std.testing.expectEqual(@as(usize, 3), step);
+}
+
+test "muon adamw state survives a checkpoint round trip" {
+    const allocator = std.testing.allocator;
+    var backend = try mod.Backend.init(allocator, std.testing.io, .{});
+    defer backend.deinit();
+    const config = mod.GptConfig{ .sequence_len = 16, .vocab_size = 40, .n_layer = 2, .n_head = 2, .n_kv_head = 1, .n_embd = 32 };
+    var rng = mod.Random.init(3);
+    var a = try mod.GptWeights.init(allocator, &backend, config);
+    defer a.deinit();
+    var grads = try mod.GptWeights.init(allocator, &backend, config);
+    defer grads.deinit();
+    const randomize = struct {
+        fn run(be: *mod.Backend, w: *mod.GptWeights, r: *mod.Random, alloc: std.mem.Allocator) !void {
+            for (w.params) |p| {
+                const host = try alloc.alloc(f32, p.tensor.numel());
+                defer alloc.free(host);
+                r.fillUniform(host, -0.1, 0.1);
+                try be.upload(p.tensor, f32, host);
+            }
+        }
+    }.run;
+    try randomize(&backend, &a, &rng, allocator);
+    var opt_a = try mod.MuonAdamW.init(allocator, &backend, &a, config.n_embd, .{ .weight_decay = 0.1 });
+    defer opt_a.deinit();
+    try randomize(&backend, &grads, &rng, allocator);
+    try opt_a.step(&a, &grads);
+
+    // Save weights + optimizer, restore into fresh copies.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const storage = mod.Storage.init(allocator, std.testing.io);
+    var ckpt = try mod.Checkpoint.init(allocator, storage, root, .base, "d2");
+    defer ckpt.deinit();
+    try ckpt.saveModel(&backend, 1, &a);
+    try ckpt.saveOptimizer(&backend, 1, &opt_a, &a);
+    var b = try mod.GptWeights.init(allocator, &backend, config);
+    defer b.deinit();
+    try ckpt.loadModel(1, &b);
+    var opt_b = try mod.MuonAdamW.init(allocator, &backend, &b, config.n_embd, .{ .weight_decay = 0.1 });
+    defer opt_b.deinit();
+    try ckpt.loadOptimizer(1, &opt_b, &b);
+
+    // The same next step from both gives the same weights.
+    var g2 = try mod.GptWeights.init(allocator, &backend, config);
+    defer g2.deinit();
+    try randomize(&backend, &grads, &rng, allocator);
+    for (grads.params, g2.params) |src, dst| try backend.copy(dst.tensor, src.tensor);
+    try opt_a.step(&a, &grads);
+    try opt_b.step(&b, &g2);
+    for (a.params, b.params) |pa, pb| {
+        const ha = try allocator.alloc(f32, pa.tensor.numel());
+        defer allocator.free(ha);
+        const hb = try allocator.alloc(f32, pb.tensor.numel());
+        defer allocator.free(hb);
+        try backend.download(pa.tensor, f32, ha);
+        try backend.download(pb.tensor, f32, hb);
+        try std.testing.expectEqualSlices(f32, ha, hb);
+    }
 }
 
 test "muon adamw training overfits one batch" {

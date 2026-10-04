@@ -10,17 +10,24 @@ const mod = @import("module.zig");
 /// - `nanochat_dir`: the Python nanochat's base dir, read-only (ClimbMix shards,
 ///   Python checkpoints and tokenizer). `$NANOCHAT_BASE_DIR`, else
 ///   `~/.cache/nanochat`, matching `nanochat/common.py:get_base_dir`.
+/// - `data_url`: where pretraining shards are downloaded from.
+///   `$ZIGNANOGPT_DATA_URL`, else nanochat's ClimbMix location.
 pub const Config = struct {
     const Self = @This();
 
     pub const base_dir_env = "ZIGNANOGPT_BASE_DIR";
     pub const nanochat_dir_env = "NANOCHAT_BASE_DIR";
+    pub const data_url_env = "ZIGNANOGPT_DATA_URL";
+    /// nanochat's `dataset.BASE_URL`.
+    pub const default_data_url = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main";
 
     allocator: std.mem.Allocator,
     /// Directory this port writes into.
     base_dir: []const u8,
     /// The Python nanochat directory, never written.
     nanochat_dir: []const u8,
+    /// Base URL of the pretraining shards (no trailing slash).
+    data_url: []const u8,
 
     /// Resolves both directories from `environ`.
     ///
@@ -39,11 +46,46 @@ pub const Config = struct {
         const base_dir = try resolve(allocator, nonEmpty(environ.get(base_dir_env)), home, "zignanogpt");
         errdefer allocator.free(base_dir);
         const nanochat_dir = try resolve(allocator, nonEmpty(environ.get(nanochat_dir_env)), home, "nanochat");
+        errdefer allocator.free(nanochat_dir);
+        const url = nonEmpty(environ.get(data_url_env)) orelse default_data_url;
+        const data_url = try allocator.dupe(u8, std.mem.trimEnd(u8, url, "/"));
         return Self{
             .allocator = allocator,
             .base_dir = base_dir,
             .nanochat_dir = nanochat_dir,
+            .data_url = data_url,
         };
+    }
+
+    /// `init` followed by `makeAbsolute`: what executables use.
+    ///
+    /// Parameters:
+    /// - `allocator`: owns the paths.
+    /// - `environ`: the process environment.
+    /// - `storage`: resolves relative overrides.
+    ///
+    /// Return: the config; as `init`.
+    pub fn load(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, storage: mod.Storage) !Self {
+        var self = try init(allocator, environ);
+        errdefer self.deinit();
+        try self.makeAbsolute(storage);
+        return self;
+    }
+
+    /// Makes the base directories absolute (an override may be relative).
+    ///
+    /// Parameters:
+    /// - `self`: the config.
+    /// - `storage`: resolves against the working directory.
+    ///
+    /// Return: nothing; allocation errors.
+    pub fn makeAbsolute(self: *Self, storage: mod.Storage) !void {
+        const base = try storage.absolute(self.base_dir);
+        self.allocator.free(self.base_dir);
+        self.base_dir = base;
+        const nanochat = try storage.absolute(self.nanochat_dir);
+        self.allocator.free(self.nanochat_dir);
+        self.nanochat_dir = nanochat;
     }
 
     /// Frees the resolved paths.
@@ -54,6 +96,7 @@ pub const Config = struct {
     /// Return: nothing.
     pub fn deinit(self: *Self) void {
         log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
+        self.allocator.free(self.data_url);
         self.allocator.free(self.nanochat_dir);
         self.allocator.free(self.base_dir);
     }
@@ -97,6 +140,7 @@ test "config defaults to ~/.cache" {
     defer config.deinit();
     try std.testing.expectEqualStrings("/home/u/.cache/zignanogpt", config.base_dir);
     try std.testing.expectEqualStrings("/home/u/.cache/nanochat", config.nanochat_dir);
+    try std.testing.expectEqualStrings(mod.Config.default_data_url, config.data_url);
 }
 
 test "config honours overrides and ignores empty ones" {
@@ -105,11 +149,13 @@ test "config honours overrides and ignores empty ones" {
     try environ.put("HOME", "/home/u");
     try environ.put(mod.Config.base_dir_env, "/data/zig");
     try environ.put(mod.Config.nanochat_dir_env, "");
+    try environ.put(mod.Config.data_url_env, "http://mirror.local/data/");
 
     var config = try mod.Config.init(std.testing.allocator, &environ);
     defer config.deinit();
     try std.testing.expectEqualStrings("/data/zig", config.base_dir);
     try std.testing.expectEqualStrings("/home/u/.cache/nanochat", config.nanochat_dir);
+    try std.testing.expectEqualStrings("http://mirror.local/data", config.data_url);
 }
 
 test "config falls back to USERPROFILE" {
