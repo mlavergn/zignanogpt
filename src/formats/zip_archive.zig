@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_zip_archive);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// One member of a zip archive.
 pub const ZipEntry = struct {

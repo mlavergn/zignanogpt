@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_hub_dataset);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// One loaded column of a `HubDataset`: all shards' values, and where each row's start.
 pub const HubColumn = struct {

@@ -29,8 +29,15 @@ pub const TrainObserver = struct {
     onStep: *const fn (context: *anyopaque, report: StepReport) void,
     onEval: *const fn (context: *anyopaque, step: usize, val_bpb: f64) void,
     onSample: *const fn (context: *anyopaque, step: usize, text: []const u8) void,
-    /// Checked before each step: true saves a checkpoint and ends the run.
+    /// Checked before each step (and, in SFT and RL, between eval problems and
+    /// rollouts): true saves a checkpoint and ends the run.
     shouldStop: *const fn (context: *anyopaque) bool,
+
+    /// Whether `observer` (if any) asks to stop.
+    pub fn stopRequested(observer: ?TrainObserver) bool {
+        const obs = observer orelse return false;
+        return obs.shouldStop(obs.context);
+    }
 };
 
 /// Prompts sampled during training (`base_train.py`'s list).
@@ -364,6 +371,9 @@ pub const Trainer = struct {
             const text = try self.tokenizer.decode(self.allocator, ids.items[1..]);
             defer self.allocator.free(text);
             try self.out.print("{s}\n", .{text});
+            const line = try std.json.Stringify.valueAlloc(self.allocator, .{ .step = self.step, .sample = text }, .{});
+            defer self.allocator.free(line);
+            try self.metric("{s}\n", .{line});
             if (self.observer) |obs| obs.onSample(obs.context, self.step, text);
         }
         try self.out.flush();

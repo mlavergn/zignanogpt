@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zignanogpt</title>
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e3e2dd;
+  --accent: #2f6fde; --user: #eef3fd; --good: #2e8b57; --bad: #c0392b;
+  --s1: #2f6fde; --s2: #d9822b; --s3: #2e8b57; --s4: #8e44ad;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161615; --panel: #1f1f1d; --text: #ecebe6; --muted: #9a9993; --line: #33332f;
+    --accent: #6c9cf0; --user: #22304a; --good: #5cc28a; --bad: #e57368;
+    --s1: #6c9cf0; --s2: #eda65a; --s3: #5cc28a; --s4: #b58be0;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 16px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+header .model { color: var(--muted); font-size: 13px; margin-left: auto; }
+nav button { background: none; border: none; color: var(--muted); font: inherit; padding: 6px 10px; border-radius: 6px; cursor: pointer; }
+nav button.on { color: var(--text); background: var(--bg); font-weight: 600; }
+main { max-width: 980px; margin: 0 auto; padding: 16px; }
+.hidden { display: none !important; }
+#chat { display: flex; flex-direction: column; height: calc(100vh - 90px); }
+#log { flex: 1; overflow-y: auto; padding: 8px 0; }
+.msg { padding: 10px 14px; border-radius: 10px; margin: 8px 0; white-space: pre-wrap; word-wrap: break-word; max-width: 85%; }
+.msg.user { background: var(--user); margin-left: auto; }
+.msg.assistant { background: var(--panel); border: 1px solid var(--line); }
+.msg.note { color: var(--muted); font-size: 13px; border: none; padding: 4px 0; }
+form { display: flex; gap: 8px; align-items: flex-end; border-top: 1px solid var(--line); padding-top: 12px; }
+textarea { flex: 1; resize: none; min-height: 44px; max-height: 200px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font: inherit; }
+button.primary { background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 10px 16px; font: inherit; cursor: pointer; }
+button.primary:disabled { opacity: .5; cursor: default; }
+.settings { display: flex; gap: 12px; color: var(--muted); font-size: 13px; margin-bottom: 8px; flex-wrap: wrap; align-items: center; }
+.settings input { width: 64px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); }
+.settings button { background: none; border: 1px solid var(--line); color: var(--muted); border-radius: 6px; padding: 3px 10px; cursor: pointer; font: inherit; }
+select { padding: 6px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font: inherit; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin: 14px 0; }
+.stat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.stat .k { color: var(--muted); font-size: 12px; }
+.stat .v { font-size: 20px; font-variant-numeric: tabular-nums; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.chart { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.chart h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
+canvas { width: 100%; height: 180px; display: block; }
+.samples { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; margin-top: 12px; }
+.samples h3 { margin: 0 0 6px; font-size: 13px; }
+.samples div { border-top: 1px solid var(--line); padding: 6px 0; white-space: pre-wrap; font-size: 13px; }
+.empty { color: var(--muted); padding: 40px 0; text-align: center; }
+@media (max-width: 600px) { main { padding: 12px 16px; } .msg { max-width: 100%; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>zignanogpt</h1>
+  <nav><button id="tab-chat" class="on">Chat</button><button id="tab-train">Training</button></nav>
+  <span class="model" id="model">…</span>
+</header>
+<main>
+  <section id="chat">
+    <div class="settings">
+      <label>temperature <input id="temperature" type="number" step="0.1" min="0" max="2" value="0.6"></label>
+      <label>top-k <input id="topk" type="number" min="0" value="50"></label>
+      <label>max tokens <input id="maxtok" type="number" min="1" value="512"></label>
+      <button id="clear" type="button">New chat</button>
+    </div>
+    <div id="log"></div>
+    <form id="form">
+      <textarea id="input" placeholder="Message (Enter to send, Shift+Enter for a new line)" rows="1"></textarea>
+      <button class="primary" id="send" type="submit">Send</button>
+    </form>
+  </section>
+  <section id="train" class="hidden">
+    <div class="settings"><label>run <select id="run"></select></label><span id="updated"></span></div>
+    <div id="nodata" class="empty">No training runs yet: <code>zignanogpt train</code>, <code>sft</code> or <code>rl</code> write metrics.jsonl.</div>
+    <div class="stats" id="stats"></div>
+    <div class="charts" id="charts"></div>
+    <div class="samples hidden" id="samples"><h3 id="samples-title">Samples</h3><div id="sample-list"></div></div>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+// ---------------------------------------------------------------- tabs
+for (const [tab, sec] of [["tab-chat", "chat"], ["tab-train", "train"]]) {
+  $(tab).onclick = () => {
+    for (const t of ["tab-chat", "tab-train"]) $(t).classList.toggle("on", t === tab);
+    $("chat").classList.toggle("hidden", sec !== "chat");
+    $("train").classList.toggle("hidden", sec !== "train");
+    if (sec === "train") loadRuns();
+  };
+}
+fetch("/api/info").then(r => r.json()).then(info => {
+  $("model").textContent = info.model ? `${info.model} · v${info.version}` : `no model yet · v${info.version}`;
+});
+
+// ---------------------------------------------------------------- chat
+let messages = [];
+let busy = false;
+function bubble(role, text) {
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  div.textContent = text;
+  $("log").appendChild(div);
+  $("log").scrollTop = $("log").scrollHeight;
+  return div;
+}
+$("clear").onclick = () => { if (!busy) { messages = []; $("log").innerHTML = ""; } };
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("form").requestSubmit(); }
+});
+$("form").onsubmit = async (e) => {
+  e.preventDefault();
+  const text = $("input").value.trim();
+  if (!text || busy) return;
+  busy = true; $("send").disabled = true; $("input").value = "";
+  messages.push({ role: "user", content: text });
+  bubble("user", text);
+  const out = bubble("assistant", "");
+  let reply = "";
+  try {
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages,
+        temperature: parseFloat($("temperature").value) || 0,
+        top_k: parseInt($("topk").value) || 0,
+        max_tokens: parseInt($("maxtok").value) || 512,
+      }),
+    });
+    if (res.headers.get("content-type") !== "text/event-stream") {
+      const err = await res.json();
+      throw new Error(err.error || res.statusText);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let cut;
+      while ((cut = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, cut); buf = buf.slice(cut + 2);
+        if (!line.startsWith("data: ")) continue;
+        const ev = JSON.parse(line.slice(6));
+        if (ev.token !== undefined) { reply += ev.token; out.textContent = reply; $("log").scrollTop = $("log").scrollHeight; }
+        if (ev.error) throw new Error(ev.error);
+      }
+    }
+    messages.push({ role: "assistant", content: reply });
+  } catch (err) {
+    messages.pop();
+    out.remove();
+    bubble("note", "Error: " + err.message);
+  } finally {
+    busy = false; $("send").disabled = false; $("input").focus();
+  }
+};
+
+// ---------------------------------------------------------------- training
+let run = null, offset = 0, rows = [], timer = null;
+async function loadRuns() {
+  const runs = await (await fetch("/api/runs")).json();
+  const sel = $("run");
+  const current = sel.value;
+  sel.innerHTML = "";
+  for (const r of runs) {
+    const o = document.createElement("option");
+    o.value = r.name; o.textContent = r.name;
+    sel.appendChild(o);
+  }
+  $("nodata").classList.toggle("hidden", runs.length > 0);
+  if (!runs.length) return;
+  sel.value = runs.some(r => r.name === current) ? current : runs[0].name;
+  if (sel.value !== run) select(sel.value);
+}
+$("run").onchange = () => select($("run").value);
+function select(name) {
+  run = name; offset = 0; rows = [];
+  if (timer) clearInterval(timer);
+  poll();
+  timer = setInterval(poll, 2000);
+}
+async function poll() {
+  if (!run || $("train").classList.contains("hidden")) return;
+  const res = await fetch(`/api/metrics?run=${encodeURIComponent(run)}&offset=${offset}`);
+  if (!res.ok) return;
+  const tail = await res.json();
+  if (tail.offset < offset) rows = [];
+  offset = tail.offset;
+  for (const line of tail.text.split("\n")) if (line.trim()) { try { rows.push(JSON.parse(line)); } catch (_) {} }
+  $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+  render();
+}
+function series(key) { return rows.filter(r => typeof r[key] === "number").map(r => [r.step, r[key]]); }
+function last(key) { const s = series(key); return s.length ? s[s.length - 1][1] : null; }
+const fmt = (v, d) => v === null ? "—" : (Math.abs(v) >= 1000 ? Math.round(v).toLocaleString() : v.toFixed(d));
+function render() {
+  const stepRows = rows.filter(r => typeof r.loss === "number" || typeof r.reward === "number");
+  const step = stepRows.length ? stepRows[stepRows.length - 1].step : null;
+  const stats = [
+    ["step", step === null ? "—" : String(step)],
+    ["loss", fmt(last("loss"), 4)],
+    ["val bpb", fmt(last("val_bpb"), 4)],
+    ["ChatCORE", fmt(last("chatcore"), 4)],
+    ["reward", fmt(last("reward"), 3)],
+    ["pass@1", fmt(last("pass_at_1"), 3)],
+    ["tok/s", fmt(last("tok_per_sec"), 0)],
+    ["TFLOP/s", fmt(last("tflops"), 3)],
+  ].filter(([k, v]) => v !== "—" || k === "step");
+  $("stats").innerHTML = stats.map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+  const charts = [
+    ["Training loss", [["loss", "loss", "--s1"]]],
+    ["Validation", [["val_bpb", "val bpb", "--s2"], ["chatcore", "ChatCORE", "--s3"], ["pass_at_1", "pass@1", "--s3"]]],
+    ["Reward", [["reward", "reward", "--s4"]]],
+    ["Learning-rate multiplier", [["lrm", "lrm", "--s3"]]],
+    ["Throughput (tok/s)", [["tok_per_sec", "tok/s", "--s4"]]],
+  ].filter(([, lines]) => lines.some(([key]) => series(key).length));
+  const box = $("charts");
+  box.innerHTML = charts.map(([title], i) => `<div class="chart"><h3>${title}</h3><canvas id="c${i}"></canvas></div>`).join("");
+  charts.forEach(([, lines], i) => draw($(`c${i}`), lines.map(([key, label, color]) => ({ label, color, points: series(key) })).filter(l => l.points.length)));
+  const samples = rows.filter(r => typeof r.sample === "string");
+  $("samples").classList.toggle("hidden", !samples.length);
+  if (samples.length) {
+    const at = samples[samples.length - 1].step;
+    $("samples-title").textContent = `Samples at step ${at}`;
+    $("sample-list").innerHTML = "";
+    for (const s of samples.filter(s => s.step === at)) { const d = document.createElement("div"); d.textContent = s.sample; $("sample-list").appendChild(d); }
+  }
+}
+function draw(canvas, lines) {
+  const css = getComputedStyle(document.documentElement);
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const g = canvas.getContext("2d");
+  g.scale(dpr, dpr);
+  const pts = lines.flatMap(l => l.points);
+  let [x0, x1] = [Math.min(...pts.map(p => p[0])), Math.max(...pts.map(p => p[0]))];
+  let [y0, y1] = [Math.min(...pts.map(p => p[1])), Math.max(...pts.map(p => p[1]))];
+  if (x1 === x0) x1 = x0 + 1;
+  if (y1 === y0) { y0 -= 0.5; y1 += 0.5; }
+  const pad = { l: 46, r: 8, t: 6, b: 18 };
+  const X = x => pad.l + (x - x0) / (x1 - x0) * (w - pad.l - pad.r);
+  const Y = y => pad.t + (1 - (y - y0) / (y1 - y0)) * (h - pad.t - pad.b);
+  g.font = "11px -apple-system, sans-serif";
+  g.fillStyle = css.getPropertyValue("--muted");
+  g.strokeStyle = css.getPropertyValue("--line");
+  g.lineWidth = 1;
+  for (const f of [0, 0.5, 1]) {
+    const y = y0 + f * (y1 - y0);
+    g.beginPath(); g.moveTo(pad.l, Y(y)); g.lineTo(w - pad.r, Y(y)); g.stroke();
+    g.fillText(Math.abs(y) >= 1000 ? Math.round(y).toLocaleString() : y.toPrecision(3), 2, Y(y) + 4);
+  }
+  g.fillText(String(x0), pad.l, h - 4);
+  g.textAlign = "right"; g.fillText(String(x1), w - pad.r, h - 4); g.textAlign = "left";
+  lines.forEach((l, i) => {
+    g.strokeStyle = css.getPropertyValue(l.color); g.lineWidth = 1.6;
+    g.beginPath();
+    l.points.forEach(([x, y], j) => j ? g.lineTo(X(x), Y(y)) : g.moveTo(X(x), Y(y)));
+    g.stroke();
+    if (l.points.length === 1) { g.fillStyle = css.getPropertyValue(l.color); g.fillRect(X(l.points[0][0]) - 2, Y(l.points[0][1]) - 2, 4, 4); }
+    if (lines.length > 1) { g.fillStyle = css.getPropertyValue(l.color); g.fillText(l.label, w - pad.r - 70, pad.t + 12 + i * 13); }
+  });
+}
+window.addEventListener("resize", () => { if (rows.length) render(); });
+</script>
+</body>
+</html>

@@ -166,6 +166,32 @@ pub const Gpt = struct {
     ///
     /// Return: nothing; backend errors.
     pub fn backward(self: *Self, acts: *const mod.GptActivations, bufs: *mod.GptGradBuffers, grads: *mod.GptWeights, idx: mod.Tensor, targets: mod.Tensor, scale: f32) !void {
+        const bt = acts.batch * acts.seq;
+        try self.backend.crossEntropyBackward(bufs.dlogits_pad, try acts.logits.reshape(&.{ bt, self.config.vocab_size }), targets, mod.GptConfig.softcap, scale);
+        try self.backwardLogits(acts, bufs, grads, idx);
+    }
+
+    /// Backpropagates `sum_r weights[r] * loss_r` (per-token losses weighted,
+    /// no mean; `chat_rl.py`'s policy gradient), adding into `grads`.
+    ///
+    /// Parameters:
+    /// - `self`: the model.
+    /// - `acts`: after `forward` on `idx`.
+    /// - `bufs`: activation-gradient scratch for the same `[B, T]`.
+    /// - `grads`: accumulated into.
+    /// - `idx`: the `[B, T]` ids `forward` saw.
+    /// - `targets`: `[B, T]` i32 next tokens, -1 where ignored.
+    /// - `weights`: `[B * T]` f32 per-token weights.
+    ///
+    /// Return: nothing; backend errors.
+    pub fn backwardWeighted(self: *Self, acts: *const mod.GptActivations, bufs: *mod.GptGradBuffers, grads: *mod.GptWeights, idx: mod.Tensor, targets: mod.Tensor, weights: mod.Tensor) !void {
+        const bt = acts.batch * acts.seq;
+        try self.backend.crossEntropyWeightedBackward(bufs.dlogits_pad, try acts.logits.reshape(&.{ bt, self.config.vocab_size }), targets, weights, mod.GptConfig.softcap);
+        try self.backwardLogits(acts, bufs, grads, idx);
+    }
+
+    /// The backward pass from `bufs.dlogits_pad` down to the embeddings.
+    fn backwardLogits(self: *Self, acts: *const mod.GptActivations, bufs: *mod.GptGradBuffers, grads: *mod.GptWeights, idx: mod.Tensor) !void {
         const be = self.backend;
         const cfg = self.config;
         const w = &self.weights;
@@ -175,8 +201,7 @@ pub const Gpt = struct {
         const c = cfg.n_embd;
         const acc = mod.MatmulOptions{ .transpose_a = true, .accumulate = true };
 
-        // Loss, soft cap and lm_head.
-        try be.crossEntropyBackward(g.dlogits_pad, try acts.logits.reshape(&.{ bt, cfg.vocab_size }), targets, mod.GptConfig.softcap, scale);
+        // Soft cap and lm_head (the loss gradient is in g.dlogits_pad).
         try be.matmul(g.dxn, g.dlogits_pad, w.lm_head, .{});
         try be.matmul(grads.lm_head, g.dlogits_pad, acts.xn_final, acc);
         try be.rmsnormBackward(g.dx, g.dxn, acts.x_final, eps, false);

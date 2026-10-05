@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_cpu_backend);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// CPU storage: one 64-byte-aligned heap block (cache line and AVX-512 friendly).
 pub const CpuBuffer = struct {
@@ -743,11 +743,36 @@ pub const CpuBackend = struct {
     ///
     /// Return: nothing; shape/dtype/aliasing errors, `error.OutOfBounds`.
     pub fn crossEntropyBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, cap: f32, scale_by: f32) !void {
+        const count: f32 = @floatFromInt(validTargets(elems(i32, targets)));
+        try self.xentBackward(dpad, logits, targets, cap, scale_by / count, null);
+    }
+
+    /// Gradient of `sum_r weights[r] * crossEntropy_r(softcap(logits_pad))`
+    /// (per-row losses, no mean): row `r` is `weights[r] * (softmax - onehot)`
+    /// times the soft cap's derivative; ignored rows and padding columns get
+    /// zero. The policy gradient of `chat_rl.py` weighs each token by its
+    /// sequence's advantage.
+    ///
+    /// Parameters:
+    /// - `self`: the backend.
+    /// - `dpad`: `[R, Vpad]` gradient output; must not alias `logits`.
+    /// - `logits`: `[R, V]`, the capped logits the loss saw.
+    /// - `targets`: `R` i32 classes, or -1.
+    /// - `weights`: `R` f32 per-row weights.
+    /// - `cap`: the soft cap used in the forward pass.
+    ///
+    /// Return: nothing; shape/dtype/aliasing errors, `error.OutOfBounds`.
+    pub fn crossEntropyWeightedBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, weights: mod.Tensor, cap: f32) !void {
+        if (weights.dtype != .f32) return error.DtypeMismatch;
+        if (weights.numel() != logits.shape.rows()) return mismatch("crossEntropyWeightedBackward", weights.shape, logits.shape);
+        try self.xentBackward(dpad, logits, targets, cap, 1, elems(f32, weights));
+    }
+
+    fn xentBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, cap: f32, factor: f32, weights: ?[]const f32) !void {
         const rows, const vocab = try self.checkTargets(logits, targets);
         if (dpad.dtype != .f32) return error.DtypeMismatch;
         if (dpad.shape.rows() != rows or dpad.shape.cols() < vocab) return mismatch("crossEntropyBackward", dpad.shape, logits.shape);
         try checkDisjoint(dpad, &.{logits});
-        const count: f32 = @floatFromInt(validTargets(elems(i32, targets)));
         const Ctx = struct {
             dpad: []f32,
             logits: []const f32,
@@ -756,9 +781,11 @@ pub const CpuBackend = struct {
             padded: usize,
             cap: f32,
             factor: f32,
+            weights: ?[]const f32,
             fn body(ctx: @This(), start: usize, end: usize) void {
                 for (start..end) |r| {
                     const out = ctx.dpad[r * ctx.padded ..][0..ctx.padded];
+                    const row_factor = if (ctx.weights) |w| w[r] else ctx.factor;
                     @memset(out[ctx.vocab..], 0);
                     if (ctx.targets[r] < 0) {
                         @memset(out[0..ctx.vocab], 0);
@@ -767,15 +794,29 @@ pub const CpuBackend = struct {
                     const row = ctx.logits[r * ctx.vocab ..][0..ctx.vocab];
                     const lse: f32 = @floatCast(logSumExp(row));
                     const target: usize = @intCast(ctx.targets[r]);
-                    for (out[0..ctx.vocab], row, 0..) |*o, z, c| {
-                        const p = @exp(z - lse) - @as(f32, if (c == target) 1 else 0);
-                        const squash = z / ctx.cap;
-                        o.* = p * ctx.factor * (1 - squash * squash);
+                    // softmax * factor * (1 - (z / cap)^2), vectorized; the target's -1 after.
+                    const V = mod.CpuMath.Vec;
+                    const n = mod.CpuMath.lanes;
+                    const lse_v: V = @splat(lse);
+                    const f_v: V = @splat(row_factor);
+                    const inv_cap: V = @splat(1 / ctx.cap);
+                    const one: V = @splat(1);
+                    var c: usize = 0;
+                    while (c + n <= ctx.vocab) : (c += n) {
+                        const z: V = row[c..][0..n].*;
+                        const squash = z * inv_cap;
+                        out[c..][0..n].* = mod.CpuMath.exp(z - lse_v) * f_v * (one - squash * squash);
                     }
+                    while (c < ctx.vocab) : (c += 1) {
+                        const squash = row[c] / ctx.cap;
+                        out[c] = mod.CpuMath.exp1(row[c] - lse) * row_factor * (1 - squash * squash);
+                    }
+                    const squash = row[target] / ctx.cap;
+                    out[target] -= row_factor * (1 - squash * squash);
                 }
             }
         };
-        const ctx = Ctx{ .dpad = elems(f32, dpad), .logits = elems(f32, logits), .targets = elems(i32, targets), .vocab = vocab, .padded = dpad.shape.cols(), .cap = cap, .factor = scale_by / count };
+        const ctx = Ctx{ .dpad = elems(f32, dpad), .logits = elems(f32, logits), .targets = elems(i32, targets), .vocab = vocab, .padded = dpad.shape.cols(), .cap = cap, .factor = factor, .weights = weights };
         try self.forRows(rows, dpad.shape.cols(), ctx, Ctx.body);
     }
 
@@ -1447,11 +1488,7 @@ pub const CpuBackend = struct {
 
     /// `log(sum(exp(row)))`, stabilized by the row max, in f64.
     fn logSumExp(row: []const f32) f64 {
-        var max = -std.math.inf(f32);
-        for (row) |z| max = @max(max, z);
-        var sum: f64 = 0;
-        for (row) |z| sum += @exp(@as(f64, z - max));
-        return @as(f64, max) + @log(sum);
+        return mod.CpuMath.logSumExp(row);
     }
 
     /// Rows per work item for rows of `cols` elements.

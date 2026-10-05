@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_pickle);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// A dictionary entry, in insertion order.
 pub const PickleEntry = struct { key: PickleValue, value: PickleValue };

@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_thrift_reader);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// Thrift compact-protocol field and element types.
 pub const ThriftType = enum(u4) {

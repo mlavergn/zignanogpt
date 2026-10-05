@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_parquet_file);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// Parquet codecs this reader decodes.
 const Codec = enum(i32) { uncompressed = 0, snappy = 1, zstd = 6, _ };

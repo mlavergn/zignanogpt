@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_safe_tensors_writer);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// A tensor queued for writing: backend memory, or host bytes.
 const Pending = struct {

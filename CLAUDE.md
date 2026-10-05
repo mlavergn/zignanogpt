@@ -22,37 +22,51 @@ every git operation. Finish a phase at a green `make validate` and report.
 | Path | What it is |
 | :--- | :--- |
 | `nanochat/` | Git submodule (`karpathy/nanochat`): the Python/PyTorch reference. **Read-only upstream; never edit it.** |
-| `src/` | The library. `module.zig` is the barrel and the `zig build test` root; `root.zig` exists only for `zig build docs` |
+| `src/` | The library: the core nanochat port (model, optimizer, tokenizer, data, training, inference, evals). `module.zig` is the barrel and the `zig build test` root; `root.zig` exists only for `zig build docs`. Supporting plug-ins live in subdirectories |
+| `src/cpu/` | The CPU backend: `backend.zig`, `matmul.zig`, `attention.zig`, `attention_backward.zig`, `math.zig`, `parallel.zig` |
+| `src/data/` | Data I/O: `storage.zig` (file read/write), pretraining shards (`dataset`, `document_stream`, `text_dataset`), Hugging Face downloads (`hub_dataset`), checkpoints and `.pt` import, the CORE eval bundle |
+| `src/formats/` | File-format readers and writers: Parquet (+ Thrift, Snappy), safetensors, zip, pickle |
+| `src/metal/` | The Metal backend: `backend.zig`, `objc.zig` (Objective-C runtime), MSL `kernels.metal` and `reduce.metal` |
+| `src/cuda/` | The CUDA backend: `backend.zig` and `kernels.zig` (Zig compiled to PTX by `build.zig`) |
 | `cli/` | The `zignanogpt` executable: `main.zig` (entry), `module.zig` (barrel + test root), `command.zig` (subcommands) |
-| `web/` | The `zignanogpt-web` console (stub until phase 11) |
+| `web/` | `zignanogpt-web`: one embedded page (chat over SSE, training dashboard), `make web` |
 | `bench/main.zig` | `zig build bench`: matmul GFLOP/s at 1 thread and all threads, always ReleaseFast |
+| `tools/` | Build-time host tools (`nvptx_fixup.zig`: makes Zig's nvptx IR loadable as PTX) |
 | `dev/fixtures.py` | Dev-only parity fixtures from the Python reference → `testdata/` (safetensors layout) |
 | `testdata/` | Committed fixtures (created as phases add fixture groups) |
 
 ## Dependencies
 
-All declared in `build.zig.zon`; `zigstorage` and `zigvaxis` are local checkouts at
+All declared in `build.zig.zon`; `zigstorage` and `zigtui` are local checkouts at
 `../../inferise/` (the build's `Git.cloneDeps` clones them if missing, then asks for a re-run).
 
 - `zigstorage` → library only. All disk and HTTP I/O goes through its `Node` (`file://`, `https://`).
-- `uucode` → library (tokenizer Unicode categories). One module is shared with zigvaxis
-  (`external_uucode = true`); `uucode_fields` in `build.zig` must stay the union of what both need.
-- `zigvaxis` → `cli/` only (TUI).
+- `zigtui` → `cli/` only (`cli.tui`): the shared Inferise TUI components (`Theme`, `ProgressBar`, ...)
+  and the whole vaxis API re-exported (`tui.vxfw`, `tui.Key`). Never import or declare zigvaxis.
+  zigtui is shared across projects: add a component or role there only when it is generic.
+- `uucode` → library (tokenizer `general_category`), taken from zigtui (`tui_dep.module("uucode")`).
+  Zig allows a package's files in one module only, so the tokenizer must share zigtui's
+  (zigvaxis's tables); a field zigvaxis does not build needs adding in zigtui's `uucode_fields`.
 
 Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the replacement value.
 
 ## Build graph
 
-- Options: `-Dbackend=cpu|metal|cuda` (only `cpu` compiles; `src/module.zig` rejects the others),
-  `-Dtest-filter=<substring>` (applied to all three test binaries).
+- Options: `-Dbackend=cpu|metal|cuda`, `-Dtest-filter=<substring>` (applied to every test binary).
+  Without `-Dbackend`, `Backend.detect` in build.zig picks Metal on Apple-silicon macOS, CUDA on
+  Linux with the NVIDIA driver (`libcuda.so.1`), else CPU; cross builds get CPU. Everything
+  backend-specific in build.zig (choice, detection, linking, the CUDA PTX) lives in `Backend`.
+  `metal` links Metal, MetalPerformanceShaders, Foundation and libobjc (macOS only); `cuda`
+  builds the kernels' PTX (`cudaKernels` in build.zig) and embeds it. `module.zig` exports the
+  Metal/CUDA types only in their own builds (`void` elsewhere), so CPU builds never reference them.
 - The `config` options module (imported as `mod.build_options`) carries `backend`, `test_filter`,
   `version`, and `source_root` (absolute repo root, for tests reading `testdata/`).
-- `zig build test` runs three test binaries: `src/module.zig`, `cli/module.zig`, `web/module.zig`.
+- `zig build test` runs four test binaries: `src/module.zig`, `cli/module.zig`, `web/module.zig`, `tools/nvptx_fixup.zig`.
   A public type not re-exported from its directory's `module.zig` has its tests silently skipped.
 
 ## Backend layer
 
-- `mod.Backend` is the build's backend type (`CpuBackend` today), chosen at comptime in
+- `mod.Backend` is the build's backend type (`CpuBackend`, `MetalBackend` or `CudaBackend`), chosen at comptime in
   `src/module.zig`. Model/optimizer/loss code calls only its ops on `Tensor`s and never
   touches element memory; host data moves via `upload`/`download`.
 - The contract is written down in `src/conformance.zig` (doc comment + `required_decls`):
@@ -65,6 +79,17 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   `Parallel` (work items on the `std.Io` thread pool via `Io.Group.async`; worker index
   is unique among concurrent workers, so per-worker scratch needs no lock). Elementwise
   ops run in 64K-element chunks. No `std.Thread.Pool` in 0.16.
+- GPU backends keep the CPU kernels as their fallback: `MetalBuffer`/`CudaBuffer` carry a
+  `bytes` slice over unified memory, so `CpuBackend` ops run on GPU tensors after a `sync`
+  (`onCpu`). A new op can start there and move to a kernel later; each `onCpu` stalls the GPU
+  queue, so on hot paths it costs far more than the op. Metal attention is flash attention on
+  simdgroup matrices (head dim padded to 8..128, compared against the CPU kernels in
+  `src/metal/backend.zig`'s tests). Metal kernels are MSL in
+  `src/metal/kernels.metal` (fast math) and `src/metal/reduce.metal` (strict, double-float sums);
+  CUDA kernels are Zig in `src/cuda/kernels.zig` (camelCase functions `@export`ed under the
+  snake_case PTX names the backend looks up; no libm on the device). `make test` runs the suite
+  on the detected backend and `make test-cpu` on the CPU (`make validate` runs both); `make cuda`
+  cross-compiles the CUDA build (no GPU to run it on yet).
 - Run `make bench` after touching `CpuMatmul`; phase 1 baseline on an M5 Max is in PLAN.md.
   A with at most 4 rows times a transposed B (decoding) takes a separate matrix-vector path
   (column blocks, contiguous SIMD dots); the bench's `decode` cases cover it.
@@ -96,7 +121,7 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   `TokenizerTrainer` = rustbpe (count desc, then smaller pair). Specials follow the ranks.
 - CLI options go through `cli/args.zig` (`Args`): every flag must be consumed, `finish`
   rejects typos. User-facing problems log at `warn` (tests fail on `log.err`).
-- `Storage` (src/storage.zig) is the one place files are read/written (zigstorage, atomic).
+- `Storage` (src/data/storage.zig) is the one place files are read/written (zigstorage, atomic).
 
 ## Data
 
@@ -105,8 +130,9 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   batches, epochs, resume skips to the row group after the saved one); `DataLoader` is the
   BOS-aligned best-fit packer. Its doc buffer must stay ordered (`orderedRemove`): selection
   ties go to the first match, exactly as Python's list scan.
-- `ParquetFile` decodes flat byte-array columns only; nested columns (HF chat datasets) are
-  phase 10. `zig` keywords bite: `resume` is reserved, `i0`/`u8`-style names are types.
+- `ParquetFile` decodes byte-array, int32 and int64 columns, nested ones included (repetition and
+  definition levels; `ParquetValues.rowStarts` splits list columns into rows). `zig` keywords
+  bite: `resume` is reserved, `i0`/`u8`-style names are types.
 
 ## Checkpoints
 
@@ -165,9 +191,16 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   piped, it prints usage. `zignanogpt train` on a terminal opens the console on the Train
   page and starts the run there (`--no-tui` for plain logs). Layout after `../../inferise/zigprompt/cli`:
   operations left, the selected one's form + output (or live training view) right, a status
-  line of live keys. Built on zigvaxis `vxfw` (`ConsoleApp` is the root widget).
-- `Operation.all` is the left pane: each entry is a `Command` plus form `Field`s that map to
-  its flags (`Operation.args`). A new command gets an entry there and a case in `Runner`.
+  line of live keys. Built on zigtui components (`cli.tui`): `SplitPane` (titles, rules, the
+  draggable divider), `StatusLine`, `StatusMark` (job/chat state), `Form` + `LineInput` (the
+  operation forms, the chat input), `ProgressBar`, `Sparkline` (loss curve) and `Transcript` (chat,
+  job log); colors by `tui.Theme` role. `ConsoleApp` is the root widget; its panes are draw-only
+  `PaneView`s. Generic UI belongs in zigtui (shared), not in `cli/`.
+- `Operation.all` is the left pane, in pipeline order: each entry is a `Command` plus form
+  `Field`s that map to its flags (`Operation.args`). An entry can run a second command
+  (`alternate`, chosen by a field's value) with per-command fields (`Field.only`): Evaluate runs
+  `eval` for base models and `chat-eval` for sft/rl. A new pipeline command gets an entry there
+  and a case in `Runner`; diagnostics (`tok-eval`, `import`) stay CLI-only.
 - Chat is the exception: the console's Chat page uses `ChatJob` (its own worker, one thread per
   load or reply, transcript behind a mutex) instead of `Job`, so it can run beside training.
   `zignanogpt chat` on a terminal opens that page (short flags are spelled out first, since

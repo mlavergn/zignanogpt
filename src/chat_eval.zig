@@ -39,6 +39,9 @@ pub const ChatEval = struct {
     tokenizer: *const mod.Tokenizer,
     /// Receives `\r` progress lines, or null.
     progress: ?*std.Io.Writer = null,
+    /// Checked between problems (training's ChatCORE): a stop request ends the
+    /// task with `error.Stopped`.
+    observer: ?mod.TrainObserver = null,
 
     pub fn init(allocator: std.mem.Allocator, model: *mod.Gpt, tokenizer: *const mod.Tokenizer) Self {
         return .{ .allocator = allocator, .model = model, .tokenizer = tokenizer };
@@ -71,6 +74,7 @@ pub const ChatEval = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         for (0..n) |i| {
+            if (mod.TrainObserver.stopRequested(self.observer)) return error.Stopped;
             _ = arena.reset(.retain_capacity);
             const a = arena.allocator();
             const conv = try task.conversation(a, i);
@@ -105,6 +109,7 @@ pub const ChatEval = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         for (0..n) |i| {
+            if (mod.TrainObserver.stopRequested(self.observer)) return error.Stopped;
             _ = arena.reset(.retain_capacity);
             const a = arena.allocator();
             const conv = try task.conversation(a, i);

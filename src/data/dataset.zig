@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_dataset);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// The pretraining shards (nanochat's `dataset.py`): ClimbMix-400B as
 /// `shard_00000.parquet` .. `shard_06542.parquet`, the last one the

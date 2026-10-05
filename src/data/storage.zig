@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_storage);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// Whole-file reads and atomic writes over zigstorage, for the port's own files
 /// (tokenizer, checkpoints, metrics). Paths are absolute filesystem paths or URLs.

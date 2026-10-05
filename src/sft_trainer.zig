@@ -56,6 +56,8 @@ pub const SftTrainer = struct {
     total_batch_size: usize,
     grad_accum_steps: usize,
     checkpoint: mod.Checkpoint,
+    /// `<checkpoint dir>/metrics.jsonl`, for the web dashboard.
+    metrics_path: []const u8,
     lrs: mod.OptimizerConfig,
 
     grads: mod.GptWeights,
@@ -141,6 +143,7 @@ pub const SftTrainer = struct {
             .total_batch_size = total,
             .grad_accum_steps = total / (batch * seq),
             .checkpoint = try mod.Checkpoint.init(allocator, storage, base_dir, .sft, tag),
+            .metrics_path = undefined,
             .lrs = lrs,
             .grads = undefined,
             .acts = undefined,
@@ -156,6 +159,8 @@ pub const SftTrainer = struct {
             .row_losses = undefined,
         };
         errdefer self.checkpoint.deinit();
+        self.metrics_path = try std.fs.path.join(allocator, &.{ self.checkpoint.dir, "metrics.jsonl" });
+        errdefer allocator.free(self.metrics_path);
         self.grads = try mod.GptWeights.init(allocator, backend, config);
         errdefer self.grads.deinit();
         self.acts = try mod.GptActivations.init(allocator, backend, config, batch, seq);
@@ -204,6 +209,7 @@ pub const SftTrainer = struct {
         self.bufs.deinit();
         self.acts.deinit();
         self.grads.deinit();
+        self.allocator.free(self.metrics_path);
         self.checkpoint.deinit();
         self.base.deinit();
         self.allocator.destroy(self.base);
@@ -243,9 +249,20 @@ pub const SftTrainer = struct {
                 self.min_val_bpb = @min(self.min_val_bpb, bpb);
                 try self.out.print("Step {d:0>5} | Validation bpb: {d:.4}\n", .{ self.step, bpb });
                 try self.out.flush();
+                try self.metric(.{ .step = self.step, .val_bpb = bpb });
                 if (self.observer) |obs| obs.onEval(obs.context, self.step, bpb);
             }
-            if (o.chatcore_every > 0 and (last or (self.step > 0 and self.step % o.chatcore_every == 0))) try self.chatcore();
+            if (o.chatcore_every > 0 and (last or (self.step > 0 and self.step % o.chatcore_every == 0))) {
+                self.chatcore() catch |err| switch (err) {
+                    // Stopped between ChatCORE problems: save at the current step.
+                    error.Stopped => {
+                        try self.out.print("Stopping at step {d} on request\n", .{self.step});
+                        try self.save();
+                        break;
+                    },
+                    else => return err,
+                };
+            }
             if (last) {
                 try self.save();
                 break;
@@ -305,6 +322,7 @@ pub const SftTrainer = struct {
             self.step, 100 * self.progress, debiased, lrm, dt * 1000, tokens / dt, flops * tokens / dt / 1e12, self.loader.current_epoch, self.total_time / 60,
         });
         try self.out.flush();
+        try self.metric(.{ .step = self.step - 1, .loss = debiased, .lrm = lrm, .dt = dt, .tok_per_sec = tokens / dt, .tflops = flops * tokens / dt / 1e12, .epoch = self.loader.current_epoch });
         if (self.observer) |obs| {
             // Without num_iterations the length is known only through the progress.
             const iterations = if (self.options.num_iterations > 0)
@@ -363,6 +381,7 @@ pub const SftTrainer = struct {
     fn chatcore(self: *Self) !void {
         const tasks = try self.data.chatcoreTasks(self.out);
         var eval = mod.ChatEval.init(self.allocator, &self.base.model, &self.base.tokenizer);
+        eval.observer = self.observer;
         var results: std.ArrayList(mod.EvalResult) = .empty;
         defer results.deinit(self.allocator);
         var categorical: std.ArrayList(mod.EvalResult) = .empty;
@@ -379,6 +398,7 @@ pub const SftTrainer = struct {
         self.last_chatcore = core;
         try self.out.print("Step {d:0>5} | ChatCORE: {d:.4} | ChatCORE_cat: {d:.4}\n", .{ self.step, core, mod.ChatEval.chatCore(categorical.items) });
         try self.out.flush();
+        try self.metric(.{ .step = self.step, .chatcore = core });
     }
 
     /// Saves model, optimizer and meta under `chatsft_checkpoints/<tag>`.
@@ -394,6 +414,15 @@ pub const SftTrainer = struct {
         try self.checkpoint.saveMeta(self.step, json);
         try self.out.print("Saved checkpoint for step {d} to {s}\n", .{ self.step, self.checkpoint.dir });
         try self.out.flush();
+    }
+
+    /// Appends one JSON line to `metrics.jsonl`.
+    fn metric(self: *Self, value: anytype) !void {
+        var line: std.Io.Writer.Allocating = .init(self.allocator);
+        defer line.deinit();
+        try std.json.Stringify.value(value, .{}, &line.writer);
+        try line.writer.writeByte('\n');
+        try self.storage.append(self.metrics_path, line.written());
     }
 
     fn inheritInt(out: *std.Io.Writer, name: []const u8, arg: ?usize, base: ?std.json.Value, fallback: usize) !usize {

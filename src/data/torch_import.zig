@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_torch_import);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// One imported tensor, upcast to f32 and made contiguous.
 pub const StateTensor = struct {

@@ -42,8 +42,7 @@ pub const Command = enum {
     /// Return: the phase number, or null when the command already works.
     pub fn phase(self: Self) ?u8 {
         return switch (self) {
-            .help, .tui, .version, .config, .@"tok-train", .@"tok-eval", .download, .import, .train, .chat, .@"chat-eval", .sft, .eval => null,
-            .rl => 10,
+            .help, .tui, .version, .config, .@"tok-train", .@"tok-eval", .download, .import, .train, .chat, .@"chat-eval", .sft, .eval, .rl => null,
         };
     }
 

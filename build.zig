@@ -135,9 +135,132 @@ const Xcode = struct {
     }
 };
 
-/// The compute backend the library is built for. One per build: model code is
-/// generic over it, so the choice is a comptime constant (`-Dbackend=`).
-const Backend = enum { cpu, metal, cuda };
+/// The compute backend the library is built for: its choice (`-Dbackend=`, or
+/// detected from the target and the host), what it links and the kernels it
+/// embeds. One per build: model code is generic over it, so the choice is a
+/// comptime constant.
+const Backend = struct {
+    pub const Kind = enum { cpu, metal, cuda };
+
+    /// Where Linux installs the NVIDIA driver library (`CudaBackend` loads it at run time).
+    const cuda_driver_paths = [_][]const u8{
+        "/usr/lib/aarch64-linux-gnu/libcuda.so.1",
+        "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+        "/usr/lib64/libcuda.so.1",
+        "/usr/lib/libcuda.so.1",
+        "/usr/lib/wsl/lib/libcuda.so.1",
+    };
+
+    /// The backend for this build: `-Dbackend` when given, else `detect`.
+    ///
+    /// Parameters:
+    /// - `b`: the build.
+    /// - `target`: the build target.
+    ///
+    /// Return: the backend.
+    pub fn choose(b: *std.Build, target: std.Build.ResolvedTarget) Kind {
+        return b.option(Kind, "backend", "Compute backend: cpu, metal, cuda (default: detected)") orelse detect(b, target);
+    }
+
+    /// Metal on Apple-silicon macOS, CUDA on Linux with the NVIDIA driver
+    /// installed, otherwise the CPU. Detection looks at this machine, so a cross
+    /// build (another OS or CPU) gets the CPU unless `-Dbackend` says otherwise.
+    ///
+    /// Parameters:
+    /// - `b`: the build.
+    /// - `target`: the build target.
+    ///
+    /// Return: the detected backend.
+    pub fn detect(b: *std.Build, target: std.Build.ResolvedTarget) Kind {
+        const t = target.result;
+        const host = b.graph.host.result;
+        if (t.os.tag != host.os.tag or t.cpu.arch != host.cpu.arch) return .cpu;
+        switch (t.os.tag) {
+            .macos => if (t.cpu.arch == .aarch64 and exists(b, "/System/Library/Frameworks/Metal.framework")) return .metal,
+            .linux => for (cuda_driver_paths) |path| {
+                if (exists(b, path)) return .cuda;
+            },
+            else => {},
+        }
+        return .cpu;
+    }
+
+    /// The kernels the backend embeds: the CUDA PTX, built from Zig sources.
+    ///
+    /// Parameters:
+    /// - `b`: the build.
+    /// - `kind`: the backend.
+    ///
+    /// Return: the generated file, or null for backends that compile at run time (Metal) or have none.
+    pub fn kernels(b: *std.Build, kind: Kind) ?std.Build.LazyPath {
+        return if (kind == .cuda) cudaKernels(b) else null;
+    }
+
+    /// Wires the backend into a library module: Metal's frameworks, or the CUDA PTX.
+    ///
+    /// Parameters:
+    /// - `module`: a module rooted in `src/`.
+    /// - `kind`: the backend.
+    /// - `ptx`: `kernels(b, kind)`.
+    ///
+    /// Return: nothing.
+    pub fn link(module: *std.Build.Module, kind: Kind, ptx: ?std.Build.LazyPath) void {
+        switch (kind) {
+            .cpu => {},
+            // Metal is reached through the Objective-C runtime; its MSL sources are compiled at start-up.
+            .metal => {
+                module.linkFramework("Metal", .{});
+                module.linkFramework("MetalPerformanceShaders", .{});
+                module.linkFramework("Foundation", .{});
+                module.linkSystemLibrary("objc", .{});
+            },
+            .cuda => module.addAnonymousImport("cuda_kernels.ptx", .{ .root_source_file = ptx.? }),
+        }
+    }
+
+    fn exists(b: *std.Build, path: []const u8) bool {
+        std.Io.Dir.cwd().access(b.graph.io, path, .{}) catch return false;
+        return true;
+    }
+
+    /// Builds the CUDA kernels' PTX: `src/cuda/kernels.zig` to LLVM IR for
+    /// nvptx64-cuda (sm_80, JIT-compiled forward by the driver), the kernel
+    /// aliases Zig emits rewritten (`tools/nvptx_fixup.zig`), then `zig cc` to PTX.
+    ///
+    /// Parameters:
+    /// - `b`: the build.
+    ///
+    /// Return: the generated `.ptx` file.
+    fn cudaKernels(b: *std.Build) std.Build.LazyPath {
+        const nvptx = b.resolveTargetQuery(.{
+            .cpu_arch = .nvptx64,
+            .os_tag = .cuda,
+            .cpu_model = .{ .explicit = &std.Target.nvptx.cpu.sm_80 },
+        });
+        const object = b.addObject(.{
+            .name = "cuda_kernels",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/cuda/kernels.zig"),
+                .target = nvptx,
+                .optimize = .ReleaseFast,
+            }),
+        });
+        const fixup = b.addExecutable(.{
+            .name = "nvptx_fixup",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/nvptx_fixup.zig"),
+                .target = b.graph.host,
+            }),
+        });
+        const run_fixup = b.addRunArtifact(fixup);
+        run_fixup.addFileArg(object.getEmittedLlvmIr());
+        const fixed = run_fixup.addOutputFileArg("cuda_kernels.ll");
+        const to_ptx = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-target", "nvptx64-cuda", "-march=sm_80", "-S", "-Wno-unused-command-line-argument" });
+        to_ptx.addFileArg(fixed);
+        to_ptx.addArg("-o");
+        return to_ptx.addOutputFileArg("cuda_kernels.ptx");
+    }
+};
 
 const Config = struct {
     name: []const u8,
@@ -154,16 +277,11 @@ const Config = struct {
 const Deps = struct {
     storage: *std.Build.Module,
     uucode: *std.Build.Module,
-    vaxis: *std.Build.Module,
-};
-
-/// Fields built into the shared `uucode` table: `general_category` for the
-/// tokenizer, the rest for zigvaxis (it needs exactly these; see its build.zig).
-const uucode_fields: []const []const u8 = &.{
-    "general_category",
-    "east_asian_width",
-    "grapheme_break",
-    "is_emoji_presentation",
+    /// The console's TUI components (and the vaxis API they re-export).
+    tui: *std.Build.Module,
+    /// The backend and its embedded kernels (`Backend.kernels`).
+    backend: Backend.Kind = .cpu,
+    kernels: ?std.Build.LazyPath = null,
 };
 
 /// Wires the options and library-side dependencies into a module rooted in `src/`.
@@ -178,6 +296,7 @@ fn addLibImports(module: *std.Build.Module, options: *std.Build.Step.Options, de
     module.addOptions("config", options);
     module.addImport("zigstorage", deps.storage);
     module.addImport("uucode", deps.uucode);
+    Backend.link(module, deps.backend, deps.kernels);
 }
 
 /// Wires an executable-side module (CLI or web) onto the library.
@@ -226,8 +345,8 @@ pub fn build(b: *std.Build) !void {
     // Build options
     const options = b.addOptions();
 
-    const backend = b.option(Backend, "backend", "Compute backend: cpu (default), metal, cuda") orelse .cpu;
-    options.addOption(Backend, "backend", backend);
+    const backend = Backend.choose(b, cfg.target);
+    options.addOption(Backend.Kind, "backend", backend);
 
     const test_filter = b.option([]const u8, "test-filter", "Run unit tests that match filter") orelse "";
     options.addOption([]const u8, "test_filter", test_filter);
@@ -241,28 +360,25 @@ pub fn build(b: *std.Build) !void {
     // -------------------------------------------------------------------------
     // Dependencies
 
-    const uucode_dep = b.dependency("uucode", .{
-        .target = cfg.target,
-        .optimize = cfg.optimize,
-        .fields = uucode_fields,
-    });
     const storage_dep = b.dependency("zigstorage", .{
         .target = cfg.target,
         .optimize = cfg.optimize,
     });
-    // zigvaxis takes our uucode module instead of building its own, so the
-    // process carries one Unicode table.
-    const vaxis_dep = b.dependency("zigvaxis", .{
+    // zigtui: the console's components, and the whole vaxis API re-exported
+    // (the CLI never imports zigvaxis itself). It also owns the process's
+    // uucode module (zigvaxis's tables, `general_category` included): Zig puts
+    // a package's files in one module only, so the tokenizer uses that one.
+    const tui_dep = b.dependency("zigtui", .{
         .target = cfg.target,
         .optimize = cfg.optimize,
-        .external_uucode = true,
     });
     const deps = Deps{
         .storage = storage_dep.module("zigstorage"),
-        .uucode = uucode_dep.module("uucode"),
-        .vaxis = vaxis_dep.module("zigvaxis"),
+        .uucode = tui_dep.module("uucode"),
+        .tui = tui_dep.module("zigtui"),
+        .backend = backend,
+        .kernels = Backend.kernels(b, backend),
     };
-    deps.vaxis.addImport("uucode", deps.uucode);
 
     // -------------------------------------------------------------------------
     // Module
@@ -298,7 +414,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = cfg.optimize,
     });
     addAppImports(cli_module, options, cfg.mod_name, module);
-    cli_module.addImport("zigvaxis", deps.vaxis);
+    cli_module.addImport("zigtui", deps.tui);
 
     const cli = b.addExecutable(.{
         .name = cfg.name,
@@ -401,7 +517,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = cfg.optimize,
     });
     addAppImports(cli_tests_module, options, cfg.mod_name, module);
-    cli_tests_module.addImport("zigvaxis", deps.vaxis);
+    cli_tests_module.addImport("zigtui", deps.tui);
 
     const cli_tests = b.addTest(.{
         .root_module = cli_tests_module,
@@ -428,6 +544,19 @@ pub fn build(b: *std.Build) !void {
     const web_tests_run = b.addRunArtifact(web_tests);
     web_tests_run.has_side_effects = true;
     tests_step.dependOn(&web_tests_run.step);
+
+    // Build tools (host): the CUDA kernels' IR fixup.
+    const tools_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/nvptx_fixup.zig"),
+            .target = b.graph.host,
+            .optimize = cfg.optimize,
+        }),
+        .filters = test_filters,
+    });
+    const tools_tests_run = b.addRunArtifact(tools_tests);
+    tools_tests_run.has_side_effects = true;
+    tests_step.dependOn(&tools_tests_run.step);
 
     // -------------------------------------------------------------------------
     // Docs

@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_snappy);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// Raw (unframed) Snappy decompression, Parquet's `SNAPPY` codec: a varint
 /// uncompressed length, then literals and back-references.

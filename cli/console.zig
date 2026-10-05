@@ -1,7 +1,7 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_console);
 const cli = @import("module.zig");
-const vaxis = cli.vaxis;
+const tui = cli.tui;
 
 /// The full-screen console: `zignanogpt` with no arguments on a terminal, or
 /// `zignanogpt tui`. While it holds the terminal, `std.log` output goes to the
@@ -60,10 +60,10 @@ pub const Console = struct {
                 owns_terminal = false;
             }
             var buffer: [4096]u8 = undefined;
-            var app: vaxis.vxfw.App = try .init(init.io, init.gpa, init.environ_map, &buffer);
+            var app: tui.vxfw.App = try .init(init.io, init.gpa, init.environ_map, &buffer);
             defer app.deinit();
-            // ESC[38;5;Nm rather than vaxis' colon form, which Terminal.app ignores.
-            app.vx.sgr = .legacy;
+            // Legacy SGR colors: Terminal.app ignores vaxis' colon form for index 202.
+            tui.Theme.prepare(&app.vx);
 
             const console = try init.gpa.create(cli.ConsoleApp);
             defer init.gpa.destroy(console);
@@ -74,7 +74,7 @@ pub const Console = struct {
 
             if (job.running()) {
                 const op = cli.Operation.all[job.operation orelse 0];
-                if (op.command == .train or op.command == .sft) {
+                if (op.command == .train or op.command == .sft or op.command == .rl) {
                     job.requestStop();
                     stopping_train = true;
                 } else {

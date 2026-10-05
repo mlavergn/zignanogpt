@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_text_dataset);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// Documents from a local text file: paragraphs separated by blank lines
 /// (`"\n\n"`), empty ones skipped. For tests, smoke runs and tokenizer training

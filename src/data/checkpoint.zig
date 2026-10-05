@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_checkpoint);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// Which training stage a checkpoint belongs to (nanochat's `load_model` sources).
 pub const CheckpointKind = enum {

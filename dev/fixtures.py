@@ -755,6 +755,63 @@ def core(out):
     print("core:", result["results"], result["core_metric"])
 
 
+
+@fixture
+def rl(out):
+    """chat_rl.py's rollout batching and policy-gradient loss on fixed rollouts (d2 model)."""
+    import torch
+    os.environ["NANOCHAT_BASE_DIR"] = os.path.join(out, "nanochat_base")
+    from nanochat.checkpoint_manager import build_model
+    model, tokenizer, _ = build_model(os.path.join(out, "nanochat_base", "base_checkpoints", "d2"), 5, torch.device("cpu"), "train")
+    os.environ["NANOCHAT_BASE_DIR"] = os.path.join(out, "task_base")
+    from tasks.gsm8k import GSM8K
+    task = GSM8K(subset="main", split="test")
+    assistant_end = tokenizer.encode_special("<|assistant_end|>")
+    output_start = tokenizer.encode_special("<|output_start|>")
+    device_batch_size, num_samples, examples = 2, 4, 2
+    rollouts, losses = [], []
+    model.zero_grad(set_to_none=True)
+    for ex in range(examples):
+        prompt = tokenizer.render_for_completion(task[ex])
+        answer = tokenizer.encode(task[ex]["messages"][-1]["content"][0]["text"])
+        seqs, masks = [], []
+        for s_i, n in enumerate([5, 9, 3, 12]):
+            gen = answer[:n]
+            mask = [1] * len(gen)
+            if s_i == 1:  # a forced tool-output span (mask 0) inside the completion
+                gen = gen[:4] + [output_start] + answer[4:6] + gen[4:]
+                mask = mask[:4] + [0, 0, 0] + mask[4:]
+            if s_i != 2:
+                gen, mask = gen + [assistant_end], mask + [1]
+            seqs.append(prompt + gen)
+            masks.append([0] * len(prompt) + mask)
+        rewards = [1.0, 0.0, 0.0, 1.0] if ex == 0 else [0.0, 0.0, 1.0, 0.0]
+        rollouts.append({"sequences": seqs, "masks": masks, "rewards": rewards})
+        # get_batch's tail
+        max_length = max(len(q) for q in seqs)
+        ids = torch.tensor([q + [assistant_end] * (max_length - len(q)) for q in seqs], dtype=torch.long)
+        mask_ids = torch.tensor([m + [0] * (max_length - len(m)) for m in masks], dtype=torch.long)
+        inputs, targets = ids[:, :-1], ids[:, 1:].clone()
+        targets[mask_ids[:, 1:] == 0] = -1
+        rewards_t = torch.tensor(rewards, dtype=torch.float)
+        advantages = rewards_t - rewards_t.mean()
+        num_passes = num_samples // device_batch_size
+        for p in range(num_passes):
+            b0, b1 = p * device_batch_size, (p + 1) * device_batch_size
+            logp = -model(inputs[b0:b1], targets[b0:b1], loss_reduction='none').view_as(inputs[b0:b1])
+            pg_obj = (logp * advantages[b0:b1].unsqueeze(-1)).sum()
+            num_valid = (targets[b0:b1] >= 0).sum().clamp(min=1)
+            pg_obj = pg_obj / (num_valid * num_passes * examples)
+            loss = -pg_obj
+            loss.backward()
+            losses.append(loss.item())
+    tensors = {f"grad.{name}": p.grad for name, p in model.named_parameters() if p.grad is not None}
+    write_safetensors(os.path.join(out, "rl.safetensors"), tensors, {
+        "rollouts": json.dumps(rollouts), "losses": json.dumps(losses),
+        "device_batch_size": str(device_batch_size), "examples": str(examples)})
+    print("rl losses:", losses)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", default="testdata", help="output directory")

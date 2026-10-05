@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_safe_tensors);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// One named tensor in a safetensors file.
 pub const SafeTensorEntry = struct {

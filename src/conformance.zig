@@ -42,7 +42,7 @@ pub const Conformance = struct {
         "rmsnormBackward",   "ropeBackward",       "attentionBackward", "reluSquareBackward",
         "dot",               "gateLinearBackward", "smearBackward",     "valueMixBackward",
         "embeddingBackward", "adamwStep",          "muonMomentum",      "muonPrepare",
-        "muonFinish",        "crossEntropyRows",   "gatedAdd",
+        "muonFinish",        "crossEntropyRows",   "gatedAdd",          "crossEntropyWeightedBackward",
     };
 
     /// Fails compilation when `B` misses part of the contract.
@@ -678,6 +678,17 @@ pub const Conformance = struct {
         const half = try hostCopy(B, backend, allocator, dpad);
         defer allocator.free(half);
         for (half, g) |hv, gv| try std.testing.expectApproxEqAbs(gv * 0.5, hv, 1e-7);
+
+        // Per-row weights instead of the mean: row r scales by weights[r] * count.
+        const weights = try tensorFrom(B, backend, f32, &.{4}, &.{ 0.5, 9, -2, 1 });
+        defer backend.free(weights);
+        try backend.crossEntropyWeightedBackward(dpad, capped, targets, weights, 3);
+        const weighted = try hostCopy(B, backend, allocator, dpad);
+        defer allocator.free(weighted);
+        const wv = [_]f32{ 0.5, 9, -2, 1 };
+        for (0..4) |r| {
+            for (0..6) |c| try std.testing.expectApproxEqAbs(g[r * 6 + c] * 3 * wv[r], weighted[r * 6 + c], 1e-6);
+        }
 
         // dot, with accumulate
         const a = try tensorFrom(B, backend, f32, &.{3}, &.{ 1, 2, 3 });

@@ -8,7 +8,7 @@
 
 .DEFAULT_GOAL := all
 
-.PHONY: all validate build dist run cli demo linux windows targets test bench format lint fixtures docs tag st open github clone claude clean
+.PHONY: all validate build dist run cli web test-cpu cuda demo linux windows targets test bench format lint fixtures docs tag st open github clone claude clean
 
 # ---------------------------------------------
 # Configuration
@@ -19,7 +19,7 @@ VERSION := $(shell sed -n -E 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"
 
 # The Zig sources to format and lint. Named explicitly rather than `.`: the
 # nanochat/ submodule and .zig-cache/ are not ours to rewrite or gate on.
-ZIG_SOURCES := build.zig $(wildcard src/*.zig) $(wildcard cli/*.zig) $(wildcard web/*.zig) $(wildcard bench/*.zig)
+ZIG_SOURCES := build.zig $(wildcard src/*.zig) $(wildcard src/*/*.zig) $(wildcard cli/*.zig) $(wildcard web/*.zig) $(wildcard bench/*.zig) $(wildcard tools/*.zig)
 
 # The styleguide checkout lint reads its zlint.json from. Override to lint
 # against another checkout: `make lint STYLEGUIDE=../zigmicrogpt/styleguide`.
@@ -41,7 +41,7 @@ all: build format test
 	@echo "done"
 
 # Full pre-commit gate: clean, format, lint, build, then test.
-validate: clean format lint build test
+validate: clean format lint build test test-cpu
 	@echo "validate done"
 
 # ---------------------------------------------
@@ -52,7 +52,7 @@ validate: clean format lint build test
 build:
 	zig build
 
-# Build optimized for release.
+# Build optimized for release (backend detected; override with -Dbackend=).
 dist:
 	zig build --release=fast
 
@@ -65,6 +65,10 @@ run:
 cli:
 	zig build --release=fast
 	./zig-out/bin/zignanogpt tui
+
+web:
+	zig build --release=fast
+	./zig-out/bin/zignanogpt-web $(ARGS)
 
 # Build and run the web console on a random port; it opens a browser itself.
 demo:
@@ -91,9 +95,17 @@ targets:
 # Test
 # ---------------------------------------------
 
-# Run the unit test suite.
+# Run the unit test suite on the detected backend (Metal, CUDA or CPU).
 test:
 	zig build test --summary all
+
+# The test suite on the CPU backend (the reference the GPU backends are checked against).
+test-cpu:
+	zig build test -Dbackend=cpu --summary all
+
+# Cross-compile the CUDA backend for the DGX Spark (no GPU here: build only).
+cuda:
+	zig build -Dbackend=cuda -Dtarget=aarch64-linux-gnu
 
 # Time backend matmul throughput (always ReleaseFast).
 bench:

@@ -11,7 +11,7 @@ const cli = @import("module.zig");
 /// `.info` compiles every function-entry trace out; `.debug` turns them on.
 pub const std_options: std.Options = .{ .log_level = .info, .logFn = logFn };
 
-pub const panic = cli.vaxis.Panic;
+pub const panic = cli.tui.Panic;
 
 /// Logs normally, or into the console's running job while it holds the terminal.
 fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {

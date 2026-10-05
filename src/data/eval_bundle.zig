@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_eval_bundle);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// How a CORE task is scored (`icl_task_type`).
 pub const CoreTaskType = enum { multiple_choice, schema, language_modeling };

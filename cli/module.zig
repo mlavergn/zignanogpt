@@ -5,7 +5,8 @@
 const std = @import("std");
 
 pub const nanogpt = @import("zignanogpt");
-pub const vaxis = @import("zigvaxis");
+/// The TUI components and the vaxis API (zigtui re-exports it; never import zigvaxis).
+pub const tui = @import("zigtui");
 
 pub const Args = @import("args.zig").Args;
 pub const BaseEval = @import("base_eval.zig").BaseEval;
@@ -30,13 +31,13 @@ pub const Operation = @import("operation.zig").Operation;
 pub const OperationField = @import("operation.zig").Field;
 pub const Overview = @import("overview.zig").Overview;
 pub const OverviewLine = @import("overview.zig").OverviewLine;
+pub const Rl = @import("rl.zig").Rl;
 pub const Runner = @import("runner.zig").Runner;
 pub const Sft = @import("sft.zig").Sft;
 pub const TokEval = @import("tok_eval.zig").TokEval;
 pub const TokTrain = @import("tok_train.zig").TokTrain;
 pub const Train = @import("train.zig").Train;
 pub const TrainSnapshot = @import("job.zig").TrainSnapshot;
-pub const TuiStyle = @import("tui_style.zig").TuiStyle;
 
 test {
     std.testing.refAllDecls(@This());

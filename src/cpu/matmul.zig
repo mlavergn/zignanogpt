@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const log = std.log.scoped(.zignanogpt_cpu_matmul);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// Rows of C one kernel call produces.
 const mr = 6;
@@ -73,10 +73,38 @@ pub const CpuMatmul = struct {
         if (self.m <= gemv_rows and self.options.transpose_b and !self.options.transpose_a) {
             return parallel.run(divCeil(self.n, gemv_cols), self, gemvWork);
         }
-        const tiles = divCeil(self.m, tm);
-        const tiles_n = divCeil(self.n, tn);
-        try parallel.run(tiles * tiles_n, self, tileWork);
+        // Shrink the tiles while there are fewer than ~4 per worker (long-K
+        // products such as weight gradients have few output tiles).
+        var shape = TileShape{ .rows = tm, .cols = tn };
+        while (shape.count(self.m, self.n) < 4 * parallel.threads) {
+            if (shape.cols > 4 * nr and shape.cols >= shape.rows) {
+                shape.cols /= 2;
+            } else if (shape.rows > 2 * mr) {
+                shape.rows /= 2;
+            } else break;
+        }
+        try parallel.run(shape.count(self.m, self.n), Tiled{ .problem = self, .shape = shape }, Tiled.work);
     }
+
+    /// The tile size of one run: at most `tm x tn`, multiples of `mr` and `nr`.
+    const TileShape = struct {
+        rows: usize,
+        cols: usize,
+
+        fn count(s: TileShape, m: usize, n: usize) usize {
+            return divCeil(m, s.rows) * divCeil(n, s.cols);
+        }
+    };
+
+    /// A run's work items: tiles of `shape`.
+    const Tiled = struct {
+        problem: *const Self,
+        shape: TileShape,
+
+        fn work(t: Tiled, index: usize, worker: usize) void {
+            t.problem.tile(t.shape, index, worker);
+        }
+    };
 
     /// `Parallel` work item: `gemv_cols` columns of C, every row.
     fn gemvWork(self: *const Self, index: usize, worker: usize) void {
@@ -113,18 +141,13 @@ pub const CpuMatmul = struct {
         return sum;
     }
 
-    /// `Parallel` work item: one tile.
-    fn tileWork(self: *const Self, index: usize, worker: usize) void {
-        self.tile(index, worker);
-    }
-
-    /// Computes one `tm x tn` tile of C.
-    fn tile(self: *const Self, index: usize, worker: usize) void {
-        const tiles_n = divCeil(self.n, tn);
-        const row0 = (index / tiles_n) * tm;
-        const col0 = (index % tiles_n) * tn;
-        const rows = @min(tm, self.m - row0);
-        const cols = @min(tn, self.n - col0);
+    /// Computes one tile of C.
+    fn tile(self: *const Self, shape: TileShape, index: usize, worker: usize) void {
+        const tiles_n = divCeil(self.n, shape.cols);
+        const row0 = (index / tiles_n) * shape.rows;
+        const col0 = (index % tiles_n) * shape.cols;
+        const rows = @min(shape.rows, self.m - row0);
+        const cols = @min(shape.cols, self.n - col0);
         const scratch = self.scratch[worker * scratch_len ..][0..scratch_len];
         const pack_a = scratch[0 .. tm * kc];
         const pack_b = scratch[tm * kc ..];
@@ -152,6 +175,20 @@ pub const CpuMatmul = struct {
     /// k-major within a panel; rows past the edge are zero.
     fn packA(self: *const Self, dst: []f32, row0: usize, rows: usize, k0: usize, depth: usize) void {
         const panels = divCeil(rows, mr);
+        if (self.options.transpose_a) {
+            // A stored [K, M]: a panel's rows are contiguous within each k, so
+            // copy them k by k (a strided walk per row misses cache every step).
+            for (0..panels) |p| {
+                const panel = dst[p * mr * depth ..][0 .. mr * depth];
+                const valid = @min(mr, rows - p * mr);
+                for (0..depth) |kk| {
+                    const out = panel[kk * mr ..][0..mr];
+                    @memcpy(out[0..valid], self.a[(k0 + kk) * self.m + row0 + p * mr ..][0..valid]);
+                    @memset(out[valid..], 0);
+                }
+            }
+            return;
+        }
         for (0..panels) |p| {
             const panel = dst[p * mr * depth ..][0 .. mr * depth];
             for (0..mr) |r| {

@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_parallel);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// Spreads independent work items over the `std.Io` thread pool.
 ///

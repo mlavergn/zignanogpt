@@ -1,7 +1,7 @@
 .{
     .name = .zignanogpt,
     .description = "Nanochat in pure Zig",
-    .version = "0.0.4",
+    .version = "0.0.5",
     .fingerprint = 0x40a6373274f306b8,
     .minimum_zig_version = "0.16.0",
     .paths = .{
@@ -16,15 +16,9 @@
             .path = "../../inferise/zigstorage",
             .clone = "git@github.com:inferise/zigstorage.git",
         },
-        .zigvaxis = .{
-            .path = "../../inferise/zigvaxis",
-            .clone = "git@github.com:inferise/zigvaxis.git",
-        },
-        // Pinned to the commit zigvaxis uses; one module serves both, built
-        // with the union of the fields each needs (see build.zig).
-        .uucode = .{
-            .url = "git+https://github.com/jacobsandlund/uucode#2826a37a4562284fdacd8fa029d49509cc9bffcd",
-            .hash = "uucode-0.2.0-ZZjBPlK5VADj7fdoq7G8LIHzD5o6FSkcBXXrRWr4jnrA",
+        .zigtui = .{
+            .path = "../../inferise/zigtui",
+            .clone = "git@github.com:inferise/zigtui.git",
         },
     },
 }

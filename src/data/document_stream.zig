@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zignanogpt_document_stream);
-const mod = @import("module.zig");
+const mod = @import("../module.zig");
 
 /// Where a document batch came from, for resuming (`dataloader_state_dict`).
 pub const DataLoaderState = struct {
