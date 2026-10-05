@@ -19,6 +19,10 @@ pub const MatmulOptions = struct {
     alpha: f32 = 1,
     /// Add into C instead of overwriting it.
     accumulate: bool = false,
+    /// Independent products done at once: each operand holds `batch` equal
+    /// matrices stacked along its rows (Muon orthogonalizes same-shape
+    /// parameters together). Shapes below are per matrix.
+    batch: usize = 1,
 
     /// The problem size `(m, n, k)` of `c = op(a) @ op(b)`, validated.
     ///
@@ -32,15 +36,36 @@ pub const MatmulOptions = struct {
     ///
     /// Return: `.{ m, n, k }`; `error.ShapeMismatch` when they do not chain.
     pub fn dims(self: MatmulOptions, c: mod.Shape, a: mod.Shape, b: mod.Shape) error{ShapeMismatch}![3]usize {
-        const m = if (self.transpose_a) a.cols() else a.rows();
-        const k = if (self.transpose_a) a.rows() else a.cols();
-        const kb = if (self.transpose_b) b.cols() else b.rows();
-        const n = if (self.transpose_b) b.rows() else b.cols();
-        if (k != kb or c.rows() != m or c.cols() != n) {
+        const batch = self.batch;
+        if (batch == 0 or a.rows() % batch != 0 or b.rows() % batch != 0 or c.rows() % batch != 0) {
+            log.debug("matmul batch {d} does not divide the rows of c {f}, a {f}, b {f}", .{ batch, c, a, b });
+            return error.ShapeMismatch;
+        }
+        const a_rows = a.rows() / batch;
+        const b_rows = b.rows() / batch;
+        const m = if (self.transpose_a) a.cols() else a_rows;
+        const k = if (self.transpose_a) a_rows else a.cols();
+        const kb = if (self.transpose_b) b.cols() else b_rows;
+        const n = if (self.transpose_b) b_rows else b.cols();
+        if (k != kb or c.rows() / batch != m or c.cols() != n) {
             log.debug("matmul shapes do not chain: c {f} = a {f} @ b {f} (ta={}, tb={})", .{ c, a, b, self.transpose_a, self.transpose_b });
             return error.ShapeMismatch;
         }
         return .{ m, n, k };
+    }
+
+    /// Matrix `index` of a batched operand, as a `[rows, cols]` view.
+    ///
+    /// Parameters:
+    /// - `self`: the options (their `batch`).
+    /// - `t`: the stacked operand.
+    /// - `index`: the matrix, below `batch`.
+    ///
+    /// Return: the view; shape errors.
+    pub fn matrixOf(self: MatmulOptions, t: mod.Tensor, index: usize) !mod.Tensor {
+        const rows = t.shape.rows() / self.batch;
+        const flat = try t.reshape(&.{ t.shape.rows(), t.shape.cols() });
+        return flat.rows(index * rows, rows);
     }
 };
 
@@ -51,6 +76,14 @@ test "matmul options default to a plain overwrite" {
     const options = mod.MatmulOptions{};
     try std.testing.expect(!options.transpose_a and !options.transpose_b and !options.accumulate);
     try std.testing.expectEqual(@as(f32, 1), options.alpha);
+}
+
+test "matmul options split a batch into per-matrix dimensions" {
+    const x = try mod.Shape.init(&.{ 3 * 4, 6 }); // three [4, 6] matrices
+    const gram = try mod.Shape.init(&.{ 3 * 6, 6 });
+    const options = mod.MatmulOptions{ .transpose_a = true, .batch = 3 };
+    try std.testing.expectEqual([3]usize{ 6, 6, 4 }, try options.dims(gram, x, x));
+    try std.testing.expectError(error.ShapeMismatch, (mod.MatmulOptions{ .batch = 5 }).dims(gram, x, x));
 }
 
 test "matmul options resolve and check dimensions" {

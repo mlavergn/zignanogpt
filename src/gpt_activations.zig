@@ -59,6 +59,9 @@ pub const GptActivations = struct {
     /// `lm_head` output over the padded vocab `[B * T, Vpad]`, then cropped and capped `[B, T, V]`.
     logits_pad: mod.Tensor,
     logits: mod.Tensor,
+    /// Each row's log-sum-exp of the capped logits `[B * T]` (`softcap` writes
+    /// it; the loss and its backward reuse it).
+    logits_lse: mod.Tensor,
     /// Scratch for projection outputs: `[B, T, C]`.
     tmp: mod.Tensor,
 
@@ -99,6 +102,7 @@ pub const GptActivations = struct {
         self.xn_final = try self.new(&.{ b, t, c });
         self.logits_pad = try self.new(&.{ b * t, config.paddedVocab() });
         self.logits = try self.new(&.{ b, t, config.vocab_size });
+        self.logits_lse = try self.new(&.{b * t});
         self.tmp = try self.new(&.{ b, t, c });
 
         self.layers = try allocator.alloc(GptLayerActivations, config.n_layer);

@@ -84,7 +84,11 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   (`onCpu`). A new op can start there and move to a kernel later; each `onCpu` stalls the GPU
   queue, so on hot paths it costs far more than the op. Metal attention is flash attention on
   simdgroup matrices (head dim padded to 8..128, compared against the CPU kernels in
-  `src/metal/backend.zig`'s tests). Metal kernels are MSL in
+  `src/metal/backend.zig`'s tests). Only `copy` writes index tensors on the GPU; the backend
+  tracks those writes (`readyForHost`) so id/target checks read the host bytes without a sync.
+  Optimizer and embedding-backward kernels live in the strict library (`reduce.metal`).
+  Profile GPU time per kernel by timing command buffers with a sync per op (temporary patch;
+  never commit it). Metal kernels are MSL in
   `src/metal/kernels.metal` (fast math) and `src/metal/reduce.metal` (strict, double-float sums);
   CUDA kernels are Zig in `src/cuda/kernels.zig` (camelCase functions `@export`ed under the
   snake_case PTX names the backend looks up; no libm on the device). `make test` runs the suite

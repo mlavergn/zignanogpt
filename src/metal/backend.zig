@@ -22,6 +22,23 @@ const reduce_source = @embedFile("reduce.metal");
 /// `MTLSize`.
 const Size = extern struct { width: u64, height: u64 = 1, depth: u64 = 1 };
 
+/// The kernels built from `reduce.metal` (no fast math); the rest come from `kernels.metal`.
+const strict_kernels = [_][]const u8{
+    "dot_partial_f32",        "reduce_sum_f32",  "row_squares_f32",   "col_squares_f32",
+    "pair_total_f32",         "adamw_step_f32",  "muon_momentum_f32", "muon_scale_rows_f32",
+    "muon_scale_all_f32",     "muon_renorm_f32", "normuon_stats_f32", "muon_update_f32",
+    "embedding_backward_f32",
+};
+
+/// Whether a kernel comes from `reduce.metal`.
+fn isStrict(comptime name: []const u8) bool {
+    @setEvalBranchQuota(10_000);
+    for (strict_kernels) |strict_name| {
+        if (std.mem.eql(u8, strict_name, name)) return true;
+    }
+    return false;
+}
+
 /// The compute kernels, by MSL function name.
 const Kernel = enum {
     fill_f32,
@@ -50,6 +67,19 @@ const Kernel = enum {
     value_mix_backward_f32,
     xent_rows_f32,
     xent_backward_f32,
+    softcap_lse_f32,
+    xent_rows_lse_f32,
+    row_squares_f32,
+    col_squares_f32,
+    pair_total_f32,
+    adamw_step_f32,
+    muon_momentum_f32,
+    muon_scale_rows_f32,
+    muon_scale_all_f32,
+    muon_renorm_f32,
+    normuon_stats_f32,
+    muon_update_f32,
+    embedding_backward_f32,
     attention_delta_f32,
     attention_f32_d8,
     attention_f32_d16,
@@ -74,8 +104,10 @@ const Kernel = enum {
 /// Matmuls go to Metal Performance Shaders; the model's other per-layer ops
 /// (attention, norms, rotary, gates, smear, value mix, dot products, cross
 /// entropy) are MSL kernels. Tensors live in shared-storage buffers, so the
-/// remaining ops (embedding backward, optimizer steps) run on the CPU kernels
-/// over the same memory after a `sync`.
+/// remaining ops run on the CPU kernels over the same memory after a `sync`.
+/// Index tensors (token ids, targets) are read on the host where the contract
+/// asks for a bounds check; that waits for the GPU only when a queued copy
+/// writes the tensor (`readyForHost`).
 pub const MetalBackend = struct {
     const Self = @This();
 
@@ -103,6 +135,9 @@ pub const MetalBackend = struct {
     /// Buffers to release once the open command buffer completes (freed
     /// tensors and per-op scratch).
     deferred: std.ArrayList(Id) = .empty,
+    /// Index tensors (by buffer address) a copy queued since the last sync
+    /// writes: the host must wait before reading them.
+    gpu_written: std.AutoHashMapUnmanaged(usize, void) = .empty,
 
     /// Opens the default Metal device and compiles the kernels.
     ///
@@ -144,7 +179,7 @@ pub const MetalBackend = struct {
         var made: usize = 0;
         errdefer for (pipelines[0..made]) |p| Objc.release(p);
         inline for (@typeInfo(Kernel).@"enum".fields, 0..) |f, i| {
-            const source = if (std.mem.eql(u8, f.name, "dot_partial_f32") or std.mem.eql(u8, f.name, "reduce_sum_f32")) reduce_library else library;
+            const source = if (comptime isStrict(f.name)) reduce_library else library;
             const function = Objc.call1(?Id, Id, source, "newFunctionWithName:", try Objc.string(f.name)) orelse {
                 log.warn("Metal kernel {s} missing", .{f.name});
                 return error.MetalCompileFailed;
@@ -163,6 +198,7 @@ pub const MetalBackend = struct {
         log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
         self.sync() catch |err| log.warn("Metal work failed at shutdown [{t}]", .{err});
         self.deferred.deinit(self.allocator);
+        self.gpu_written.deinit(self.allocator);
         var it = self.gemms.valueIterator();
         while (it.next()) |g| Objc.release(g.*);
         self.gemms.deinit(self.allocator);
@@ -224,6 +260,7 @@ pub const MetalBackend = struct {
         self.pool = null;
         for (self.deferred.items) |b| Objc.release(b);
         self.deferred.clearRetainingCapacity();
+        self.gpu_written.clearRetainingCapacity();
         if (failed) return error.MetalCommandFailed;
     }
 
@@ -256,6 +293,7 @@ pub const MetalBackend = struct {
         // Overlapping copies need memmove order: leave them to the CPU.
         if (overlaps(dst, src)) return self.onCpu("copy", .{ dst, src });
         const n = try count(dst);
+        if (dst.dtype != .f32) try self.gpu_written.put(self.allocator, @intFromPtr(dst.buffer.bytes.ptr), {});
         const e = try self.begin(.copy_u32);
         setTensor(e, dst, 0);
         setTensor(e, src, 1);
@@ -322,11 +360,23 @@ pub const MetalBackend = struct {
         dispatch(e, n);
     }
 
-    pub fn softcap(self: *Self, out: mod.Tensor, logits: mod.Tensor, cap: f32) !void {
+    pub fn softcap(self: *Self, out: mod.Tensor, logits: mod.Tensor, cap: f32, lse: ?mod.Tensor) !void {
         if (out.dtype != .f32 or logits.dtype != .f32) return error.DtypeMismatch;
         if (out.shape.rows() != logits.shape.rows() or out.shape.cols() > logits.shape.cols()) return error.ShapeMismatch;
         if (overlaps(out, logits)) return error.Aliasing;
         const n = try count(out);
+        if (lse) |t| {
+            // One pass: the capped row and its log-sum-exp.
+            try checkRowValues(t, out);
+            const e = try self.begin(.softcap_lse_f32);
+            setTensor(e, out, 0);
+            setTensor(e, logits, 1);
+            setTensor(e, t, 2);
+            const Args = extern struct { cols: u32, padded: u32, cap: f32, n: u32 };
+            setValue(e, Args, .{ .cols = @intCast(out.shape.cols()), .padded = @intCast(logits.shape.cols()), .cap = cap, .n = n }, 3);
+            dispatchRows(e, out.shape.rows(), out.shape.cols());
+            return;
+        }
         const e = try self.begin(.softcap_f32);
         setTensor(e, out, 0);
         setTensor(e, logits, 1);
@@ -340,7 +390,7 @@ pub const MetalBackend = struct {
         const cols = table.shape.cols();
         if (out.numel() != ids.numel() * cols) return error.ShapeMismatch;
         // The ids are checked on the host (the contract forbids reading out of bounds).
-        try self.sync();
+        try self.readyForHost(ids);
         const vocab = table.shape.rows();
         const id_bytes = ids.buffer.bytes[ids.offset * 4 ..][0 .. ids.numel() * 4];
         for (std.mem.bytesAsSlice(i32, id_bytes)) |id| {
@@ -389,6 +439,12 @@ pub const MetalBackend = struct {
         if (overlaps(c, a) or overlaps(c, b)) return error.Aliasing;
         if (m == 0 or n == 0) return;
         if (k > 0) return self.gemm(c, a, b, options, m, n, k);
+        if (options.batch > 1) {
+            var single = options;
+            single.batch = 1;
+            for (0..options.batch) |i| try self.matmul(try options.matrixOf(c, i), try options.matrixOf(a, i), try options.matrixOf(b, i), single);
+            return;
+        }
         const e = try self.begin(.matmul_f32);
         setTensor(e, c, 0);
         setTensor(e, a, 1);
@@ -419,19 +475,24 @@ pub const MetalBackend = struct {
             try self.gemms.put(self.allocator, key, made);
             break :blk made;
         };
-        // Stored layouts: A is [M, K] or [K, M], B is [K, N] or [N, K], C is [M, N].
-        const left = try matrix(a, if (options.transpose_a) k else m, if (options.transpose_a) m else k);
-        const right = try matrix(b, if (options.transpose_b) n else k, if (options.transpose_b) k else n);
-        const result = try matrix(c, m, n);
+        // Stored layouts: A is [M, K] or [K, M], B is [K, N] or [N, K], C is [M, N];
+        // a batch is that many matrices back to back.
+        const batch = options.batch;
+        const left = try matrix(a, if (options.transpose_a) k else m, if (options.transpose_a) m else k, batch);
+        const right = try matrix(b, if (options.transpose_b) n else k, if (options.transpose_b) k else n, batch);
+        const result = try matrix(c, m, n, batch);
+        Objc.call1(void, u64, kernel, "setBatchStart:", 0);
+        Objc.call1(void, u64, kernel, "setBatchSize:", batch);
         const Encode = *const fn (Id, mod.ObjcSel, Id, Id, Id, Id) callconv(.c) void;
         Objc.function(Encode)(kernel, Objc.sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:"), command, left, right, result);
     }
 
-    /// An autoreleased `MPSMatrix` over a tensor's elements, `rows x cols` row-major.
-    fn matrix(t: mod.Tensor, rows: usize, cols: usize) !Id {
+    /// An autoreleased `MPSMatrix` over a tensor's elements: `matrices`
+    /// row-major `rows x cols` matrices, back to back.
+    fn matrix(t: mod.Tensor, rows: usize, cols: usize, matrices: usize) !Id {
         // MPSDataTypeFloat32 = 0x10000000 | 32
-        const F = *const fn (Id, mod.ObjcSel, u64, u64, u64, u32) callconv(.c) ?Id;
-        const desc = Objc.function(F)(try Objc.class("MPSMatrixDescriptor"), Objc.sel("matrixDescriptorWithRows:columns:rowBytes:dataType:"), rows, cols, cols * 4, 0x10000020) orelse return error.MetalInitFailed;
+        const F = *const fn (Id, mod.ObjcSel, u64, u64, u64, u64, u64, u32) callconv(.c) ?Id;
+        const desc = Objc.function(F)(try Objc.class("MPSMatrixDescriptor"), Objc.sel("matrixDescriptorWithRows:columns:matrices:rowBytes:matrixBytes:dataType:"), rows, cols, matrices, cols * 4, rows * cols * 4, 0x10000020) orelse return error.MetalInitFailed;
         const raw = Objc.call0(?Id, try Objc.class("MPSMatrix"), "alloc") orelse return error.MetalInitFailed;
         const made = Objc.call3(?Id, Id, u64, Id, raw, "initWithBuffer:offset:descriptor:", t.buffer.mtl.?, t.offset * 4, desc) orelse return error.MetalInitFailed;
         return Objc.call0(Id, made, "autorelease");
@@ -466,8 +527,11 @@ pub const MetalBackend = struct {
 
     const AttnArgs = extern struct { b: u32, tq: u32, tk: u32, keys: u32, h: u32, hkv: u32, d: u32, window: u32, scale: f32, has_lse: u32 };
 
-    /// Queries (forward, dq) or keys (dk/dv) per attention threadgroup.
-    const attn_block = 32;
+    /// Simdgroups per attention threadgroup (`ATTN_SG` in kernels.metal); each
+    /// takes 8 query rows (forward, dq) or 8 key rows (dk/dv).
+    fn attnGroups(padded: usize) usize {
+        return if (padded <= 64) 8 else 4;
+    }
 
     /// Flash attention on simdgroup matrices (`kernels.metal`); head
     /// dimensions past 128 run on the CPU kernels.
@@ -484,7 +548,8 @@ pub const MetalBackend = struct {
         const e = try self.begin(attnKernel("attention_f32", padded));
         for ([_]mod.Tensor{ out, q, k, v, lse orelse out }, 0..) |t, i| setTensor(e, t, i);
         setValue(e, AttnArgs, attnArgs(d, options, lse != null), 5);
-        dispatchGroups(e, .{ .width = (d.tq + attn_block - 1) / attn_block, .height = d.h, .depth = d.b });
+        const sgs = attnGroups(padded);
+        dispatchAttention(e, .{ .width = (d.tq + 8 * sgs - 1) / (8 * sgs), .height = d.h, .depth = d.b }, sgs);
     }
 
     pub fn attentionBackward(self: *Self, dq: mod.Tensor, dk: mod.Tensor, dv: mod.Tensor, dout: mod.Tensor, q: mod.Tensor, k: mod.Tensor, v: mod.Tensor, out: mod.Tensor, lse: mod.Tensor, options: mod.AttentionOptions) !void {
@@ -512,11 +577,12 @@ pub const MetalBackend = struct {
         e = try self.begin(attnKernel("attention_dq_f32", padded));
         for ([_]mod.Tensor{ dq, dout, q, k, v, lse, delta }, 0..) |t, i| setTensor(e, t, i);
         setValue(e, AttnArgs, args, 7);
-        dispatchGroups(e, .{ .width = (d.tq + attn_block - 1) / attn_block, .height = d.h, .depth = d.b });
+        const sgs = attnGroups(padded);
+        dispatchAttention(e, .{ .width = (d.tq + 8 * sgs - 1) / (8 * sgs), .height = d.h, .depth = d.b }, sgs);
         e = try self.begin(attnKernel("attention_dkv_f32", padded));
         for ([_]mod.Tensor{ dk, dv, dout, q, k, v, lse, delta }, 0..) |t, i| setTensor(e, t, i);
         setValue(e, AttnArgs, args, 8);
-        dispatchGroups(e, .{ .width = (d.tk + attn_block - 1) / attn_block, .height = d.hkv, .depth = d.b });
+        dispatchAttention(e, .{ .width = (d.tk + 8 * sgs - 1) / (8 * sgs), .height = d.hkv, .depth = d.b }, sgs);
     }
 
     fn attnArgs(d: mod.AttentionOptions.Dims, options: mod.AttentionOptions, has_lse: bool) AttnArgs {
@@ -585,7 +651,7 @@ pub const MetalBackend = struct {
         setTensor(e, dout, 1);
         setTensor(e, x, 2);
         setValue(e, GateArgs, args, 3);
-        dispatch(e, @intCast(heads * cin));
+        if (heads * cin > 0) Objc.call2(void, Size, Size, e, "dispatchThreadgroups:threadsPerThreadgroup:", .{ .width = heads * cin }, .{ .width = 256 });
     }
 
     const SmearArgs = extern struct { t: u32, cols: u32, factor: f32, has_lambda: u32, n: u32 };
@@ -662,13 +728,13 @@ pub const MetalBackend = struct {
         dispatch(e, @intCast(pairs));
     }
 
-    const XentArgs = extern struct { vocab: u32, padded: u32, cap: f32, factor: f32, has_weights: u32 };
+    const XentArgs = extern struct { vocab: u32, padded: u32, cap: f32, factor: f32, has_weights: u32, has_lse: u32 = 0 };
 
     /// Checks targets on the host (after a sync) and counts the valid ones.
     fn checkTargets(self: *Self, logits: mod.Tensor, targets: mod.Tensor) !usize {
         if (logits.dtype != .f32 or targets.dtype != .i32) return error.DtypeMismatch;
         if (targets.numel() != logits.shape.rows()) return error.ShapeMismatch;
-        try self.sync();
+        try self.readyForHost(targets);
         const vocab = logits.shape.cols();
         var valid: usize = 0;
         for (std.mem.bytesAsSlice(i32, targets.buffer.bytes[targets.offset * 4 ..][0 .. targets.numel() * 4])) |t| {
@@ -693,30 +759,38 @@ pub const MetalBackend = struct {
         dispatchRows(e, logits.shape.rows(), logits.shape.cols());
     }
 
-    pub fn crossEntropy(self: *Self, loss: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor) !void {
+    pub fn crossEntropy(self: *Self, loss: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, lse: ?mod.Tensor) !void {
         const valid = try self.checkTargets(logits, targets);
         if (loss.dtype != .f32 or loss.numel() == 0) return error.DtypeMismatch;
         const rows = logits.shape.rows();
         const losses = try self.scratch(rows);
-        try self.xentRows(losses, logits, targets);
+        if (lse) |t| {
+            // The soft cap's log-sum-exp: one gather per row instead of a pass over it.
+            try checkRowValues(t, logits);
+            const e = try self.begin(.xent_rows_lse_f32);
+            for ([_]mod.Tensor{ losses, logits, targets, t }, 0..) |tensor, i| setTensor(e, tensor, i);
+            setValue(e, [2]u32, .{ @intCast(logits.shape.cols()), @intCast(rows) }, 4);
+            dispatch(e, @intCast(rows));
+        } else try self.xentRows(losses, logits, targets);
         // The mean over valid rows (NaN when there are none, as PyTorch).
         try self.reduce(losses, rows, loss, if (valid == 0) std.math.nan(f32) else 1 / @as(f32, @floatFromInt(valid)), false);
     }
 
-    pub fn crossEntropyBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, cap: f32, scale_by: f32) !void {
+    pub fn crossEntropyBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, cap: f32, scale_by: f32, lse: ?mod.Tensor) !void {
         const valid = try self.checkTargets(logits, targets);
-        try self.xentBackward(dpad, logits, targets, null, cap, scale_by / @as(f32, @floatFromInt(valid)));
+        try self.xentBackward(dpad, logits, targets, null, cap, scale_by / @as(f32, @floatFromInt(valid)), lse);
     }
 
-    pub fn crossEntropyWeightedBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, weights: mod.Tensor, cap: f32) !void {
+    pub fn crossEntropyWeightedBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, weights: mod.Tensor, cap: f32, lse: ?mod.Tensor) !void {
         _ = try self.checkTargets(logits, targets);
         if (weights.dtype != .f32) return error.DtypeMismatch;
         if (weights.numel() != logits.shape.rows()) return error.ShapeMismatch;
-        try self.xentBackward(dpad, logits, targets, weights, cap, 1);
+        try self.xentBackward(dpad, logits, targets, weights, cap, 1, lse);
     }
 
-    fn xentBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, weights: ?mod.Tensor, cap: f32, factor: f32) !void {
+    fn xentBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, weights: ?mod.Tensor, cap: f32, factor: f32, lse: ?mod.Tensor) !void {
         if (dpad.dtype != .f32) return error.DtypeMismatch;
+        if (lse) |t| try checkRowValues(t, logits);
         if (dpad.shape.rows() != logits.shape.rows() or dpad.shape.cols() < logits.shape.cols()) return error.ShapeMismatch;
         if (overlaps(dpad, logits)) return error.Aliasing;
         const e = try self.begin(.xent_backward_f32);
@@ -724,7 +798,8 @@ pub const MetalBackend = struct {
         setTensor(e, logits, 1);
         setTensor(e, targets, 2);
         setTensor(e, weights orelse logits, 3);
-        setValue(e, XentArgs, .{ .vocab = @intCast(logits.shape.cols()), .padded = @intCast(dpad.shape.cols()), .cap = cap, .factor = factor, .has_weights = @intFromBool(weights != null) }, 4);
+        setValue(e, XentArgs, .{ .vocab = @intCast(logits.shape.cols()), .padded = @intCast(dpad.shape.cols()), .cap = cap, .factor = factor, .has_weights = @intFromBool(weights != null), .has_lse = @intFromBool(lse != null) }, 4);
+        setTensor(e, lse orelse logits, 5);
         dispatchRows(e, logits.shape.rows(), dpad.shape.cols());
     }
 
@@ -757,20 +832,196 @@ pub const MetalBackend = struct {
         Objc.call2(void, Size, Size, e, "dispatchThreadgroups:threadsPerThreadgroup:", .{ .width = 1 }, .{ .width = 256 });
     }
 
+    /// `dtable[ids[r]] += dout[r]`. The host groups the rows by id (its ids
+    /// are host-readable, as in `embedding`); one GPU thread per (column, id)
+    /// then adds that id's rows in order, the CPU's sum order.
     pub fn embeddingBackward(self: *Self, dtable: mod.Tensor, dout: mod.Tensor, ids: mod.Tensor) !void {
-        return self.onCpu("embeddingBackward", .{ dtable, dout, ids });
+        if (dtable.dtype != .f32 or dout.dtype != .f32 or ids.dtype != .i32) return error.DtypeMismatch;
+        const cols = dtable.shape.cols();
+        const rows = ids.numel();
+        if (dout.numel() != rows * cols) return error.ShapeMismatch;
+        if (rows == 0 or cols == 0) return;
+        _ = try count(dtable);
+        try self.readyForHost(ids);
+        const vocab = dtable.shape.rows();
+        const id_values = std.mem.bytesAsSlice(i32, ids.buffer.bytes[ids.offset * 4 ..][0 .. rows * 4]);
+        for (id_values) |id| {
+            if (id < 0 or id >= vocab) {
+                log.debug("embedding backward id {d} outside vocab {d}", .{ id, vocab });
+                return error.OutOfBounds;
+            }
+        }
+        // Rows grouped by id, in row order within an id (a stable sort).
+        const order = try self.allocator.alloc(u32, rows);
+        defer self.allocator.free(order);
+        for (order, 0..) |*o, r| o.* = @intCast(r);
+        const ByRow = struct {
+            ids: []align(1) const i32,
+            fn less(ctx: @This(), x: u32, y: u32) bool {
+                return ctx.ids[x] < ctx.ids[y] or (ctx.ids[x] == ctx.ids[y] and x < y);
+            }
+        };
+        std.sort.pdq(u32, order, ByRow{ .ids = id_values }, ByRow.less);
+        var unique: usize = 0;
+        for (order, 0..) |r, k| {
+            if (k == 0 or id_values[r] != id_values[order[k - 1]]) unique += 1;
+        }
+        // Layout: rows by id, each id's start (and the end), then the ids.
+        const index = try self.scratch(rows + 2 * unique + 1);
+        const words = std.mem.bytesAsSlice(u32, index.buffer.bytes);
+        @memcpy(words[0..rows], order);
+        const starts = words[rows..][0 .. unique + 1];
+        const unique_ids = words[rows + unique + 1 ..][0..unique];
+        var u: usize = 0;
+        for (order, 0..) |r, k| {
+            if (k == 0 or id_values[r] != id_values[order[k - 1]]) {
+                starts[u] = @intCast(k);
+                unique_ids[u] = @intCast(id_values[r]);
+                u += 1;
+            }
+        }
+        starts[unique] = @intCast(rows);
+        const e = try self.begin(.embedding_backward_f32);
+        for ([_]mod.Tensor{ dtable, dout, index }, 0..) |t, i| setTensor(e, t, i);
+        const Args = extern struct { cols: u32, unique: u32, rows: u32 };
+        setValue(e, Args, .{ .cols = @intCast(cols), .unique = @intCast(unique), .rows = @intCast(rows) }, 3);
+        Objc.call2(void, Size, Size, e, "dispatchThreads:threadsPerThreadgroup:", .{ .width = cols, .height = unique }, .{ .width = @min(cols, 256) });
     }
+
     pub fn adamwStep(self: *Self, p: mod.Tensor, g: mod.Tensor, m: mod.Tensor, v: mod.Tensor, params: mod.AdamWParams) !void {
-        return self.onCpu("adamwStep", .{ p, g, m, v, params });
+        try checkSame(p, g);
+        try checkSame(p, m);
+        try checkSame(p, v);
+        try params.validate();
+        const n = try count(p);
+        const step: f32 = @floatFromInt(params.step);
+        const Args = extern struct { decay: f32, w1: f32, w2: f32, bias2: f32, step_size: f32, eps: f32, n: u32 };
+        const e = try self.begin(.adamw_step_f32);
+        for ([_]mod.Tensor{ p, g, m, v }, 0..) |t, i| setTensor(e, t, i);
+        setValue(e, Args, .{
+            .decay = 1 - params.lr * params.weight_decay,
+            .w1 = 1 - params.beta1,
+            .w2 = 1 - params.beta2,
+            .bias2 = 1 - std.math.pow(f32, params.beta2, step),
+            .step_size = params.lr / (1 - std.math.pow(f32, params.beta1, step)),
+            .eps = params.eps,
+            .n = n,
+        }, 4);
+        dispatch(e, n);
     }
+
     pub fn muonMomentum(self: *Self, g: mod.Tensor, buf: mod.Tensor, momentum: f32) !void {
-        return self.onCpu("muonMomentum", .{ g, buf, momentum });
+        try checkSame(g, buf);
+        const n = try count(g);
+        const e = try self.begin(.muon_momentum_f32);
+        setTensor(e, g, 0);
+        setTensor(e, buf, 1);
+        const Args = extern struct { momentum: f32, n: u32 };
+        setValue(e, Args, .{ .momentum = momentum, .n = n }, 2);
+        dispatch(e, n);
     }
+
+    const ShapeArgs = extern struct { rows: u32, cols: u32, n: u32 };
+
+    /// MuonEq row equilibration, then `x /= ||x||_F * 1.01 + 1e-6`
+    /// (`CpuBackend.muonPrepare`), with double-float norms.
     pub fn muonPrepare(self: *Self, x: mod.Tensor) !void {
-        return self.onCpu("muonPrepare", .{x});
+        if (x.dtype != .f32) return error.DtypeMismatch;
+        const rows = x.shape.rows();
+        const cols = x.shape.cols();
+        const n = try count(x);
+        if (n == 0) return;
+        const row_sq = try self.scratch(2 * rows);
+        const total = try self.scratch(2);
+        try self.rowSquares(x, rows, cols, row_sq);
+        try self.pairTotal(row_sq, rows, total);
+        var e = try self.begin(.muon_scale_rows_f32);
+        for ([_]mod.Tensor{ x, row_sq, total }, 0..) |t, i| setTensor(e, t, i);
+        setValue(e, ShapeArgs, .{ .rows = @intCast(rows), .cols = @intCast(cols), .n = n }, 3);
+        dispatch(e, n);
+        try self.rowSquares(x, rows, cols, row_sq);
+        try self.pairTotal(row_sq, rows, total);
+        e = try self.begin(.muon_scale_all_f32);
+        setTensor(e, x, 0);
+        setTensor(e, total, 1);
+        setValue(e, u32, n, 2);
+        dispatch(e, n);
     }
+
+    /// Muon+ renormalization, NorMuon variance reduction and the cautious
+    /// update (`CpuBackend.muonFinish`), with double-float norms and sums.
     pub fn muonFinish(self: *Self, p: mod.Tensor, g: mod.Tensor, second: mod.Tensor, params: mod.MuonParams) !void {
-        return self.onCpu("muonFinish", .{ p, g, second, params });
+        try checkSame(p, g);
+        if (second.dtype != .f32) return error.DtypeMismatch;
+        const rows = p.shape.rows();
+        const cols = p.shape.cols();
+        const by_row = rows >= cols;
+        const shape = mod.MuonParams.secondShape(rows, cols);
+        if (second.shape.rows() != shape[0] or second.shape.cols() != shape[1]) return error.ShapeMismatch;
+        const n = try count(p);
+        if (n == 0) return;
+
+        const row_sq = try self.scratch(2 * rows);
+        const total = try self.scratch(2);
+        try self.rowSquares(g, rows, cols, row_sq);
+        try self.pairTotal(row_sq, rows, total);
+        var e = try self.begin(.muon_renorm_f32);
+        setTensor(e, g, 0);
+        setTensor(e, total, 1);
+        const RenormArgs = extern struct { target: f32, n: u32 };
+        setValue(e, RenormArgs, .{ .target = @floatCast(@sqrt(@as(f64, @floatFromInt(@min(rows, cols))))), .n = n }, 2);
+        dispatch(e, n);
+
+        // Squares over the reduced dimension: per row when tall, per column when wide.
+        const reduced = second.numel();
+        const sums = try self.scratch(2 * reduced);
+        if (by_row) {
+            try self.rowSquares(g, rows, cols, sums);
+        } else {
+            e = try self.begin(.col_squares_f32);
+            setTensor(e, g, 0);
+            setTensor(e, sums, 1);
+            const ColArgs = extern struct { rows: u32, cols: u32 };
+            setValue(e, ColArgs, .{ .rows = @intCast(rows), .cols = @intCast(cols) }, 2);
+            dispatch(e, @intCast(cols));
+        }
+        const ratio = try self.scratch(1);
+        e = try self.begin(.normuon_stats_f32);
+        for ([_]mod.Tensor{ sums, second, ratio }, 0..) |t, i| setTensor(e, t, i);
+        const StatsArgs = extern struct { count: u32, red: f32, beta2: f32 };
+        setValue(e, StatsArgs, .{ .count = @intCast(reduced), .red = @floatFromInt(if (by_row) cols else rows), .beta2 = params.beta2 }, 3);
+        Objc.call2(void, Size, Size, e, "dispatchThreadgroups:threadsPerThreadgroup:", .{ .width = 1 }, .{ .width = 256 });
+
+        e = try self.begin(.muon_update_f32);
+        for ([_]mod.Tensor{ p, g, second, ratio }, 0..) |t, i| setTensor(e, t, i);
+        const UpdateArgs = extern struct { lr: f32, lr_wd: f32, cols: u32, by_row: u32, n: u32 };
+        setValue(e, UpdateArgs, .{ .lr = params.lr, .lr_wd = params.lr * params.weight_decay, .cols = @intCast(cols), .by_row = @intFromBool(by_row), .n = n }, 4);
+        dispatch(e, n);
+    }
+
+    /// `out[r]` = row `r`'s sum of squares, as a (hi, lo) pair.
+    fn rowSquares(self: *Self, x: mod.Tensor, rows: usize, cols: usize, out: mod.Tensor) !void {
+        const e = try self.begin(.row_squares_f32);
+        setTensor(e, x, 0);
+        setTensor(e, out, 1);
+        setValue(e, u32, @intCast(cols), 2);
+        dispatchRows(e, rows, cols);
+    }
+
+    /// `out[0..2]` = the sum of `n` (hi, lo) pairs, kept as a pair.
+    fn pairTotal(self: *Self, pairs: mod.Tensor, n: usize, out: mod.Tensor) !void {
+        const e = try self.begin(.pair_total_f32);
+        setTensor(e, pairs, 0);
+        setTensor(e, out, 1);
+        setValue(e, u32, @intCast(n), 2);
+        Objc.call2(void, Size, Size, e, "dispatchThreadgroups:threadsPerThreadgroup:", .{ .width = 1 }, .{ .width = 256 });
+    }
+
+    /// Waits for the GPU only when a queued copy writes `t`, so the host can
+    /// read an index tensor it uploaded without draining the queue.
+    fn readyForHost(self: *Self, t: mod.Tensor) !void {
+        if (t.buffer.mtl == null) return;
+        if (self.gpu_written.contains(@intFromPtr(t.buffer.bytes.ptr))) try self.sync();
     }
 
     // -------------------------------------------------------------------------
@@ -836,9 +1087,9 @@ pub const MetalBackend = struct {
         Objc.call2(void, Size, Size, e, "dispatchThreads:threadsPerThreadgroup:", .{ .width = n }, .{ .width = @min(n, 256) });
     }
 
-    /// `groups` threadgroups of 128 threads (4 simdgroups).
-    fn dispatchGroups(e: Id, groups: Size) void {
-        Objc.call2(void, Size, Size, e, "dispatchThreadgroups:threadsPerThreadgroup:", groups, .{ .width = 128 });
+    /// `groups` attention threadgroups of `sgs` simdgroups.
+    fn dispatchAttention(e: Id, groups: Size, sgs: usize) void {
+        Objc.call2(void, Size, Size, e, "dispatchThreadgroups:threadsPerThreadgroup:", groups, .{ .width = 32 * sgs });
     }
 
     /// One threadgroup per row.
@@ -850,6 +1101,12 @@ pub const MetalBackend = struct {
 
     fn count(t: mod.Tensor) !u32 {
         return std.math.cast(u32, t.numel()) orelse error.TensorTooLarge;
+    }
+
+    /// Fails unless `values` holds one f32 per row of `matrix`.
+    fn checkRowValues(values: mod.Tensor, rows_of: mod.Tensor) !void {
+        if (values.dtype != .f32) return error.DtypeMismatch;
+        if (values.numel() != rows_of.shape.rows()) return error.ShapeMismatch;
     }
 
     fn checkSame(x: mod.Tensor, y: mod.Tensor) !void {

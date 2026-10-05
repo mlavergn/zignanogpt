@@ -29,6 +29,19 @@ const ParamGroup = struct {
 };
 
 /// Per-parameter optimizer state.
+/// The Muon parameters of one shape, orthogonalized together: their
+/// momentum-applied gradients are copied into `x` (`[count * rows, cols]`)
+/// and Polar Express runs as batched matmuls over all of them.
+const MuonStack = struct {
+    indices: []usize,
+    rows: usize,
+    cols: usize,
+    x: mod.Tensor,
+    gram: mod.Tensor,
+    poly: mod.Tensor,
+    product: mod.Tensor,
+};
+
 const ParamState = struct {
     /// AdamW moments and update count.
     m: ?mod.Tensor = null,
@@ -51,10 +64,8 @@ pub const MuonAdamW = struct {
     arena: std.heap.ArenaAllocator,
     groups: []ParamGroup,
     states: []ParamState,
-    /// Polar Express scratch: two `[k, k]` (k = min side) and one `[rows, cols]`, flat.
-    gram: mod.Tensor,
-    poly: mod.Tensor,
-    product: mod.Tensor,
+    /// The Muon group's parameters by shape, in parameter order.
+    stacks: []MuonStack,
 
     /// Builds the groups and zeroed state for `weights`.
     ///
@@ -128,9 +139,9 @@ pub const MuonAdamW = struct {
 
         self.states = try arena.alloc(ParamState, weights.params.len);
         @memset(self.states, .{});
+        self.stacks = &.{};
         errdefer self.freeStates();
-        var max_gram: usize = 1;
-        var max_matrix: usize = 1;
+        var stacks: std.ArrayList(MuonStack) = .empty;
         for (self.groups) |group| {
             for (group.indices) |i| {
                 const t = weights.params[i].tensor;
@@ -145,17 +156,38 @@ pub const MuonAdamW = struct {
                         const cols = t.shape.cols();
                         state.momentum = try backend.alloc(.f32, t.shape.slice());
                         state.second = try backend.alloc(.f32, &mod.MuonParams.secondShape(rows, cols));
-                        max_gram = @max(max_gram, @min(rows, cols) * @min(rows, cols));
-                        max_matrix = @max(max_matrix, rows * cols);
+                        for (stacks.items) |stack| {
+                            if (stack.rows == rows and stack.cols == cols) break;
+                        } else try stacks.append(arena, .{ .indices = &.{}, .rows = rows, .cols = cols, .x = undefined, .gram = undefined, .poly = undefined, .product = undefined });
                     },
                 }
             }
         }
-        self.gram = try backend.alloc(.f32, &.{max_gram});
-        errdefer backend.free(self.gram);
-        self.poly = try backend.alloc(.f32, &.{max_gram});
-        errdefer backend.free(self.poly);
-        self.product = try backend.alloc(.f32, &.{max_matrix});
+        // Each stack lists its parameters, in parameter order.
+        for (stacks.items) |*stack| {
+            var indices: std.ArrayList(usize) = .empty;
+            for (self.groups) |group| {
+                if (group.kind != .muon) continue;
+                for (group.indices) |i| {
+                    const shape = weights.params[i].tensor.shape;
+                    if (shape.rows() == stack.rows and shape.cols() == stack.cols) try indices.append(arena, i);
+                }
+            }
+            stack.indices = indices.items;
+        }
+        self.stacks = stacks.items;
+        for (self.stacks, 0..) |*stack, made| {
+            errdefer for (self.stacks[0..made]) |done| freeStack(backend, done);
+            const n = stack.indices.len;
+            const k = @min(stack.rows, stack.cols);
+            stack.x = try backend.alloc(.f32, &.{ n * stack.rows, stack.cols });
+            errdefer backend.free(stack.x);
+            stack.product = try backend.alloc(.f32, &.{ n * stack.rows, stack.cols });
+            errdefer backend.free(stack.product);
+            stack.gram = try backend.alloc(.f32, &.{ n * k, k });
+            errdefer backend.free(stack.gram);
+            stack.poly = try backend.alloc(.f32, &.{ n * k, k });
+        }
         return self;
     }
 
@@ -167,9 +199,7 @@ pub const MuonAdamW = struct {
     /// Return: nothing.
     pub fn deinit(self: *Self) void {
         log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
-        self.backend.free(self.product);
-        self.backend.free(self.poly);
-        self.backend.free(self.gram);
+        for (self.stacks) |stack| freeStack(self.backend, stack);
         self.freeStates();
         self.arena.deinit();
     }
@@ -219,6 +249,10 @@ pub const MuonAdamW = struct {
     /// Return: nothing; backend errors.
     pub fn step(self: *Self, weights: *mod.GptWeights, grads: *mod.GptWeights) !void {
         for (self.groups) |group| {
+            if (group.kind == .muon) {
+                for (self.stacks) |stack| try self.muonStack(group, stack, weights, grads);
+                continue;
+            }
             for (group.indices) |i| {
                 const p = weights.params[i].tensor;
                 const g = grads.params[i].tensor;
@@ -235,7 +269,7 @@ pub const MuonAdamW = struct {
                             .step = state.step,
                         });
                     },
-                    .muon => try self.muonStep(group, p, g, state.*),
+                    .muon => unreachable,
                 }
             }
         }
@@ -298,43 +332,55 @@ pub const MuonAdamW = struct {
     }
 
     /// Muon on one matrix.
-    fn muonStep(self: *Self, group: ParamGroup, p: mod.Tensor, g: mod.Tensor, state: ParamState) !void {
+    /// Muon on one shape stack: momentum and MuonEq per matrix, Polar Express
+    /// as batched matmuls over the stack, then each matrix's update.
+    fn muonStack(self: *Self, group: ParamGroup, stack: MuonStack, weights: *mod.GptWeights, grads: *mod.GptWeights) !void {
         const be = self.backend;
-        const rows = p.shape.rows();
-        const cols = p.shape.cols();
-        const x = try g.reshape(&.{ rows, cols });
-        try be.muonMomentum(x, state.momentum.?, @floatCast(group.momentum));
-        try be.muonPrepare(x);
+        const rows = stack.rows;
+        const cols = stack.cols;
+        const n = stack.indices.len;
+        for (stack.indices, 0..) |i, slot| {
+            const g = try grads.params[i].tensor.reshape(&.{ rows, cols });
+            try be.muonMomentum(g, self.states[i].momentum.?, @floatCast(group.momentum));
+            const x = try stack.x.rows(slot * rows, rows);
+            try be.copy(x, g);
+            try be.muonPrepare(x);
+        }
 
         // Polar Express: X <- a X + (b A + c A^2) applied from the short side.
-        const k = @min(rows, cols);
-        const gram = try (try self.gram.rows(0, k * k)).reshape(&.{ k, k });
-        const poly = try (try self.poly.rows(0, k * k)).reshape(&.{ k, k });
-        const product = try (try self.product.rows(0, rows * cols)).reshape(&.{ rows, cols });
         const tall = rows > cols;
         for (mod.polar_express_coeffs) |coeffs| {
             const a, const b, const c = coeffs;
             if (tall) {
-                try be.matmul(gram, x, x, .{ .transpose_a = true }); // X^T X
+                try be.matmul(stack.gram, stack.x, stack.x, .{ .transpose_a = true, .batch = n }); // X^T X
             } else {
-                try be.matmul(gram, x, x, .{ .transpose_b = true }); // X X^T
+                try be.matmul(stack.gram, stack.x, stack.x, .{ .transpose_b = true, .batch = n }); // X X^T
             }
-            try be.matmul(poly, gram, gram, .{ .alpha = c });
-            try be.combine(poly, gram, mod.Scalar.constant(b), poly, mod.Scalar.constant(1));
+            try be.matmul(stack.poly, stack.gram, stack.gram, .{ .alpha = c, .batch = n });
+            try be.combine(stack.poly, stack.gram, mod.Scalar.constant(b), stack.poly, mod.Scalar.constant(1));
             if (tall) {
-                try be.matmul(product, x, poly, .{});
+                try be.matmul(stack.product, stack.x, stack.poly, .{ .batch = n });
             } else {
-                try be.matmul(product, poly, x, .{});
+                try be.matmul(stack.product, stack.poly, stack.x, .{ .batch = n });
             }
-            try be.combine(x, x, mod.Scalar.constant(a), product, mod.Scalar.constant(1));
+            try be.combine(stack.x, stack.x, mod.Scalar.constant(a), stack.product, mod.Scalar.constant(1));
         }
 
         const aspect = @max(1.0, @as(f64, @floatFromInt(rows)) / @as(f64, @floatFromInt(cols)));
-        try be.muonFinish(try p.reshape(&.{ rows, cols }), x, state.second.?, .{
-            .lr = @floatCast(group.lr * @sqrt(aspect)),
-            .weight_decay = @floatCast(group.weight_decay),
-            .beta2 = @floatCast(group.beta2),
-        });
+        for (stack.indices, 0..) |i, slot| {
+            try be.muonFinish(try weights.params[i].tensor.reshape(&.{ rows, cols }), try stack.x.rows(slot * rows, rows), self.states[i].second.?, .{
+                .lr = @floatCast(group.lr * @sqrt(aspect)),
+                .weight_decay = @floatCast(group.weight_decay),
+                .beta2 = @floatCast(group.beta2),
+            });
+        }
+    }
+
+    fn freeStack(backend: *mod.Backend, stack: MuonStack) void {
+        backend.free(stack.poly);
+        backend.free(stack.gram);
+        backend.free(stack.product);
+        backend.free(stack.x);
     }
 
     fn freeStates(self: *Self) void {

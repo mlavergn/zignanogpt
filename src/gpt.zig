@@ -135,7 +135,7 @@ pub const Gpt = struct {
         try be.combine(acts.x_final, x, mod.Scalar.constant(1), mid, mod.Scalar.of(w.backout_lambda, -1));
         try be.rmsnorm(acts.xn_final, acts.x_final, eps);
         try be.matmul(acts.logits_pad, acts.xn_final, w.lm_head, .{ .transpose_b = true });
-        try be.softcap(try acts.logits.reshape(&.{ bt, cfg.vocab_size }), acts.logits_pad, mod.GptConfig.softcap);
+        try be.softcap(try acts.logits.reshape(&.{ bt, cfg.vocab_size }), acts.logits_pad, mod.GptConfig.softcap, acts.logits_lse);
     }
 
     /// Mean cross-entropy of the logits `forward` left in `acts`.
@@ -149,7 +149,7 @@ pub const Gpt = struct {
     /// Return: nothing; backend errors.
     pub fn loss(self: *Self, acts: *const mod.GptActivations, targets: mod.Tensor, out: mod.Tensor) !void {
         const bt = acts.batch * acts.seq;
-        try self.backend.crossEntropy(out, try acts.logits.reshape(&.{ bt, self.config.vocab_size }), targets);
+        try self.backend.crossEntropy(out, try acts.logits.reshape(&.{ bt, self.config.vocab_size }), targets, acts.logits_lse);
     }
 
     /// Backpropagates `scale * loss` from the activations of the last
@@ -167,7 +167,7 @@ pub const Gpt = struct {
     /// Return: nothing; backend errors.
     pub fn backward(self: *Self, acts: *const mod.GptActivations, bufs: *mod.GptGradBuffers, grads: *mod.GptWeights, idx: mod.Tensor, targets: mod.Tensor, scale: f32) !void {
         const bt = acts.batch * acts.seq;
-        try self.backend.crossEntropyBackward(bufs.dlogits_pad, try acts.logits.reshape(&.{ bt, self.config.vocab_size }), targets, mod.GptConfig.softcap, scale);
+        try self.backend.crossEntropyBackward(bufs.dlogits_pad, try acts.logits.reshape(&.{ bt, self.config.vocab_size }), targets, mod.GptConfig.softcap, scale, acts.logits_lse);
         try self.backwardLogits(acts, bufs, grads, idx);
     }
 
@@ -186,7 +186,7 @@ pub const Gpt = struct {
     /// Return: nothing; backend errors.
     pub fn backwardWeighted(self: *Self, acts: *const mod.GptActivations, bufs: *mod.GptGradBuffers, grads: *mod.GptWeights, idx: mod.Tensor, targets: mod.Tensor, weights: mod.Tensor) !void {
         const bt = acts.batch * acts.seq;
-        try self.backend.crossEntropyWeightedBackward(bufs.dlogits_pad, try acts.logits.reshape(&.{ bt, self.config.vocab_size }), targets, weights, mod.GptConfig.softcap);
+        try self.backend.crossEntropyWeightedBackward(bufs.dlogits_pad, try acts.logits.reshape(&.{ bt, self.config.vocab_size }), targets, weights, mod.GptConfig.softcap, acts.logits_lse);
         try self.backwardLogits(acts, bufs, grads, idx);
     }
 
@@ -318,7 +318,7 @@ pub const Gpt = struct {
         // Only each row's last position: row T-1 (B = 1) or every row (T = 1).
         const last = try (try bufs.x_final.reshape(&.{ bt, c })).rows(bt - b, b);
         try be.matmul(bufs.logits_pad, last, w.lm_head, .{ .transpose_b = true });
-        try be.softcap(bufs.logits, bufs.logits_pad, mod.GptConfig.softcap);
+        try be.softcap(bufs.logits, bufs.logits_pad, mod.GptConfig.softcap, null);
     }
 
     /// Greedy decoding with a KV cache (nanochat's `generate` at temperature 0),

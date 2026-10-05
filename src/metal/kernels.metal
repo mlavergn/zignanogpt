@@ -269,14 +269,24 @@ kernel void gate_linear_backward_dx_f32(device float* dx [[buffer(0)]], device c
     dx[r * p.cols + c] += sum;
 }
 
-// One thread per weight, summing over every row in order.
+// One threadgroup per weight: the rows split across its threads, then a
+// fixed-order tree sum (deterministic).
 kernel void gate_linear_backward_dw_f32(device float* dw [[buffer(0)]], device const float* dout [[buffer(1)]], device const float* x [[buffer(2)]],
-                                        constant GateArgs& p [[buffer(3)]], uint i [[thread_position_in_grid]]) {
-    if (i >= p.heads * p.cin) return;
+                                        constant GateArgs& p [[buffer(3)]], uint i [[threadgroup_position_in_grid]],
+                                        uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]],
+                                        uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float shared[32];
     const uint h = i / p.cin, c = i % p.cin;
     float sum = 0.0f;
-    for (uint r = 0; r < p.rows; r++) sum += dout[r * p.heads + h] * x[r * p.cols + c];
-    dw[i] += sum;
+    for (uint r = tid; r < p.rows; r += threads) sum += dout[r * p.heads + h] * x[r * p.cols + c];
+    sum = simd_sum(sum);
+    if (lane == 0) shared[sg] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint g = 0; g < (threads + 31) / 32; g++) total += shared[g];
+        dw[i] += total;
+    }
 }
 
 struct SmearArgs {
@@ -372,10 +382,62 @@ struct XentArgs {
     float cap;
     float factor;
     uint has_weights;
+    uint has_lse;
 };
 
+// The soft cap plus each row's log-sum-exp of the capped values, in one pass
+// over the row (one threadgroup per row). Each thread keeps an online max and
+// sum; the finite floor keeps fast math away from infinities.
+kernel void softcap_lse_f32(device float* out [[buffer(0)]], device const float* logits [[buffer(1)]], device float* lse [[buffer(2)]],
+                            constant SoftcapArgs& p [[buffer(3)]],
+                            uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float shared_m[32];
+    threadgroup float shared_s[32];
+    device const float* src = logits + r * p.padded;
+    device float* dst = out + r * p.cols;
+    float m = -1.0e30f, s = 0.0f;
+    for (uint c = tid; c < p.cols; c += threads) {
+        const float z = p.cap * precise::tanh(src[c] / p.cap);
+        dst[c] = z;
+        if (z > m) {
+            s = s * exp(m - z) + 1.0f;
+            m = z;
+        } else {
+            s += exp(z - m);
+        }
+    }
+    for (ushort offset = 16; offset > 0; offset /= 2) {
+        const float m2 = simd_shuffle_down(m, offset);
+        const float s2 = simd_shuffle_down(s, offset);
+        const float mm = max(m, m2);
+        s = s * exp(m - mm) + s2 * exp(m2 - mm);
+        m = mm;
+    }
+    if (lane == 0) {
+        shared_m[sg] = m;
+        shared_s[sg] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float mt = -1.0e30f;
+        for (uint g = 0; g < (threads + 31) / 32; g++) mt = max(mt, shared_m[g]);
+        float st = 0.0f;
+        for (uint g = 0; g < (threads + 31) / 32; g++) st += shared_s[g] * exp(shared_m[g] - mt);
+        lse[r] = mt + log(st);
+    }
+}
+
+// losses[r] = lse[r] - logits[r, targets[r]], 0 where the target is -1.
+kernel void xent_rows_lse_f32(device float* losses [[buffer(0)]], device const float* logits [[buffer(1)]], device const int* targets [[buffer(2)]],
+                              device const float* lse [[buffer(3)]], constant uint2& p [[buffer(4)]], uint r [[thread_position_in_grid]]) {
+    if (r >= p.y) return;
+    const int t = targets[r];
+    losses[r] = t < 0 ? 0.0f : lse[r] - logits[r * p.x + uint(t)];
+}
+
 // One threadgroup per row: the row's log-sum-exp.
-static float row_lse(device const float* row, uint vocab, threadgroup float* shared, uint tid, uint threads, uint lane, uint sg) {
+static float block_lse(device const float* row, uint vocab, threadgroup float* shared, uint tid, uint threads, uint lane, uint sg) {
     const uint groups = (threads + 31) / 32;
     float m = -INFINITY;
     for (uint c = tid; c < vocab; c += threads) m = max(m, row[c]);
@@ -401,13 +463,13 @@ kernel void xent_rows_f32(device float* losses [[buffer(0)]], device const float
         return;
     }
     device const float* row = logits + r * p.vocab;
-    const float lse = row_lse(row, p.vocab, shared, tid, threads, lane, sg);
+    const float lse = block_lse(row, p.vocab, shared, tid, threads, lane, sg);
     if (tid == 0) losses[r] = lse - row[t];
 }
 
 // Gradient through the soft cap: weights[r] (or factor) * (softmax - onehot) * (1 - (z / cap)^2).
 kernel void xent_backward_f32(device float* dpad [[buffer(0)]], device const float* logits [[buffer(1)]], device const int* targets [[buffer(2)]],
-                              device const float* weights [[buffer(3)]], constant XentArgs& p [[buffer(4)]],
+                              device const float* weights [[buffer(3)]], constant XentArgs& p [[buffer(4)]], device const float* row_lse [[buffer(5)]],
                               uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]],
                               uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float shared[32];
@@ -418,7 +480,7 @@ kernel void xent_backward_f32(device float* dpad [[buffer(0)]], device const flo
         return;
     }
     device const float* row = logits + r * p.vocab;
-    const float lse = row_lse(row, p.vocab, shared, tid, threads, lane, sg);
+    const float lse = p.has_lse ? row_lse[r] : block_lse(row, p.vocab, shared, tid, threads, lane, sg);
     const float f = p.has_weights ? weights[r] : p.factor;
     for (uint c = tid; c < p.padded; c += threads) {
         if (c >= p.vocab) {
@@ -460,20 +522,20 @@ inline bool attn_visible(uint i, uint j, constant AttnArgs& p) {
 
 // Stages `rows` rows of a [*, stride] operand starting at row r0 (rows past
 // `limit` and columns past d read as zero) into a [rows, DP] tile.
-template <uint DP>
+template <uint DP, uint THREADS>
 inline void attn_stage(threadgroup float* tile, device const float* base, uint stride, uint d, uint r0, uint rows, uint limit, uint tid) {
-    for (uint e = tid; e < rows * DP; e += 128) {
+    for (uint e = tid; e < rows * DP; e += THREADS) {
         const uint r = e / DP, c = e % DP, row = r0 + r;
         tile[e] = (row < limit && c < d) ? base[row * stride + c] : 0.0f;
     }
 }
 
 // out[b, t, h] = softmax(scale q k^T) v over the visible keys; lse = m + log(l).
-template <uint DP, uint BK>
+template <uint DP, uint BK, uint SG>
 inline void attention_body(device float* out, device const float* q, device const float* k, device const float* v,
                            device float* lse, constant AttnArgs& p, threadgroup float* tile, threadgroup float* scratch,
                            threadgroup float* diag, uint3 tg, uint tid, uint sg, uint lane) {
-    constexpr uint BQ = 32, ND = DP / 8, NK = BK / 8;
+    constexpr uint BQ = 8 * SG, ND = DP / 8, NK = BK / 8;
     const uint b = tg.z, h = tg.y, q0 = tg.x * BQ;
     const uint kvh = h / (p.h / p.hkv);
     const uint off = p.keys - p.tq;
@@ -482,7 +544,7 @@ inline void attention_body(device float* out, device const float* q, device cons
     device const float* kb = k + (b * p.tk * p.hkv + kvh) * p.d;
     device const float* vb = v + (b * p.tk * p.hkv + kvh) * p.d;
 
-    attn_stage<DP>(tile, qb, qstride, p.d, q0, BQ, p.tq, tid);
+    attn_stage<DP, 32 * SG>(tile, qb, qstride, p.d, q0, BQ, p.tq, tid);
     threadgroup float* dg = diag + sg * 64;
     for (uint e = lane; e < 64; e += 32) dg[e] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -503,8 +565,8 @@ inline void attention_body(device float* out, device const float* q, device cons
     const uint j_hi = min(i_last, p.keys - 1);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint j0 = j_lo; j0 <= j_hi; j0 += BK) {
-        attn_stage<DP>(tile, kb, kstride, p.d, j0, BK, j_hi + 1, tid);
-        attn_stage<DP>(tile + BK * DP, vb, kstride, p.d, j0, BK, j_hi + 1, tid);
+        attn_stage<DP, 32 * SG>(tile, kb, kstride, p.d, j0, BK, j_hi + 1, tid);
+        attn_stage<DP, 32 * SG>(tile + BK * DP, vb, kstride, p.d, j0, BK, j_hi + 1, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint n = 0; n < NK; n++) {
             simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
@@ -583,11 +645,11 @@ kernel void attention_delta_f32(device float* delta [[buffer(0)]], device const 
 }
 
 // dq = scale * sum_j p_ij (dout_i . v_j - delta_i) k_j, per block of 32 queries.
-template <uint DP, uint BK>
+template <uint DP, uint BK, uint SG>
 inline void attention_dq_body(device float* dq, device const float* dout, device const float* q, device const float* k,
                               device const float* v, device const float* lse, device const float* delta, constant AttnArgs& p,
                               threadgroup float* tile, threadgroup float* scratch, uint3 tg, uint tid, uint sg, uint lane) {
-    constexpr uint BQ = 32, ND = DP / 8, NK = BK / 8;
+    constexpr uint BQ = 8 * SG, ND = DP / 8, NK = BK / 8;
     const uint b = tg.z, h = tg.y, q0 = tg.x * BQ;
     const uint kvh = h / (p.h / p.hkv);
     const uint off = p.keys - p.tq;
@@ -597,11 +659,11 @@ inline void attention_dq_body(device float* dq, device const float* dout, device
     const uint head = (b * p.tq * p.h + h) * p.d;
 
     simdgroup_float8x8 qr[ND], gr[ND], acc[ND];
-    attn_stage<DP>(tile, q + head, qstride, p.d, q0, BQ, p.tq, tid);
+    attn_stage<DP, 32 * SG>(tile, q + head, qstride, p.d, q0, BQ, p.tq, tid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = 0; i < ND; i++) simdgroup_load(qr[i], tile + sg * 8 * DP + i * 8, DP);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    attn_stage<DP>(tile, dout + head, qstride, p.d, q0, BQ, p.tq, tid);
+    attn_stage<DP, 32 * SG>(tile, dout + head, qstride, p.d, q0, BQ, p.tq, tid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = 0; i < ND; i++) {
         simdgroup_load(gr[i], tile + sg * 8 * DP + i * 8, DP);
@@ -621,8 +683,8 @@ inline void attention_dq_body(device float* dq, device const float* dout, device
     const uint j_hi = min(i_last, p.keys - 1);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint j0 = j_lo; j0 <= j_hi; j0 += BK) {
-        attn_stage<DP>(tile, kb, kstride, p.d, j0, BK, j_hi + 1, tid);
-        attn_stage<DP>(tile + BK * DP, vb, kstride, p.d, j0, BK, j_hi + 1, tid);
+        attn_stage<DP, 32 * SG>(tile, kb, kstride, p.d, j0, BK, j_hi + 1, tid);
+        attn_stage<DP, 32 * SG>(tile + BK * DP, vb, kstride, p.d, j0, BK, j_hi + 1, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint n = 0; n < NK; n++) {
             simdgroup_float8x8 sc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
@@ -666,23 +728,23 @@ inline void attention_dq_body(device float* dq, device const float* dout, device
 
 // dv_j = sum_i p_ij dout_i, dk_j = scale * sum_i ds_ij q_i over every query
 // head of the kv head's group, per block of 32 keys (written, not added).
-template <uint DP, uint BQ>
+template <uint DP, uint BQ, uint SG>
 inline void attention_dkv_body(device float* dk, device float* dv, device const float* dout, device const float* q,
                                device const float* k, device const float* v, device const float* lse, device const float* delta,
                                constant AttnArgs& p, threadgroup float* tile, threadgroup float* scratch, threadgroup float* stats,
                                uint3 tg, uint tid, uint sg, uint lane) {
-    constexpr uint BKEY = 32, ND = DP / 8, NQ = BQ / 8;
+    constexpr uint BKEY = 8 * SG, ND = DP / 8, NQ = BQ / 8;
     const uint b = tg.z, kvh = tg.y, j0 = tg.x * BKEY;
     const uint off = p.keys - p.tq;
     const uint qstride = p.h * p.d, kstride = p.hkv * p.d;
     const uint kvbase = (b * p.tk * p.hkv + kvh) * p.d;
 
     simdgroup_float8x8 kr[ND], vr[ND], dka[ND], dva[ND];
-    attn_stage<DP>(tile, k + kvbase, kstride, p.d, j0, BKEY, p.tk, tid);
+    attn_stage<DP, 32 * SG>(tile, k + kvbase, kstride, p.d, j0, BKEY, p.tk, tid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = 0; i < ND; i++) simdgroup_load(kr[i], tile + sg * 8 * DP + i * 8, DP);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    attn_stage<DP>(tile, v + kvbase, kstride, p.d, j0, BKEY, p.tk, tid);
+    attn_stage<DP, 32 * SG>(tile, v + kvbase, kstride, p.d, j0, BKEY, p.tk, tid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = 0; i < ND; i++) {
         simdgroup_load(vr[i], tile + sg * 8 * DP + i * 8, DP);
@@ -706,9 +768,9 @@ inline void attention_dkv_body(device float* dk, device float* dv, device const 
             const uint h = kvh * group + hh;
             const uint head = (b * p.tq * p.h + h) * p.d;
             for (uint t0 = t_lo; t0 < t_end; t0 += BQ) {
-                attn_stage<DP>(tile, q + head, qstride, p.d, t0, BQ, t_end, tid);
-                attn_stage<DP>(tile + BQ * DP, dout + head, qstride, p.d, t0, BQ, t_end, tid);
-                for (uint e = tid; e < BQ; e += 128) {
+                attn_stage<DP, 32 * SG>(tile, q + head, qstride, p.d, t0, BQ, t_end, tid);
+                attn_stage<DP, 32 * SG>(tile + BQ * DP, dout + head, qstride, p.d, t0, BQ, t_end, tid);
+                for (uint e = tid; e < BQ; e += 32 * SG) {
                     const uint t = t0 + e;
                     stats[e] = t < t_end ? lse[(b * p.h + h) * p.tq + t] : 0.0f;
                     stats[BQ + e] = t < t_end ? delta[(b * p.h + h) * p.tq + t] : 0.0f;
@@ -768,9 +830,14 @@ inline void attention_dkv_body(device float* dk, device float* dv, device const 
     }
 }
 
-// Key/query block sizes per padded head dimension (threadgroup memory <= 32 KB).
+// Simdgroups per threadgroup (8 rows each) and key/query block sizes per
+// padded head dimension, within 32 KB of threadgroup memory.
+#define ATTN_SG(DP) ((DP) <= 64 ? 8 : 4)
 #define ATTN_BLOCK(DP) ((DP) <= 64 ? 32 : 16)
-#define ATTN_TILE(DP) ((DP) * (2 * ATTN_BLOCK(DP) > 32 ? 2 * ATTN_BLOCK(DP) : 32))
+#define ATTN_DKV_BLOCK(DP) ((DP) <= 64 ? 16 : 16)
+#define ATTN_MAX(A, B) ((A) > (B) ? (A) : (B))
+#define ATTN_TILE(DP) ((DP) * ATTN_MAX(8 * ATTN_SG(DP), 2 * ATTN_BLOCK(DP)))
+#define ATTN_DKV_TILE(DP) ((DP) * ATTN_MAX(8 * ATTN_SG(DP), 2 * ATTN_DKV_BLOCK(DP)))
 
 #define ATTN_KERNELS(DP)                                                                                                    \
     kernel void attention_f32_d##DP(device float* out [[buffer(0)]], device const float* q [[buffer(1)]],                 \
@@ -779,9 +846,9 @@ inline void attention_dkv_body(device float* dk, device float* dv, device const 
                                     uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
                                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
         threadgroup float tile[ATTN_TILE(DP)];                                                                              \
-        threadgroup float scratch[4 * 8 * ATTN_BLOCK(DP)];                                                                  \
-        threadgroup float diag[4 * 64];                                                                                     \
-        attention_body<DP, ATTN_BLOCK(DP)>(out, q, k, v, lse, p, tile, scratch, diag, tg, tid, sg, lane);                   \
+        threadgroup float scratch[ATTN_SG(DP) * 8 * ATTN_BLOCK(DP)];                                                        \
+        threadgroup float diag[ATTN_SG(DP) * 64];                                                                           \
+        attention_body<DP, ATTN_BLOCK(DP), ATTN_SG(DP)>(out, q, k, v, lse, p, tile, scratch, diag, tg, tid, sg, lane);      \
     }                                                                                                                       \
     kernel void attention_dq_f32_d##DP(device float* dq [[buffer(0)]], device const float* dout [[buffer(1)]],            \
                                        device const float* q [[buffer(2)]], device const float* k [[buffer(3)]],          \
@@ -790,8 +857,8 @@ inline void attention_dkv_body(device float* dk, device float* dv, device const 
                                        uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
                                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
         threadgroup float tile[ATTN_TILE(DP)];                                                                              \
-        threadgroup float scratch[4 * 16 * ATTN_BLOCK(DP)];                                                                 \
-        attention_dq_body<DP, ATTN_BLOCK(DP)>(dq, dout, q, k, v, lse, delta, p, tile, scratch, tg, tid, sg, lane);          \
+        threadgroup float scratch[ATTN_SG(DP) * 16 * ATTN_BLOCK(DP)];                                                       \
+        attention_dq_body<DP, ATTN_BLOCK(DP), ATTN_SG(DP)>(dq, dout, q, k, v, lse, delta, p, tile, scratch, tg, tid, sg, lane); \
     }                                                                                                                       \
     kernel void attention_dkv_f32_d##DP(device float* dk [[buffer(0)]], device float* dv [[buffer(1)]],                   \
                                         device const float* dout [[buffer(2)]], device const float* q [[buffer(3)]],      \
@@ -800,10 +867,10 @@ inline void attention_dkv_body(device float* dk, device float* dv, device const 
                                         constant AttnArgs& p [[buffer(8)]],                                               \
                                         uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
                                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
-        threadgroup float tile[ATTN_TILE(DP)];                                                                              \
-        threadgroup float scratch[4 * 16 * ATTN_BLOCK(DP)];                                                                 \
-        threadgroup float stats[2 * ATTN_BLOCK(DP)];                                                                        \
-        attention_dkv_body<DP, ATTN_BLOCK(DP)>(dk, dv, dout, q, k, v, lse, delta, p, tile, scratch, stats, tg, tid, sg, lane); \
+        threadgroup float tile[ATTN_DKV_TILE(DP)];                                                                          \
+        threadgroup float scratch[ATTN_SG(DP) * 16 * ATTN_DKV_BLOCK(DP)];                                                   \
+        threadgroup float stats[2 * ATTN_DKV_BLOCK(DP)];                                                                    \
+        attention_dkv_body<DP, ATTN_DKV_BLOCK(DP), ATTN_SG(DP)>(dk, dv, dout, q, k, v, lse, delta, p, tile, scratch, stats, tg, tid, sg, lane); \
     }
 
 ATTN_KERNELS(8)

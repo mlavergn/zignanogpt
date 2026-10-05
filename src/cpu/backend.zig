@@ -223,6 +223,12 @@ pub const CpuBackend = struct {
         if (c.dtype != .f32 or a.dtype != .f32 or b.dtype != .f32) return error.DtypeMismatch;
         const m, const n, const k = try options.dims(c.shape, a.shape, b.shape);
         try checkDisjoint(c, &.{ a, b });
+        if (options.batch > 1) {
+            var single = options;
+            single.batch = 1;
+            for (0..options.batch) |i| try self.matmul(try options.matrixOf(c, i), try options.matrixOf(a, i), try options.matrixOf(b, i), single);
+            return;
+        }
         const problem = mod.CpuMatmul{
             .c = elems(f32, c),
             .a = elems(f32, a),
@@ -621,34 +627,41 @@ pub const CpuBackend = struct {
     }
 
     /// Crops padded logits to the vocabulary and squashes them:
-    /// `out[r, c] = cap * tanh(logits[r, c] / cap)` for `c < V`.
+    /// `out[r, c] = cap * tanh(logits[r, c] / cap)` for `c < V`; optionally
+    /// each row's log-sum-exp of the capped values, for the cross-entropy ops
+    /// to reuse instead of another pass over the logits.
     ///
     /// Parameters:
     /// - `self`: the backend.
     /// - `out`: `[R, V]`; must not alias `logits`.
     /// - `logits`: `[R, Vpad]`, `Vpad >= V`.
     /// - `cap`: the soft cap (nanochat: 15).
+    /// - `lse`: `R` f32 outputs, or null.
     ///
     /// Return: nothing; shape/dtype/aliasing errors.
-    pub fn softcap(self: *Self, out: mod.Tensor, logits: mod.Tensor, cap: f32) !void {
+    pub fn softcap(self: *Self, out: mod.Tensor, logits: mod.Tensor, cap: f32, lse: ?mod.Tensor) !void {
         if (out.dtype != .f32 or logits.dtype != .f32) return error.DtypeMismatch;
         if (out.shape.rows() != logits.shape.rows() or out.shape.cols() > logits.shape.cols()) return mismatch("softcap", out.shape, logits.shape);
         try checkDisjoint(out, &.{logits});
+        if (lse) |t| try checkRowValues(t, out, "softcap");
         const Ctx = struct {
             out: []f32,
             logits: []const f32,
+            lse: ?[]f32,
             cols: usize,
             padded: usize,
             cap: f32,
             fn body(ctx: @This(), start: usize, end: usize) void {
                 for (start..end) |r| {
                     const src = ctx.logits[r * ctx.padded ..][0..ctx.cols];
-                    for (ctx.out[r * ctx.cols ..][0..ctx.cols], src) |*o, v| o.* = ctx.cap * std.math.tanh(v / ctx.cap);
+                    const row = ctx.out[r * ctx.cols ..][0..ctx.cols];
+                    for (row, src) |*o, v| o.* = ctx.cap * std.math.tanh(v / ctx.cap);
+                    if (ctx.lse) |l| l[r] = @floatCast(logSumExp(row));
                 }
             }
         };
         const cols = out.shape.cols();
-        const ctx = Ctx{ .out = elems(f32, out), .logits = elems(f32, logits), .cols = cols, .padded = logits.shape.cols(), .cap = cap };
+        const ctx = Ctx{ .out = elems(f32, out), .logits = elems(f32, logits), .lse = if (lse) |t| elems(f32, t) else null, .cols = cols, .padded = logits.shape.cols(), .cap = cap };
         try self.forRows(out.shape.rows(), cols, ctx, Ctx.body);
     }
 
@@ -660,9 +673,12 @@ pub const CpuBackend = struct {
     /// - `loss`: receives the mean in element 0.
     /// - `logits`: `[R, V]`.
     /// - `targets`: `R` i32 classes below `V`, or -1.
+    /// - `lse`: the rows' log-sum-exp from `softcap`, or null. The CPU sums
+    ///   its own in f64 (the loss stays exact); other backends may use it.
     ///
     /// Return: nothing; shape/dtype errors, `error.OutOfBounds` for a bad target.
-    pub fn crossEntropy(self: *Self, loss: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor) !void {
+    pub fn crossEntropy(self: *Self, loss: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, lse: ?mod.Tensor) !void {
+        if (lse) |t| try checkRowValues(t, logits, "crossEntropy");
         const rows, const vocab = try self.checkTargets(logits, targets);
         if (loss.dtype != .f32 or loss.numel() == 0) return error.DtypeMismatch;
         const per = rowsPerItem(vocab);
@@ -740,11 +756,12 @@ pub const CpuBackend = struct {
     /// - `targets`: `R` i32 classes, or -1.
     /// - `cap`: the soft cap used in the forward pass.
     /// - `scale`: multiplies the gradient (e.g. `1 / grad_accum_steps`).
+    /// - `lse`: the rows' log-sum-exp from `softcap`, or null to compute it.
     ///
     /// Return: nothing; shape/dtype/aliasing errors, `error.OutOfBounds`.
-    pub fn crossEntropyBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, cap: f32, scale_by: f32) !void {
+    pub fn crossEntropyBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, cap: f32, scale_by: f32, lse: ?mod.Tensor) !void {
         const count: f32 = @floatFromInt(validTargets(elems(i32, targets)));
-        try self.xentBackward(dpad, logits, targets, cap, scale_by / count, null);
+        try self.xentBackward(dpad, logits, targets, cap, scale_by / count, null, lse);
     }
 
     /// Gradient of `sum_r weights[r] * crossEntropy_r(softcap(logits_pad))`
@@ -760,15 +777,17 @@ pub const CpuBackend = struct {
     /// - `targets`: `R` i32 classes, or -1.
     /// - `weights`: `R` f32 per-row weights.
     /// - `cap`: the soft cap used in the forward pass.
+    /// - `lse`: the rows' log-sum-exp from `softcap`, or null to compute it.
     ///
     /// Return: nothing; shape/dtype/aliasing errors, `error.OutOfBounds`.
-    pub fn crossEntropyWeightedBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, weights: mod.Tensor, cap: f32) !void {
+    pub fn crossEntropyWeightedBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, weights: mod.Tensor, cap: f32, lse: ?mod.Tensor) !void {
         if (weights.dtype != .f32) return error.DtypeMismatch;
         if (weights.numel() != logits.shape.rows()) return mismatch("crossEntropyWeightedBackward", weights.shape, logits.shape);
-        try self.xentBackward(dpad, logits, targets, cap, 1, elems(f32, weights));
+        try self.xentBackward(dpad, logits, targets, cap, 1, elems(f32, weights), lse);
     }
 
-    fn xentBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, cap: f32, factor: f32, weights: ?[]const f32) !void {
+    fn xentBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, cap: f32, factor: f32, weights: ?[]const f32, lse_in: ?mod.Tensor) !void {
+        if (lse_in) |t| try checkRowValues(t, logits, "crossEntropyBackward");
         const rows, const vocab = try self.checkTargets(logits, targets);
         if (dpad.dtype != .f32) return error.DtypeMismatch;
         if (dpad.shape.rows() != rows or dpad.shape.cols() < vocab) return mismatch("crossEntropyBackward", dpad.shape, logits.shape);
@@ -782,6 +801,7 @@ pub const CpuBackend = struct {
             cap: f32,
             factor: f32,
             weights: ?[]const f32,
+            lse: ?[]const f32,
             fn body(ctx: @This(), start: usize, end: usize) void {
                 for (start..end) |r| {
                     const out = ctx.dpad[r * ctx.padded ..][0..ctx.padded];
@@ -792,7 +812,7 @@ pub const CpuBackend = struct {
                         continue;
                     }
                     const row = ctx.logits[r * ctx.vocab ..][0..ctx.vocab];
-                    const lse: f32 = @floatCast(logSumExp(row));
+                    const lse: f32 = if (ctx.lse) |l| l[r] else @floatCast(logSumExp(row));
                     const target: usize = @intCast(ctx.targets[r]);
                     // softmax * factor * (1 - (z / cap)^2), vectorized; the target's -1 after.
                     const V = mod.CpuMath.Vec;
@@ -816,7 +836,7 @@ pub const CpuBackend = struct {
                 }
             }
         };
-        const ctx = Ctx{ .dpad = elems(f32, dpad), .logits = elems(f32, logits), .targets = elems(i32, targets), .vocab = vocab, .padded = dpad.shape.cols(), .cap = cap, .factor = factor, .weights = weights };
+        const ctx = Ctx{ .dpad = elems(f32, dpad), .logits = elems(f32, logits), .targets = elems(i32, targets), .vocab = vocab, .padded = dpad.shape.cols(), .cap = cap, .factor = factor, .weights = weights, .lse = if (lse_in) |t| elems(f32, t) else null };
         try self.forRows(rows, dpad.shape.cols(), ctx, Ctx.body);
     }
 
@@ -1508,6 +1528,12 @@ pub const CpuBackend = struct {
             for (data[r * cols ..][0..cols]) |v| sum += @as(f64, v) * @as(f64, v);
             s.* = sum;
         }
+    }
+
+    /// Fails unless `values` holds one f32 per row of `matrix`.
+    fn checkRowValues(values: mod.Tensor, matrix: mod.Tensor, comptime op: []const u8) !void {
+        if (values.dtype != .f32) return error.DtypeMismatch;
+        if (values.numel() != matrix.shape.rows()) return mismatch(op, values.shape, matrix.shape);
     }
 
     /// Fails unless both tensors are f32 with the same shape.

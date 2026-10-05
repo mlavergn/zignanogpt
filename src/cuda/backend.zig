@@ -279,6 +279,12 @@ pub const CudaBackend = struct {
         if (c.dtype != .f32 or a.dtype != .f32 or b.dtype != .f32) return error.DtypeMismatch;
         const m, const n, const k = try options.dims(c.shape, a.shape, b.shape);
         if (overlaps(c, a) or overlaps(c, b)) return error.Aliasing;
+        if (options.batch > 1) {
+            var single = options;
+            single.batch = 1;
+            for (0..options.batch) |i| try self.matmul(try options.matrixOf(c, i), try options.matrixOf(a, i), try options.matrixOf(b, i), single);
+            return;
+        }
         const total = std.math.cast(u32, m * n) orelse return error.TensorTooLarge;
         try self.launch(.matmul_f32, total, .{
             ptrOf(c),                                    ptrOf(a),                                    ptrOf(b),
@@ -324,20 +330,20 @@ pub const CudaBackend = struct {
     pub fn valueMixBackward(self: *Self, dve: mod.Tensor, dgate: mod.Tensor, dv: mod.Tensor, ve: mod.Tensor, gate: mod.Tensor) !void {
         return self.onCpu("valueMixBackward", .{ dve, dgate, dv, ve, gate });
     }
-    pub fn softcap(self: *Self, out: mod.Tensor, logits: mod.Tensor, cap: f32) !void {
-        return self.onCpu("softcap", .{ out, logits, cap });
+    pub fn softcap(self: *Self, out: mod.Tensor, logits: mod.Tensor, cap: f32, lse: ?mod.Tensor) !void {
+        return self.onCpu("softcap", .{ out, logits, cap, lse });
     }
-    pub fn crossEntropy(self: *Self, loss: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor) !void {
-        return self.onCpu("crossEntropy", .{ loss, logits, targets });
+    pub fn crossEntropy(self: *Self, loss: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, lse: ?mod.Tensor) !void {
+        return self.onCpu("crossEntropy", .{ loss, logits, targets, lse });
     }
     pub fn crossEntropyRows(self: *Self, losses: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor) !void {
         return self.onCpu("crossEntropyRows", .{ losses, logits, targets });
     }
-    pub fn crossEntropyBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, cap: f32, scale_by: f32) !void {
-        return self.onCpu("crossEntropyBackward", .{ dpad, logits, targets, cap, scale_by });
+    pub fn crossEntropyBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, cap: f32, scale_by: f32, lse: ?mod.Tensor) !void {
+        return self.onCpu("crossEntropyBackward", .{ dpad, logits, targets, cap, scale_by, lse });
     }
-    pub fn crossEntropyWeightedBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, weights: mod.Tensor, cap: f32) !void {
-        return self.onCpu("crossEntropyWeightedBackward", .{ dpad, logits, targets, weights, cap });
+    pub fn crossEntropyWeightedBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, weights: mod.Tensor, cap: f32, lse: ?mod.Tensor) !void {
+        return self.onCpu("crossEntropyWeightedBackward", .{ dpad, logits, targets, weights, cap, lse });
     }
     pub fn dot(self: *Self, out: mod.Tensor, a: mod.Tensor, b: mod.Tensor, factor: f32, accumulate: bool) !void {
         return self.onCpu("dot", .{ out, a, b, factor, accumulate });

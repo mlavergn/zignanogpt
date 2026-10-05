@@ -153,11 +153,20 @@ pub const Conformance = struct {
         defer backend.free(padded);
         const capped = try backend.alloc(.f32, &.{ 2, 2 });
         defer backend.free(capped);
-        try backend.softcap(capped, padded, 15);
+        const row_lse = try backend.alloc(.f32, &.{2});
+        defer backend.free(row_lse);
+        try backend.softcap(capped, padded, 15, row_lse);
         const cap = try hostCopy(B, backend, allocator, capped);
         defer allocator.free(cap);
         try expectClose(&.{ 15 * std.math.tanh(@as(f32, 2)), 15 * std.math.tanh(@as(f32, -1)), 0, 15 * std.math.tanh(@as(f32, 0.5)) }, cap, 1e-5);
-        try std.testing.expectError(error.Aliasing, backend.softcap(padded, padded, 15));
+        // The rows' log-sum-exp of the capped values.
+        const got_lse = try hostCopy(B, backend, allocator, row_lse);
+        defer allocator.free(got_lse);
+        for (0..2) |row| {
+            const want = @log(@exp(@as(f64, cap[2 * row])) + @exp(@as(f64, cap[2 * row + 1])));
+            try std.testing.expectApproxEqAbs(want, got_lse[row], 1e-5);
+        }
+        try std.testing.expectError(error.Aliasing, backend.softcap(padded, padded, 15, null));
     }
 
     /// gateLinear, smear, valueMix.
@@ -648,15 +657,15 @@ pub const Conformance = struct {
             pad: mod.Tensor,
             targets: mod.Tensor,
             fn run(c: @This()) !void {
-                try c.be.softcap(c.capped, c.pad, 3);
-                try c.be.crossEntropy(c.loss, c.capped, c.targets);
+                try c.be.softcap(c.capped, c.pad, 3, null);
+                try c.be.crossEntropy(c.loss, c.capped, c.targets, null);
             }
         };
         const ctx = Xent{ .be = backend, .loss = loss, .capped = capped, .pad = pad, .targets = targets };
         try ctx.run();
         const dpad = try backend.alloc(.f32, &.{ 4, 6 });
         defer backend.free(dpad);
-        try backend.crossEntropyBackward(dpad, capped, targets, 3, 1);
+        try backend.crossEntropyBackward(dpad, capped, targets, 3, 1, null);
         const g = try hostCopy(B, backend, allocator, dpad);
         defer allocator.free(g);
         for (0..4) |r| try std.testing.expectEqual(@as(f32, 0), g[r * 6 + 5]); // padding column
@@ -674,7 +683,7 @@ pub const Conformance = struct {
         try backend.download(loss, f32, &mean);
         try std.testing.expectEqual(@as(f32, 0), row_losses[1]);
         try std.testing.expectApproxEqAbs(mean[0], (row_losses[0] + row_losses[2] + row_losses[3]) / 3, 1e-6);
-        try backend.crossEntropyBackward(dpad, capped, targets, 3, 0.5);
+        try backend.crossEntropyBackward(dpad, capped, targets, 3, 0.5, null);
         const half = try hostCopy(B, backend, allocator, dpad);
         defer allocator.free(half);
         for (half, g) |hv, gv| try std.testing.expectApproxEqAbs(gv * 0.5, hv, 1e-7);
@@ -682,13 +691,32 @@ pub const Conformance = struct {
         // Per-row weights instead of the mean: row r scales by weights[r] * count.
         const weights = try tensorFrom(B, backend, f32, &.{4}, &.{ 0.5, 9, -2, 1 });
         defer backend.free(weights);
-        try backend.crossEntropyWeightedBackward(dpad, capped, targets, weights, 3);
+        try backend.crossEntropyWeightedBackward(dpad, capped, targets, weights, 3, null);
         const weighted = try hostCopy(B, backend, allocator, dpad);
         defer allocator.free(weighted);
         const wv = [_]f32{ 0.5, 9, -2, 1 };
         for (0..4) |r| {
             for (0..6) |c| try std.testing.expectApproxEqAbs(g[r * 6 + c] * 3 * wv[r], weighted[r * 6 + c], 1e-6);
         }
+
+        // With the soft cap's log-sum-exp passed along, the same loss and gradients.
+        const row_lse = try backend.alloc(.f32, &.{4});
+        defer backend.free(row_lse);
+        try backend.softcap(capped, pad, 3, row_lse);
+        const with_lse = try backend.alloc(.f32, &.{1});
+        defer backend.free(with_lse);
+        try backend.crossEntropy(with_lse, capped, targets, row_lse);
+        var mean_lse: [1]f32 = undefined;
+        try backend.download(with_lse, f32, &mean_lse);
+        try std.testing.expectApproxEqAbs(mean[0], mean_lse[0], 1e-5);
+        try backend.crossEntropyBackward(dpad, capped, targets, 3, 1, row_lse);
+        const g_lse = try hostCopy(B, backend, allocator, dpad);
+        defer allocator.free(g_lse);
+        for (g, g_lse) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+        try backend.crossEntropyWeightedBackward(dpad, capped, targets, weights, 3, row_lse);
+        const w_lse = try hostCopy(B, backend, allocator, dpad);
+        defer allocator.free(w_lse);
+        for (weighted, w_lse) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
 
         // dot, with accumulate
         const a = try tensorFrom(B, backend, f32, &.{3}, &.{ 1, 2, 3 });
@@ -917,6 +945,13 @@ pub const Conformance = struct {
                 }
             }
         }
+        // Batched: three independent products per call, each checked on its own.
+        for ([_]bool{ false, true }) |ta| {
+            for ([_]bool{ false, true }) |tb| {
+                const options = mod.MatmulOptions{ .transpose_a = ta, .transpose_b = tb, .alpha = 0.5, .accumulate = ta, .batch = 3 };
+                try matmulCase(B, backend, allocator, &rng, 17, 9, 24, options);
+            }
+        }
 
         // Operands that are row views of larger tensors.
         const big = try backend.alloc(.f32, &.{ 10, 4 });
@@ -932,43 +967,51 @@ pub const Conformance = struct {
         try std.testing.expectError(error.ShapeMismatch, backend.matmul(c, big, big, .{}));
     }
 
+    /// One matmul (`options.batch` of them stacked) against an f64 host product.
     fn matmulCase(comptime B: type, backend: *B, allocator: std.mem.Allocator, rng: *mod.Random, m: usize, n: usize, k: usize, options: mod.MatmulOptions) !void {
-        const ha = try allocator.alloc(f32, m * k);
+        const batch = options.batch;
+        const ha = try allocator.alloc(f32, batch * m * k);
         defer allocator.free(ha);
-        const hb = try allocator.alloc(f32, k * n);
+        const hb = try allocator.alloc(f32, batch * k * n);
         defer allocator.free(hb);
-        const hc = try allocator.alloc(f32, m * n);
+        const hc = try allocator.alloc(f32, batch * m * n);
         defer allocator.free(hc);
         rng.fillUniform(ha, -1, 1);
         rng.fillUniform(hb, -1, 1);
         rng.fillUniform(hc, -1, 1);
 
-        const a = try backend.alloc(.f32, if (options.transpose_a) &.{ k, m } else &.{ m, k });
+        const a = try backend.alloc(.f32, if (options.transpose_a) &.{ batch * k, m } else &.{ batch * m, k });
         defer backend.free(a);
-        const b = try backend.alloc(.f32, if (options.transpose_b) &.{ n, k } else &.{ k, n });
+        const b = try backend.alloc(.f32, if (options.transpose_b) &.{ batch * n, k } else &.{ batch * k, n });
         defer backend.free(b);
-        const c = try backend.alloc(.f32, &.{ m, n });
+        const c = try backend.alloc(.f32, &.{ batch * m, n });
         defer backend.free(c);
         try backend.upload(a, f32, ha);
         try backend.upload(b, f32, hb);
         try backend.upload(c, f32, hc);
         try backend.matmul(c, a, b, options);
 
-        const got = try allocator.alloc(f32, m * n);
+        const got = try allocator.alloc(f32, batch * m * n);
         defer allocator.free(got);
         try backend.download(c, f32, got);
         const tolerance = 1e-5 * @as(f64, @floatFromInt(k + 1));
-        for (0..m) |i| {
-            for (0..n) |j| {
-                var sum: f64 = 0;
-                for (0..k) |kk| {
-                    const av = if (options.transpose_a) ha[kk * m + i] else ha[i * k + kk];
-                    const bv = if (options.transpose_b) hb[j * k + kk] else hb[kk * n + j];
-                    sum += @as(f64, av) * @as(f64, bv);
+        for (0..batch) |s| {
+            const sa = ha[s * m * k ..][0 .. m * k];
+            const sb = hb[s * k * n ..][0 .. k * n];
+            const sc = hc[s * m * n ..][0 .. m * n];
+            const sg = got[s * m * n ..][0 .. m * n];
+            for (0..m) |i| {
+                for (0..n) |j| {
+                    var sum: f64 = 0;
+                    for (0..k) |kk| {
+                        const av = if (options.transpose_a) sa[kk * m + i] else sa[i * k + kk];
+                        const bv = if (options.transpose_b) sb[j * k + kk] else sb[kk * n + j];
+                        sum += @as(f64, av) * @as(f64, bv);
+                    }
+                    var expected = options.alpha * sum;
+                    if (options.accumulate) expected += sc[i * n + j];
+                    try std.testing.expectApproxEqAbs(expected, @as(f64, sg[i * n + j]), tolerance);
                 }
-                var expected = options.alpha * sum;
-                if (options.accumulate) expected += hc[i * n + j];
-                try std.testing.expectApproxEqAbs(expected, @as(f64, got[i * n + j]), tolerance);
             }
         }
     }
