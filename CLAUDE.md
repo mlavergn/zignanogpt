@@ -12,6 +12,15 @@ records its status there; the CLI's pipeline commands print which phase implemen
 It follows the sibling `../zigmicrogpt` (a Zig port of `microgpt`); read that repo's
 `CLAUDE.md` for the inherited conventions.
 
+## Platforms
+
+Two supported targets, and both must always compile: **macOS on Apple silicon with Metal**
+and **DGX OS (Linux ARM64, DGX Spark GB10) with CUDA**. A native `zig build` picks the
+backend on each (`Backend.detect`). From macOS, `make cuda` cross-compiles the CUDA build and
+compiles (does not run) every test binary for `aarch64-linux-gnu`; `make validate` includes it
+there. Nothing on the build or test path may assume macOS (frameworks, `xcrun`, `open` stay
+behind `builtin.os.tag == .macos` or in convenience targets). CUDA has not run on hardware yet.
+
 ## Git
 
 **Never create branches, commits, tags, or pushes.** The user makes or explicitly requests
@@ -91,7 +100,13 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   never commit it). Metal kernels are MSL in
   `src/metal/kernels.metal` (fast math) and `src/metal/reduce.metal` (strict, double-float sums);
   CUDA kernels are Zig in `src/cuda/kernels.zig` (camelCase functions `@export`ed under the
-  snake_case PTX names the backend looks up; no libm on the device). `make test` runs the suite
+  snake_case PTX names the backend looks up; no libm on the device). Shared memory is a
+  container-level `addrspace(.shared)` array; barriers, warp shuffles, `ex2`/`lg2` and
+  `%nctaid` are inline PTX (checked only by the driver's JIT on the Spark). Every launch is
+  256-thread blocks (the block reductions assume a multiple of 32); `launchBlocks` copies the
+  arguments into a runtime tuple (constants are comptime fields with no address). A new CUDA
+  kernel needs its name in both `Kernel` (backend) and the `@export` list. The CUDA backend
+  has never run: see PLAN.md's DGX bring-up checklist before trusting it. `make test` runs the suite
   on the detected backend and `make test-cpu` on the CPU (`make validate` runs both); `make cuda`
   cross-compiles the CUDA build (no GPU to run it on yet).
 - Run `make bench` after touching `CpuMatmul`; phase 1 baseline on an M5 Max is in PLAN.md.
@@ -197,7 +212,7 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   operations left, the selected one's form + output (or live training view) right, a status
   line of live keys. Built on zigtui components (`cli.tui`): `SplitPane` (titles, rules, the
   draggable divider), `StatusLine`, `StatusMark` (job/chat state), `Form` + `LineInput` (the
-  operation forms, the chat input), `ProgressBar`, `Sparkline` (loss curve) and `Transcript` (chat,
+  operation forms, the chat input), `ProgressBar`, `Sparkline` (loss curve) and `TranscriptView` (chat,
   job log); colors by `tui.Theme` role. `ConsoleApp` is the root widget; its panes are draw-only
   `PaneView`s. Generic UI belongs in zigtui (shared), not in `cli/`.
 - `Operation.all` is the left pane, in pipeline order: each entry is a `Command` plus form
@@ -229,7 +244,8 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   functions logs on a cold path (an error branch) instead.
 - `make format` / `make lint` cover `ZIG_SOURCES` (`build.zig`, `src/`, `cli/`, `web/`, `bench/`); add new
   source directories there, never `.` (that sweeps in `nanochat/`).
-- `make linux`: cross-compiles x86_64 and aarch64 (DGX Spark). `make docs`: autodoc on :8080.
+- `make linux`: cross-compiles x86_64 and aarch64 (CPU backend). `make cuda`: the DGX OS CUDA
+  build plus compiled tests. `make docs`: autodoc on :8080.
 - `make cli`: ReleaseFast build, then the console (TUI). `make run ARGS="config"` or
   `./zig-out/bin/zignanogpt <command>` for a single command.
 - `make fixtures` (or `make fixtures ONLY=gpt`): runs `dev/fixtures.py` with

@@ -508,6 +508,8 @@ pub fn build(b: *std.Build) !void {
     const tests_run = b.addRunArtifact(tests);
     // force tests to run on every test run
     tests_run.has_side_effects = true;
+    // A cross build (`make cuda` from macOS) compiles the tests and skips running them.
+    tests_run.skip_foreign_checks = true;
     tests_step.dependOn(&tests_run.step);
 
     // The CLI is its own module, so its tests need their own compile step.
@@ -526,6 +528,7 @@ pub fn build(b: *std.Build) !void {
 
     const cli_tests_run = b.addRunArtifact(cli_tests);
     cli_tests_run.has_side_effects = true;
+    cli_tests_run.skip_foreign_checks = true;
     tests_step.dependOn(&cli_tests_run.step);
 
     // The web console is likewise its own module.
@@ -543,6 +546,7 @@ pub fn build(b: *std.Build) !void {
 
     const web_tests_run = b.addRunArtifact(web_tests);
     web_tests_run.has_side_effects = true;
+    web_tests_run.skip_foreign_checks = true;
     tests_step.dependOn(&web_tests_run.step);
 
     // Build tools (host): the CUDA kernels' IR fixup.

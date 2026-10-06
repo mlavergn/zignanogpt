@@ -14,6 +14,16 @@ Dependencies (all Zig):
 
 No C/Python at runtime; Python only in dev-only fixture generation.
 
+Supported platforms (both must compile at every commit; `make validate` on macOS cross-compiles
+the second, tests included):
+
+| Platform | Backend | Build |
+| :--- | :--- | :--- |
+| macOS, Apple silicon (ARM64) | Metal | native `zig build` (detected) |
+| DGX OS (Ubuntu-based Linux, ARM64), DGX Spark GB10 (sm_121) | CUDA | native `zig build` on the Spark (detected via `libcuda.so.1`); `make cuda` cross-compiles from macOS |
+
+CPU works on both (and elsewhere) with `-Dbackend=cpu`.
+
 ## Key decisions
 
 | Area | Python | Zig |
@@ -341,6 +351,24 @@ Git: Claude creates no branches or commits; the user makes or requests every git
       norm and backward, a one-thread-per-output matmul. Built and type-checked only: the
       conformance suite and a training step still have to run on the Spark, and the matmul is
       the first thing to tile there.
+    - CUDA rough-out (blind, for the Spark): every op the model trains with now has a kernel
+      (44 PTX entries, matched against `Kernel` by the build): a 64x64-tiled matmul through
+      shared memory (batched via grid z), block-per-row norms / soft cap (+lse) / cross entropy,
+      warp-per-row attention forward, dq and dk/dv (deterministic, head dim <= 256), the
+      optimizer with f64 norms and sums, host-grouped embedding backward, rotary, gates, smear,
+      value mix, and f64 two-stage `dot`. Frees and scratch are released at the next sync.
+      Inline PTX for barriers, shuffles, `ex2`/`lg2` (tanh from `ex2`; PTX's own is ~11 bits).
+      `make cuda` compiles it and every test binary; nothing has run on a GPU yet.
+    - DGX bring-up checklist (native on DGX OS):
+      1. `zig build`, then `./zig-out/bin/zignanogpt version` says `cuda backend`.
+      2. `make test`: the conformance suite and the PyTorch parity fixtures on CUDA. First
+         suspects on failure: the inline PTX (`kernels.zig`, validated only by the driver's JIT),
+         block-size assumptions (256 threads, multiple of 32), the `AttnDims` byval parameter.
+      3. `make train-bench` against PyTorch CUDA on the same Spark (nanochat's `base_train.py`,
+         same d6 settings), and the Mac's Metal number (0.249 s per step).
+      4. Speed, measured there: TF32 tensor-core matmul (`mma.sync`), flash-style attention,
+         host-readable ids without a sync (GB10 has concurrent managed access), stream-ordered
+         scratch (`cuMemAllocAsync`) instead of managed allocations per op.
 
 ## Out of scope
 
@@ -393,6 +421,7 @@ FP8, FA3, DDP, wandb, HumanEval (needs Python sandbox), notebooks, bf16 compute.
 | Q23 Train defaults | Python's; `--preset=cpu` for `runcpu.sh` values |
 | Q24 Git | No branches or commits by Claude; user drives all git |
 | Q25 CUDA hardware | None yet (compile-only); target DGX Spark |
+| Q26 Platforms | macOS ARM64 (Metal) and DGX OS Linux ARM64 (CUDA), both required; CUDA cross-checked by `make validate` on macOS |
 
 ## Open questions
 

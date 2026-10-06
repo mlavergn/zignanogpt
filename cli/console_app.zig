@@ -558,7 +558,7 @@ pub const ConsoleApp = struct {
                 .note => .{ .text = text, .role = .secondaryText },
             };
         }
-        const record = try a.create(tui.Transcript);
+        const record = try a.create(tui.TranscriptView);
         record.* = .{ .entries = entries };
         const room: vxfw.Size = .{ .width = width, .height = height -| 1 };
 
@@ -604,7 +604,7 @@ pub const ConsoleApp = struct {
         const tail = try self.job.tail(a, height);
         const entries = try a.alloc(tui.TranscriptEntry, tail.len);
         for (tail, entries) |t, *entry| entry.* = .{ .text = t, .role = .secondaryText };
-        const record = try a.create(tui.Transcript);
+        const record = try a.create(tui.TranscriptView);
         record.* = .{ .entries = entries, .indent = 0, .spaced = false, .wrap = false };
         const size: vxfw.Size = .{ .width = width, .height = height };
         return record.draw(ctx.withConstraints(size, .fromSize(size)));

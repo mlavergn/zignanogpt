@@ -27,6 +27,7 @@ const cases = [_]Case{
     .{ .name = "lm_head    x@W^T", .m = 1024, .n = 32768, .k = 384, .options = .{ .transpose_b = true } },
     .{ .name = "input grad dy@W ", .m = 16384, .n = 384, .k = 1536 },
     .{ .name = "wgrad   dy^T@x +=", .m = 1536, .n = 384, .k = 16384, .options = .{ .transpose_a = true, .accumulate = true } },
+    .{ .name = "wgrad attn dy^T@x", .m = 384, .n = 384, .k = 16384, .options = .{ .transpose_a = true, .accumulate = true } },
     .{ .name = "square 1024", .m = 1024, .n = 1024, .k = 1024 },
     // Chat decoding: one token through a d20 model (n_embd 1280), memory-bound.
     .{ .name = "decode fc  x@W^T", .m = 1, .n = 5120, .k = 1280, .options = .{ .transpose_b = true } },

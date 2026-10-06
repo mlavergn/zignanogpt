@@ -8,7 +8,7 @@
 
 .DEFAULT_GOAL := all
 
-.PHONY: all validate build dist run cli web test-cpu cuda demo linux windows targets test bench format lint fixtures docs tag st open github clone claude clean
+.PHONY: all validate build dist run cli web test-cpu cuda train-bench demo linux windows targets test bench format lint fixtures docs tag st open github clone claude clean
 
 # ---------------------------------------------
 # Configuration
@@ -32,6 +32,11 @@ PY_ENV := $(CURDIR)/.venv
 # uv, invoked by absolute path like the other inferise tools.
 UV ?= /usr/local/inferise/uv/bin/uv
 
+# On macOS the gate also cross-compiles the DGX OS (Linux ARM64) CUDA build and
+# its tests, so both supported platforms stay compiling; on the Spark itself
+# `make test` already runs the suite on CUDA.
+VALIDATE_EXTRA := $(if $(filter Darwin,$(shell uname -s)),cuda,)
+
 # ---------------------------------------------
 # Primary workflows
 # ---------------------------------------------
@@ -41,7 +46,7 @@ all: build format test
 	@echo "done"
 
 # Full pre-commit gate: clean, format, lint, build, then test.
-validate: clean format lint build test test-cpu
+validate: clean format lint build test test-cpu $(VALIDATE_EXTRA)
 	@echo "validate done"
 
 # ---------------------------------------------
@@ -103,13 +108,25 @@ test:
 test-cpu:
 	zig build test -Dbackend=cpu --summary all
 
-# Cross-compile the CUDA backend for the DGX Spark (no GPU here: build only).
+# Cross-compile the CUDA build for DGX OS (Linux ARM64) from macOS: the
+# binaries, plus every test binary compiled (not run: no GPU or Linux here).
 cuda:
 	zig build -Dbackend=cuda -Dtarget=aarch64-linux-gnu
+	zig build test -Dbackend=cuda -Dtarget=aarch64-linux-gnu --summary all
 
 # Time backend matmul throughput (always ReleaseFast).
 bench:
 	zig build bench
+
+# Time 40 base-training steps of the d6 run (32 x 512, eval and samples off) on
+# the detected backend; the same command on the Mac (Metal) and the Spark (CUDA).
+# Needs the tokenizer and data shards in the base dir; the checkpoint is removed.
+train-bench:
+	zig build --release=fast
+	./zig-out/bin/zignanogpt train --no-tui --depth 6 --head-dim 64 --max-seq-len 512 --window-pattern L \
+		--device-batch-size 32 --total-batch-size 16384 --model-tag train-bench --num-iterations 40 \
+		--eval-every 0 --sample-every 0 --save-every 1000 | grep -E "^step 000[123]"
+	rm -rf "$${ZIGNANOGPT_BASE_DIR:-$$HOME/.cache/zignanogpt}/base_checkpoints/train-bench"
 
 # ---------------------------------------------
 # Format & lint

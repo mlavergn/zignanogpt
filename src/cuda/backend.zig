@@ -51,7 +51,7 @@ const Driver = struct {
     }
 };
 
-/// The kernels, by PTX entry name.
+/// The kernels, by PTX entry name (`kernels.zig` exports the same names).
 const Kernel = enum {
     fill_f32,
     copy_u32,
@@ -62,17 +62,63 @@ const Kernel = enum {
     relu_square_f32,
     relu_square_backward_f32,
     embedding_f32,
+    embedding_backward_f32,
     rmsnorm_f32,
     rmsnorm_backward_f32,
     matmul_f32,
+    rope_f32,
+    gate_linear_f32,
+    gate_linear_backward_dx_f32,
+    gate_linear_backward_dw_f32,
+    smear_f32,
+    smear_backward_f32,
+    gated_add_f32,
+    value_mix_f32,
+    value_mix_backward_f32,
+    softcap_f32,
+    softcap_lse_f32,
+    xent_rows_f32,
+    xent_rows_lse_f32,
+    xent_backward_f32,
+    dot_partial_f32,
+    reduce_sum_f64,
+    reduce_sum_f32,
+    attention_f32,
+    attention_delta_f32,
+    attention_dq_f32,
+    attention_dkv_f32,
+    adamw_step_f32,
+    muon_momentum_f32,
+    row_squares_f64,
+    col_squares_f64,
+    total_f64,
+    muon_scale_rows_f32,
+    muon_scale_all_f32,
+    muon_renorm_f32,
+    normuon_stats_f32,
+    muon_update_f32,
 };
 
-/// The CUDA backend (driver API; target: the DGX Spark, GB10, aarch64 Linux).
-/// Ops launch on one stream in issue order; `sync` waits for it. Kernels are
-/// written in Zig (`src/cuda/kernels.zig`) and loaded as PTX, so neither nvcc nor
-/// cuBLAS is needed: elementwise ops, embedding, RMS norm and a plain matmul
-/// run on the GPU; the rest run on the CPU kernels over managed memory after
-/// a sync. Built and checked for type errors on macOS, not yet run on a GPU.
+/// The attention problem as the kernels take it (`AttnDims` in kernels.zig).
+const AttnDims = extern struct { b: u32, tq: u32, tk: u32, keys: u32, h: u32, hkv: u32, d: u32, window: u32 };
+
+/// Threads per block for elementwise and row kernels (a multiple of 32: the
+/// block reductions sum per warp).
+const block_threads: u32 = 256;
+
+/// The CUDA backend (driver API; target: DGX OS on the DGX Spark, GB10,
+/// aarch64 Linux). Ops launch on one stream in issue order; `sync` waits for
+/// it. Kernels are Zig (`src/cuda/kernels.zig`) loaded as PTX, so neither nvcc
+/// nor cuBLAS is needed. Every op the model trains with has a kernel (tiled
+/// matmul, warp-per-row attention, row reductions, optimizer); index tensors
+/// are still checked on the host after a sync, and head dims past 256 fall
+/// back to the CPU attention.
+///
+/// Written blind: it compiles (and its tests compile) for aarch64-linux, but
+/// has not yet run on a GPU. Memory is managed (`cuMemAllocManaged`), which the
+/// GB10's coherent unified memory lets host and device touch freely; on a GPU
+/// without concurrent managed access the host writes in `alloc` would need a
+/// sync first.
 pub const CudaBackend = struct {
     const Self = @This();
 
@@ -94,6 +140,9 @@ pub const CudaBackend = struct {
     stream: Stream,
     module: Module,
     functions: [@typeInfo(Kernel).@"enum".fields.len]Function,
+    /// Device allocations to free once the work issued so far completes
+    /// (freed tensors and per-op scratch).
+    deferred: std.ArrayList(u64) = .empty,
 
     /// Loads the driver, opens device 0 and loads the kernels.
     ///
@@ -142,6 +191,7 @@ pub const CudaBackend = struct {
     pub fn deinit(self: *Self) void {
         log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
         self.sync() catch |err| log.warn("CUDA work failed at shutdown [{t}]", .{err});
+        self.deferred.deinit(self.allocator);
         self.cpu.deinit();
         _ = self.driver.cuModuleUnload(self.module);
         _ = self.driver.cuStreamDestroy_v2(self.stream);
@@ -163,16 +213,23 @@ pub const CudaBackend = struct {
         return mod.Tensor{ .buffer = .{ .bytes = bytes, .device_ptr = ptr }, .dtype = dtype, .shape = shape };
     }
 
-    /// Frees a tensor after the work issued so far completes.
+    /// Frees a tensor once the work issued so far completes.
     pub fn free(self: *Self, tensor: mod.Tensor) void {
         if (tensor.buffer.device_ptr == 0) return self.cpu.free(tensor);
-        self.sync() catch |err| log.warn("CUDA work failed before a free [{t}]", .{err});
-        self.check(self.driver.cuMemFree_v2(tensor.buffer.device_ptr), "cuMemFree") catch |err| log.warn("cuMemFree failed [{t}]", .{err});
+        self.deferred.append(self.allocator, tensor.buffer.device_ptr) catch {
+            self.sync() catch |err| log.warn("CUDA work failed before a free [{t}]", .{err});
+            self.check(self.driver.cuMemFree_v2(tensor.buffer.device_ptr), "cuMemFree") catch |err| log.warn("cuMemFree failed [{t}]", .{err});
+        };
     }
 
+    /// Waits for the stream, then frees the deferred allocations.
     pub fn sync(self: *Self) !void {
         try self.current();
         try self.check(self.driver.cuStreamSynchronize(self.stream), "cuStreamSynchronize");
+        for (self.deferred.items) |ptr| {
+            self.check(self.driver.cuMemFree_v2(ptr), "cuMemFree") catch |err| log.warn("cuMemFree failed [{t}]", .{err});
+        }
+        self.deferred.clearRetainingCapacity();
     }
 
     pub fn upload(self: *Self, tensor: mod.Tensor, comptime T: type, data: []const T) !void {
@@ -185,8 +242,15 @@ pub const CudaBackend = struct {
         return self.cpu.download(tensor, T, out);
     }
 
+    /// A zeroed scratch tensor of `len` f32 slots (2 per f64), freed at the next sync.
+    fn scratch(self: *Self, len: usize) !mod.Tensor {
+        const t = try self.alloc(.f32, &.{@max(len, 1)});
+        try self.deferred.append(self.allocator, t.buffer.device_ptr);
+        return t;
+    }
+
     // -------------------------------------------------------------------------
-    // Ops with CUDA kernels
+    // Elementwise
 
     pub fn fill(self: *Self, tensor: mod.Tensor, value: f32) !void {
         if (tensor.dtype != .f32) return error.DtypeMismatch;
@@ -249,44 +313,295 @@ pub const CudaBackend = struct {
         try self.launch(.relu_square_backward_f32, n, .{ ptrOf(dx), ptrOf(dy), ptrOf(x), n });
     }
 
+    pub fn rope(self: *Self, out: mod.Tensor, x: mod.Tensor, cos: mod.Tensor, sin: mod.Tensor, pos0: usize) !void {
+        try self.rotate(out, x, cos, sin, pos0, 1);
+    }
+
+    pub fn ropeBackward(self: *Self, dx: mod.Tensor, dy: mod.Tensor, cos: mod.Tensor, sin: mod.Tensor, pos0: usize) !void {
+        try self.rotate(dx, dy, cos, sin, pos0, -1);
+    }
+
+    fn rotate(self: *Self, out: mod.Tensor, x: mod.Tensor, cos: mod.Tensor, sin: mod.Tensor, pos0: usize, sign: f32) !void {
+        try checkSame(out, x);
+        try checkSame(cos, sin);
+        if (x.shape.rank != 4 or x.shape.dims[3] % 2 != 0 or cos.shape.cols() * 2 != x.shape.dims[3]) return error.ShapeMismatch;
+        if (pos0 + x.shape.dims[1] > cos.shape.rows()) return error.OutOfBounds;
+        const n = try count(x) / 2;
+        try self.launch(.rope_f32, n, .{
+            ptrOf(out),                          ptrOf(x),                            ptrOf(cos),                              ptrOf(sin),
+            @as(u32, @intCast(x.shape.dims[1])), @as(u32, @intCast(x.shape.dims[2])), @as(u32, @intCast(x.shape.dims[3] / 2)), @as(u32, @intCast(pos0)),
+            sign,                                n,
+        });
+    }
+
+    pub fn gateLinear(self: *Self, out: mod.Tensor, x: mod.Tensor, w: mod.Tensor) !void {
+        if (out.dtype != .f32 or x.dtype != .f32 or w.dtype != .f32) return error.DtypeMismatch;
+        const heads = w.shape.rows();
+        const cin = w.shape.cols();
+        if (cin > x.shape.cols() or out.shape.rows() != x.shape.rows() or out.shape.cols() != heads) return error.ShapeMismatch;
+        const n = try count(out);
+        try self.launch(.gate_linear_f32, n, .{ ptrOf(out), ptrOf(x), ptrOf(w), @as(u32, @intCast(x.shape.cols())), @as(u32, @intCast(cin)), @as(u32, @intCast(heads)), @as(u32, @intCast(x.shape.rows())) });
+    }
+
+    pub fn gateLinearBackward(self: *Self, dx: mod.Tensor, dw: mod.Tensor, dout: mod.Tensor, x: mod.Tensor, w: mod.Tensor) !void {
+        try checkSame(dx, x);
+        try checkSame(dw, w);
+        if (dout.dtype != .f32) return error.DtypeMismatch;
+        const rows = x.shape.rows();
+        const heads = w.shape.rows();
+        const cin = w.shape.cols();
+        if (cin > x.shape.cols() or dout.shape.rows() != rows or dout.shape.cols() != heads) return error.ShapeMismatch;
+        const shape = .{ @as(u32, @intCast(x.shape.cols())), @as(u32, @intCast(cin)), @as(u32, @intCast(heads)), @as(u32, @intCast(rows)) };
+        try self.launch(.gate_linear_backward_dx_f32, @intCast(rows * cin), .{ ptrOf(dx), ptrOf(dout), ptrOf(w) } ++ shape);
+        try self.launchBlocks(.gate_linear_backward_dw_f32, .{ @intCast(heads * cin), 1, 1 }, .{ ptrOf(dw), ptrOf(dout), ptrOf(x) } ++ shape);
+    }
+
+    pub fn smear(self: *Self, out: mod.Tensor, x: mod.Tensor, gate: mod.Tensor, lambda: mod.Scalar) !void {
+        try checkSame(out, x);
+        try lambda.validate();
+        if (gate.dtype != .f32) return error.DtypeMismatch;
+        if (x.shape.rank != 3 or gate.numel() != x.shape.dims[0] * x.shape.dims[1]) return error.ShapeMismatch;
+        if (overlaps(out, x)) return error.Aliasing;
+        const n = try count(out);
+        try self.launch(.smear_f32, n, .{
+            ptrOf(out),                          ptrOf(x),                            ptrOf(gate),   ptrOf(lambda.tensor orelse gate),
+            @as(u32, @intCast(x.shape.dims[1])), @as(u32, @intCast(x.shape.dims[2])), lambda.factor, @as(u32, @intFromBool(lambda.tensor != null)),
+            n,
+        });
+    }
+
+    pub fn smearBackward(self: *Self, dx: mod.Tensor, dgate: mod.Tensor, dlambda: mod.Tensor, dout: mod.Tensor, x: mod.Tensor, gate: mod.Tensor, lambda: mod.Scalar) !void {
+        try checkSame(dx, x);
+        try checkSame(dout, x);
+        try checkSame(dgate, gate);
+        try lambda.validate();
+        if (dlambda.dtype != .f32 or dlambda.numel() == 0) return error.DtypeMismatch;
+        if (x.shape.rank != 3 or gate.numel() != x.shape.dims[0] * x.shape.dims[1]) return error.ShapeMismatch;
+        if (overlaps(dx, dout) or overlaps(dx, x)) return error.Aliasing;
+        const rows: u32 = @intCast(x.shape.rows());
+        const partial = try self.scratch(rows);
+        try self.launchBlocks(.smear_backward_f32, .{ rows, 1, 1 }, .{
+            ptrOf(dx),                           ptrOf(dgate),  ptrOf(partial),                                ptrOf(dout),
+            ptrOf(x),                            ptrOf(gate),   ptrOf(lambda.tensor orelse gate),              @as(u32, @intCast(x.shape.dims[1])),
+            @as(u32, @intCast(x.shape.dims[2])), lambda.factor, @as(u32, @intFromBool(lambda.tensor != null)),
+        });
+        // dlambda += factor * sum(partial), rows in order.
+        try self.launchBlocks(.reduce_sum_f32, .{ 1, 1, 1 }, .{ ptrOf(partial), ptrOf(dlambda), rows, lambda.factor, @as(u32, 1) });
+    }
+
+    pub fn gatedAdd(self: *Self, out: mod.Tensor, x: mod.Tensor, y: mod.Tensor, gate: mod.Tensor, s: mod.Scalar) !void {
+        try checkSame(out, x);
+        try checkSame(out, y);
+        try s.validate();
+        if (gate.dtype != .f32) return error.DtypeMismatch;
+        if (gate.numel() != x.shape.rows()) return error.ShapeMismatch;
+        const n = try count(out);
+        try self.launch(.gated_add_f32, n, .{
+            ptrOf(out),                         ptrOf(x), ptrOf(y),                                 ptrOf(gate), ptrOf(s.tensor orelse gate),
+            @as(u32, @intCast(x.shape.cols())), s.factor, @as(u32, @intFromBool(s.tensor != null)), n,
+        });
+    }
+
+    pub fn valueMix(self: *Self, v: mod.Tensor, ve: mod.Tensor, gate: mod.Tensor) !void {
+        if (v.dtype != .f32 or ve.dtype != .f32 or gate.dtype != .f32) return error.DtypeMismatch;
+        const pairs = gate.numel();
+        if (v.numel() != ve.numel() or pairs == 0 or v.numel() % pairs != 0) return error.ShapeMismatch;
+        const n = try count(v);
+        try self.launch(.value_mix_f32, n, .{ ptrOf(v), ptrOf(ve), ptrOf(gate), @as(u32, @intCast(v.numel() / pairs)), n });
+    }
+
+    pub fn valueMixBackward(self: *Self, dve: mod.Tensor, dgate: mod.Tensor, dv: mod.Tensor, ve: mod.Tensor, gate: mod.Tensor) !void {
+        try checkSame(dve, ve);
+        try checkSame(dgate, gate);
+        if (dv.dtype != .f32) return error.DtypeMismatch;
+        const pairs = gate.numel();
+        if (dv.numel() != ve.numel() or pairs == 0 or ve.numel() % pairs != 0) return error.ShapeMismatch;
+        try self.launch(.value_mix_backward_f32, @intCast(pairs), .{ ptrOf(dve), ptrOf(dgate), ptrOf(dv), ptrOf(ve), ptrOf(gate), @as(u32, @intCast(ve.numel() / pairs)), @as(u32, @intCast(pairs)) });
+    }
+
+    // -------------------------------------------------------------------------
+    // Embedding (ids are checked on the host, after a sync)
+
     pub fn embedding(self: *Self, out: mod.Tensor, table: mod.Tensor, ids: mod.Tensor) !void {
         if (out.dtype != .f32 or table.dtype != .f32 or ids.dtype != .i32) return error.DtypeMismatch;
         const cols = table.shape.cols();
         if (out.numel() != ids.numel() * cols) return error.ShapeMismatch;
-        try self.sync(); // the ids are checked on the host
-        const vocab = table.shape.rows();
-        for (std.mem.bytesAsSlice(i32, ids.buffer.bytes[ids.offset * 4 ..][0 .. ids.numel() * 4])) |id| {
-            if (id < 0 or id >= vocab) return error.OutOfBounds;
-        }
+        _ = try self.hostIds(ids, table.shape.rows());
         const n = try count(out);
         try self.launch(.embedding_f32, n, .{ ptrOf(out), ptrOf(table), ptrOf(ids), @as(u32, @intCast(cols)), n });
     }
 
+    /// `dtable[ids[r]] += dout[r]`: the host groups the rows by id (stable);
+    /// one thread per (id, column) adds that id's rows in order (the CPU's order).
+    pub fn embeddingBackward(self: *Self, dtable: mod.Tensor, dout: mod.Tensor, ids: mod.Tensor) !void {
+        if (dtable.dtype != .f32 or dout.dtype != .f32 or ids.dtype != .i32) return error.DtypeMismatch;
+        const cols = dtable.shape.cols();
+        const rows = ids.numel();
+        if (dout.numel() != rows * cols) return error.ShapeMismatch;
+        if (rows == 0 or cols == 0) return;
+        _ = try count(dtable);
+        const id_values = try self.hostIds(ids, dtable.shape.rows());
+        const order = try self.allocator.alloc(u32, rows);
+        defer self.allocator.free(order);
+        for (order, 0..) |*o, r| o.* = @intCast(r);
+        const ByRow = struct {
+            ids: []align(1) const i32,
+            fn less(ctx: @This(), x: u32, y: u32) bool {
+                return ctx.ids[x] < ctx.ids[y] or (ctx.ids[x] == ctx.ids[y] and x < y);
+            }
+        };
+        std.sort.pdq(u32, order, ByRow{ .ids = id_values }, ByRow.less);
+        var unique: usize = 0;
+        for (order, 0..) |r, k| {
+            if (k == 0 or id_values[r] != id_values[order[k - 1]]) unique += 1;
+        }
+        // Layout: rows by id, each id's start (and the end), then the ids.
+        const groups = try self.scratch(rows + 2 * unique + 1);
+        const words = std.mem.bytesAsSlice(u32, groups.buffer.bytes);
+        @memcpy(words[0..rows], order);
+        const starts = words[rows..][0 .. unique + 1];
+        const unique_ids = words[rows + unique + 1 ..][0..unique];
+        var u: usize = 0;
+        for (order, 0..) |r, k| {
+            if (k == 0 or id_values[r] != id_values[order[k - 1]]) {
+                starts[u] = @intCast(k);
+                unique_ids[u] = @intCast(id_values[r]);
+                u += 1;
+            }
+        }
+        starts[unique] = @intCast(rows);
+        try self.launch(.embedding_backward_f32, @intCast(unique * cols), .{ ptrOf(dtable), ptrOf(dout), ptrOf(groups), @as(u32, @intCast(cols)), @as(u32, @intCast(unique)), @as(u32, @intCast(rows)) });
+    }
+
+    /// The ids of `ids` on the host after a sync, each checked below `vocab`.
+    fn hostIds(self: *Self, ids: mod.Tensor, vocab: usize) ![]align(1) const i32 {
+        try self.sync();
+        const values = std.mem.bytesAsSlice(i32, ids.buffer.bytes[ids.offset * 4 ..][0 .. ids.numel() * 4]);
+        for (values) |id| {
+            if (id < 0 or id >= vocab) {
+                log.debug("id {d} outside vocab {d}", .{ id, vocab });
+                return error.OutOfBounds;
+            }
+        }
+        return values;
+    }
+
+    // -------------------------------------------------------------------------
+    // Row reductions (one block per row)
+
     pub fn rmsnorm(self: *Self, out: mod.Tensor, x: mod.Tensor, eps: f32) !void {
         try checkSame(out, x);
-        const rows: u32 = @intCast(x.shape.rows());
-        try self.launch(.rmsnorm_f32, rows, .{ ptrOf(out), ptrOf(x), rows, @as(u32, @intCast(x.shape.cols())), eps });
+        try self.launchBlocks(.rmsnorm_f32, .{ try rowCount(x), 1, 1 }, .{ ptrOf(out), ptrOf(x), @as(u32, @intCast(x.shape.cols())), eps });
     }
 
     pub fn rmsnormBackward(self: *Self, dx: mod.Tensor, dy: mod.Tensor, x: mod.Tensor, eps: f32, accumulate: bool) !void {
         try checkSame(dx, x);
         try checkSame(dy, x);
-        const rows: u32 = @intCast(x.shape.rows());
-        try self.launch(.rmsnorm_backward_f32, rows, .{ ptrOf(dx), ptrOf(dy), ptrOf(x), rows, @as(u32, @intCast(x.shape.cols())), eps, @as(u32, @intFromBool(accumulate)) });
+        try self.launchBlocks(.rmsnorm_backward_f32, .{ try rowCount(x), 1, 1 }, .{ ptrOf(dx), ptrOf(dy), ptrOf(x), @as(u32, @intCast(x.shape.cols())), eps, @as(u32, @intFromBool(accumulate)) });
     }
+
+    pub fn softcap(self: *Self, out: mod.Tensor, logits: mod.Tensor, cap: f32, lse: ?mod.Tensor) !void {
+        if (out.dtype != .f32 or logits.dtype != .f32) return error.DtypeMismatch;
+        if (out.shape.rows() != logits.shape.rows() or out.shape.cols() > logits.shape.cols()) return error.ShapeMismatch;
+        if (overlaps(out, logits)) return error.Aliasing;
+        const n = try count(out);
+        const cols: u32 = @intCast(out.shape.cols());
+        const padded: u32 = @intCast(logits.shape.cols());
+        if (lse) |t| {
+            try checkRowValues(t, out);
+            return self.launchBlocks(.softcap_lse_f32, .{ try rowCount(out), 1, 1 }, .{ ptrOf(out), ptrOf(logits), ptrOf(t), cols, padded, cap });
+        }
+        try self.launch(.softcap_f32, n, .{ ptrOf(out), ptrOf(logits), cols, padded, cap, n });
+    }
+
+    /// Checks targets on the host (after a sync) and counts the valid ones.
+    fn checkTargets(self: *Self, logits: mod.Tensor, targets: mod.Tensor) !usize {
+        if (logits.dtype != .f32 or targets.dtype != .i32) return error.DtypeMismatch;
+        if (targets.numel() != logits.shape.rows()) return error.ShapeMismatch;
+        try self.sync();
+        const vocab = logits.shape.cols();
+        var valid: usize = 0;
+        for (std.mem.bytesAsSlice(i32, targets.buffer.bytes[targets.offset * 4 ..][0 .. targets.numel() * 4])) |t| {
+            if (t < -1 or t >= vocab) return error.OutOfBounds;
+            valid += @intFromBool(t >= 0);
+        }
+        return valid;
+    }
+
+    pub fn crossEntropy(self: *Self, loss: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, lse: ?mod.Tensor) !void {
+        const valid = try self.checkTargets(logits, targets);
+        if (loss.dtype != .f32 or loss.numel() == 0) return error.DtypeMismatch;
+        const rows = try rowCount(logits);
+        const losses = try self.scratch(rows);
+        try self.xentRows(losses, logits, targets, lse);
+        // The mean over valid rows (NaN when there are none, as PyTorch).
+        const factor = if (valid == 0) std.math.nan(f32) else 1 / @as(f32, @floatFromInt(valid));
+        try self.launchBlocks(.reduce_sum_f32, .{ 1, 1, 1 }, .{ ptrOf(losses), ptrOf(loss), rows, factor, @as(u32, 0) });
+    }
+
+    pub fn crossEntropyRows(self: *Self, losses: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor) !void {
+        _ = try self.checkTargets(logits, targets);
+        if (losses.dtype != .f32 or losses.numel() != logits.shape.rows()) return error.ShapeMismatch;
+        try self.xentRows(losses, logits, targets, null);
+    }
+
+    fn xentRows(self: *Self, losses: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, lse: ?mod.Tensor) !void {
+        const rows = try rowCount(logits);
+        const vocab: u32 = @intCast(logits.shape.cols());
+        if (lse) |t| {
+            try checkRowValues(t, logits);
+            return self.launch(.xent_rows_lse_f32, rows, .{ ptrOf(losses), ptrOf(logits), ptrOf(targets), ptrOf(t), vocab, rows });
+        }
+        try self.launchBlocks(.xent_rows_f32, .{ rows, 1, 1 }, .{ ptrOf(losses), ptrOf(logits), ptrOf(targets), vocab });
+    }
+
+    pub fn crossEntropyBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, cap: f32, scale_by: f32, lse: ?mod.Tensor) !void {
+        const valid = try self.checkTargets(logits, targets);
+        try self.xentBackward(dpad, logits, targets, null, cap, scale_by / @as(f32, @floatFromInt(valid)), lse);
+    }
+
+    pub fn crossEntropyWeightedBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, weights: mod.Tensor, cap: f32, lse: ?mod.Tensor) !void {
+        _ = try self.checkTargets(logits, targets);
+        if (weights.dtype != .f32) return error.DtypeMismatch;
+        if (weights.numel() != logits.shape.rows()) return error.ShapeMismatch;
+        try self.xentBackward(dpad, logits, targets, weights, cap, 1, lse);
+    }
+
+    fn xentBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, weights: ?mod.Tensor, cap: f32, factor: f32, lse: ?mod.Tensor) !void {
+        if (dpad.dtype != .f32) return error.DtypeMismatch;
+        if (lse) |t| try checkRowValues(t, logits);
+        if (dpad.shape.rows() != logits.shape.rows() or dpad.shape.cols() < logits.shape.cols()) return error.ShapeMismatch;
+        if (overlaps(dpad, logits)) return error.Aliasing;
+        try self.launchBlocks(.xent_backward_f32, .{ try rowCount(logits), 1, 1 }, .{
+            ptrOf(dpad),              ptrOf(logits),                           ptrOf(targets),                        ptrOf(weights orelse logits),
+            ptrOf(lse orelse logits), @as(u32, @intCast(logits.shape.cols())), @as(u32, @intCast(dpad.shape.cols())), cap,
+            factor,                   @as(u32, @intFromBool(weights != null)), @as(u32, @intFromBool(lse != null)),
+        });
+    }
+
+    pub fn dot(self: *Self, out: mod.Tensor, a: mod.Tensor, b: mod.Tensor, factor: f32, accumulate: bool) !void {
+        try checkSame(a, b);
+        if (out.dtype != .f32 or out.numel() == 0) return error.DtypeMismatch;
+        const n = try count(a);
+        const groups: u32 = @intCast(@max(1, @min(256, (n + 4095) / 4096)));
+        const partial = try self.scratch(2 * groups); // one f64 per block
+        try self.launchBlocks(.dot_partial_f32, .{ groups, 1, 1 }, .{ ptrOf(a), ptrOf(b), ptrOf(partial), n });
+        try self.launchBlocks(.reduce_sum_f64, .{ 1, 1, 1 }, .{ ptrOf(partial), ptrOf(out), groups, factor, @as(u32, @intFromBool(accumulate)) });
+    }
+
+    // -------------------------------------------------------------------------
+    // Matmul: 64x64 tiles per block of 256 threads (`matmul_f32` in kernels.zig)
 
     pub fn matmul(self: *Self, c: mod.Tensor, a: mod.Tensor, b: mod.Tensor, options: mod.MatmulOptions) !void {
         if (c.dtype != .f32 or a.dtype != .f32 or b.dtype != .f32) return error.DtypeMismatch;
         const m, const n, const k = try options.dims(c.shape, a.shape, b.shape);
         if (overlaps(c, a) or overlaps(c, b)) return error.Aliasing;
-        if (options.batch > 1) {
-            var single = options;
-            single.batch = 1;
-            for (0..options.batch) |i| try self.matmul(try options.matrixOf(c, i), try options.matrixOf(a, i), try options.matrixOf(b, i), single);
-            return;
-        }
-        const total = std.math.cast(u32, m * n) orelse return error.TensorTooLarge;
-        try self.launch(.matmul_f32, total, .{
+        if (m == 0 or n == 0) return;
+        _ = try count(c);
+        _ = try count(a);
+        _ = try count(b);
+        const grid = [3]u32{ @intCast((n + 63) / 64), @intCast((m + 63) / 64), @intCast(options.batch) };
+        try self.launchBlocks(.matmul_f32, grid, .{
             ptrOf(c),                                    ptrOf(a),                                    ptrOf(b),
             @as(u32, @intCast(m)),                       @as(u32, @intCast(n)),                       @as(u32, @intCast(k)),
             @as(u32, @intFromBool(options.transpose_a)), @as(u32, @intFromBool(options.transpose_b)), @as(u32, @intFromBool(options.accumulate)),
@@ -295,73 +610,141 @@ pub const CudaBackend = struct {
     }
 
     // -------------------------------------------------------------------------
-    // Ops on the CPU kernels (managed memory, after a sync)
+    // Attention: one warp per query row (forward, dq) or key row (dk/dv)
 
-    pub fn rope(self: *Self, out: mod.Tensor, x: mod.Tensor, cos: mod.Tensor, sin: mod.Tensor, pos0: usize) !void {
-        return self.onCpu("rope", .{ out, x, cos, sin, pos0 });
-    }
-    pub fn ropeBackward(self: *Self, dx: mod.Tensor, dy: mod.Tensor, cos: mod.Tensor, sin: mod.Tensor, pos0: usize) !void {
-        return self.onCpu("ropeBackward", .{ dx, dy, cos, sin, pos0 });
-    }
+    /// Head dims the warp-per-row kernels hold (8 per lane).
+    const max_head_dim = 256;
+
     pub fn attention(self: *Self, out: mod.Tensor, q: mod.Tensor, k: mod.Tensor, v: mod.Tensor, lse: ?mod.Tensor, options: mod.AttentionOptions) !void {
-        return self.onCpu("attention", .{ out, q, k, v, lse, options });
+        try checkSame(out, q);
+        try checkSame(k, v);
+        const d = try options.dims(out.shape, q.shape, k.shape, v.shape, if (lse) |t| t.shape else null);
+        if (lse) |t| if (t.dtype != .f32) return error.DtypeMismatch;
+        if (d.d > max_head_dim) return self.onCpu("attention", .{ out, q, k, v, lse, options });
+        for ([_]mod.Tensor{ q, k, v }) |t| if (overlaps(out, t)) return error.Aliasing;
+        _ = try count(q);
+        _ = try count(k);
+        const warps = d.b * d.tq * d.h;
+        if (warps == 0 or d.d == 0) return;
+        try self.launch(.attention_f32, try warpThreads(warps), .{ ptrOf(out), ptrOf(q), ptrOf(k), ptrOf(v), ptrOf(lse orelse out), attnDims(d, options), attnScale(d), @as(u32, @intFromBool(lse != null)) });
     }
+
     pub fn attentionBackward(self: *Self, dq: mod.Tensor, dk: mod.Tensor, dv: mod.Tensor, dout: mod.Tensor, q: mod.Tensor, k: mod.Tensor, v: mod.Tensor, out: mod.Tensor, lse: mod.Tensor, options: mod.AttentionOptions) !void {
-        return self.onCpu("attentionBackward", .{ dq, dk, dv, dout, q, k, v, out, lse, options });
+        try checkSame(dq, q);
+        try checkSame(dout, q);
+        try checkSame(out, q);
+        try checkSame(dk, k);
+        try checkSame(dv, k);
+        try checkSame(k, v);
+        if (lse.dtype != .f32) return error.DtypeMismatch;
+        const d = try options.dims(out.shape, q.shape, k.shape, v.shape, lse.shape);
+        if (d.d > max_head_dim) return self.onCpu("attentionBackward", .{ dq, dk, dv, dout, q, k, v, out, lse, options });
+        const inputs = [_]mod.Tensor{ dout, q, k, v, out, lse };
+        for ([_]mod.Tensor{ dq, dk, dv }) |o| for (inputs) |t| if (overlaps(o, t)) return error.Aliasing;
+        _ = try count(q);
+        _ = try count(k);
+        if (d.b == 0 or d.tq == 0 or d.h == 0 or d.d == 0) return;
+        const dims = attnDims(d, options);
+        const rows: u32 = @intCast(d.b * d.h * d.tq);
+        const delta = try self.scratch(rows);
+        try self.launch(.attention_delta_f32, rows, .{ ptrOf(delta), ptrOf(dout), ptrOf(out), dims });
+        try self.launch(.attention_dq_f32, try warpThreads(d.b * d.tq * d.h), .{ ptrOf(dq), ptrOf(dout), ptrOf(q), ptrOf(k), ptrOf(v), ptrOf(lse), ptrOf(delta), dims, attnScale(d) });
+        try self.launch(.attention_dkv_f32, try warpThreads(d.b * d.tk * d.hkv), .{ ptrOf(dk), ptrOf(dv), ptrOf(dout), ptrOf(q), ptrOf(k), ptrOf(v), ptrOf(lse), ptrOf(delta), dims, attnScale(d) });
     }
-    pub fn gateLinear(self: *Self, out: mod.Tensor, x: mod.Tensor, w: mod.Tensor) !void {
-        return self.onCpu("gateLinear", .{ out, x, w });
+
+    fn attnDims(d: mod.AttentionOptions.Dims, options: mod.AttentionOptions) AttnDims {
+        return .{
+            .b = @intCast(d.b),
+            .tq = @intCast(d.tq),
+            .tk = @intCast(d.tk),
+            .keys = @intCast(d.keys),
+            .h = @intCast(d.h),
+            .hkv = @intCast(d.hkv),
+            .d = @intCast(d.d),
+            .window = @intCast(@min(options.window, 1 << 30)),
+        };
     }
-    pub fn gateLinearBackward(self: *Self, dx: mod.Tensor, dw: mod.Tensor, dout: mod.Tensor, x: mod.Tensor, w: mod.Tensor) !void {
-        return self.onCpu("gateLinearBackward", .{ dx, dw, dout, x, w });
+
+    fn attnScale(d: mod.AttentionOptions.Dims) f32 {
+        return 1 / @sqrt(@as(f32, @floatFromInt(d.d)));
     }
-    pub fn smear(self: *Self, out: mod.Tensor, x: mod.Tensor, gate: mod.Tensor, lambda: mod.Scalar) !void {
-        return self.onCpu("smear", .{ out, x, gate, lambda });
+
+    /// Threads for one warp per row.
+    fn warpThreads(rows: usize) !u32 {
+        return std.math.cast(u32, rows * 32) orelse error.TensorTooLarge;
     }
-    pub fn smearBackward(self: *Self, dx: mod.Tensor, dgate: mod.Tensor, dlambda: mod.Tensor, dout: mod.Tensor, x: mod.Tensor, gate: mod.Tensor, lambda: mod.Scalar) !void {
-        return self.onCpu("smearBackward", .{ dx, dgate, dlambda, dout, x, gate, lambda });
-    }
-    pub fn gatedAdd(self: *Self, out: mod.Tensor, x: mod.Tensor, y: mod.Tensor, gate: mod.Tensor, s: mod.Scalar) !void {
-        return self.onCpu("gatedAdd", .{ out, x, y, gate, s });
-    }
-    pub fn valueMix(self: *Self, v: mod.Tensor, ve: mod.Tensor, gate: mod.Tensor) !void {
-        return self.onCpu("valueMix", .{ v, ve, gate });
-    }
-    pub fn valueMixBackward(self: *Self, dve: mod.Tensor, dgate: mod.Tensor, dv: mod.Tensor, ve: mod.Tensor, gate: mod.Tensor) !void {
-        return self.onCpu("valueMixBackward", .{ dve, dgate, dv, ve, gate });
-    }
-    pub fn softcap(self: *Self, out: mod.Tensor, logits: mod.Tensor, cap: f32, lse: ?mod.Tensor) !void {
-        return self.onCpu("softcap", .{ out, logits, cap, lse });
-    }
-    pub fn crossEntropy(self: *Self, loss: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, lse: ?mod.Tensor) !void {
-        return self.onCpu("crossEntropy", .{ loss, logits, targets, lse });
-    }
-    pub fn crossEntropyRows(self: *Self, losses: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor) !void {
-        return self.onCpu("crossEntropyRows", .{ losses, logits, targets });
-    }
-    pub fn crossEntropyBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, cap: f32, scale_by: f32, lse: ?mod.Tensor) !void {
-        return self.onCpu("crossEntropyBackward", .{ dpad, logits, targets, cap, scale_by, lse });
-    }
-    pub fn crossEntropyWeightedBackward(self: *Self, dpad: mod.Tensor, logits: mod.Tensor, targets: mod.Tensor, weights: mod.Tensor, cap: f32, lse: ?mod.Tensor) !void {
-        return self.onCpu("crossEntropyWeightedBackward", .{ dpad, logits, targets, weights, cap, lse });
-    }
-    pub fn dot(self: *Self, out: mod.Tensor, a: mod.Tensor, b: mod.Tensor, factor: f32, accumulate: bool) !void {
-        return self.onCpu("dot", .{ out, a, b, factor, accumulate });
-    }
-    pub fn embeddingBackward(self: *Self, dtable: mod.Tensor, dout: mod.Tensor, ids: mod.Tensor) !void {
-        return self.onCpu("embeddingBackward", .{ dtable, dout, ids });
-    }
+
+    // -------------------------------------------------------------------------
+    // Optimizer (norms and sums in f64, as the CPU's)
+
     pub fn adamwStep(self: *Self, p: mod.Tensor, g: mod.Tensor, m: mod.Tensor, v: mod.Tensor, params: mod.AdamWParams) !void {
-        return self.onCpu("adamwStep", .{ p, g, m, v, params });
+        try checkSame(p, g);
+        try checkSame(p, m);
+        try checkSame(p, v);
+        try params.validate();
+        const n = try count(p);
+        const step: f32 = @floatFromInt(params.step);
+        try self.launch(.adamw_step_f32, n, .{
+            ptrOf(p),                                                ptrOf(g),         ptrOf(m),         ptrOf(v),
+            1 - params.lr * params.weight_decay,                     1 - params.beta1, 1 - params.beta2, 1 - std.math.pow(f32, params.beta2, step),
+            params.lr / (1 - std.math.pow(f32, params.beta1, step)), params.eps,       n,
+        });
     }
+
     pub fn muonMomentum(self: *Self, g: mod.Tensor, buf: mod.Tensor, momentum: f32) !void {
-        return self.onCpu("muonMomentum", .{ g, buf, momentum });
+        try checkSame(g, buf);
+        const n = try count(g);
+        try self.launch(.muon_momentum_f32, n, .{ ptrOf(g), ptrOf(buf), momentum, n });
     }
+
+    /// MuonEq row equilibration, then `x /= ||x||_F * 1.01 + 1e-6`.
     pub fn muonPrepare(self: *Self, x: mod.Tensor) !void {
-        return self.onCpu("muonPrepare", .{x});
+        if (x.dtype != .f32) return error.DtypeMismatch;
+        const rows = try rowCount(x);
+        const cols: u32 = @intCast(x.shape.cols());
+        const n = try count(x);
+        if (n == 0) return;
+        const row_sq = try self.scratch(2 * @as(usize, rows));
+        const total = try self.scratch(2);
+        try self.launchBlocks(.row_squares_f64, .{ rows, 1, 1 }, .{ ptrOf(x), ptrOf(row_sq), cols });
+        try self.launchBlocks(.total_f64, .{ 1, 1, 1 }, .{ ptrOf(row_sq), ptrOf(total), rows });
+        try self.launch(.muon_scale_rows_f32, n, .{ ptrOf(x), ptrOf(row_sq), ptrOf(total), rows, cols, n });
+        try self.launchBlocks(.row_squares_f64, .{ rows, 1, 1 }, .{ ptrOf(x), ptrOf(row_sq), cols });
+        try self.launchBlocks(.total_f64, .{ 1, 1, 1 }, .{ ptrOf(row_sq), ptrOf(total), rows });
+        try self.launch(.muon_scale_all_f32, n, .{ ptrOf(x), ptrOf(total), n });
     }
+
+    /// Muon+ renormalization, NorMuon variance reduction and the cautious update.
     pub fn muonFinish(self: *Self, p: mod.Tensor, g: mod.Tensor, second: mod.Tensor, params: mod.MuonParams) !void {
-        return self.onCpu("muonFinish", .{ p, g, second, params });
+        try checkSame(p, g);
+        if (second.dtype != .f32) return error.DtypeMismatch;
+        const rows = try rowCount(p);
+        const cols: u32 = @intCast(p.shape.cols());
+        const by_row = rows >= cols;
+        const shape = mod.MuonParams.secondShape(rows, cols);
+        if (second.shape.rows() != shape[0] or second.shape.cols() != shape[1]) return error.ShapeMismatch;
+        const n = try count(p);
+        if (n == 0) return;
+
+        const row_sq = try self.scratch(2 * @as(usize, rows));
+        const total = try self.scratch(2);
+        try self.launchBlocks(.row_squares_f64, .{ rows, 1, 1 }, .{ ptrOf(g), ptrOf(row_sq), cols });
+        try self.launchBlocks(.total_f64, .{ 1, 1, 1 }, .{ ptrOf(row_sq), ptrOf(total), rows });
+        const target: f32 = @floatCast(@sqrt(@as(f64, @floatFromInt(@min(rows, cols)))));
+        try self.launch(.muon_renorm_f32, n, .{ ptrOf(g), ptrOf(total), target, n });
+
+        // Squares over the reduced dimension: per row when tall, per column when wide.
+        const reduced: u32 = @intCast(second.numel());
+        const sums = try self.scratch(2 * @as(usize, reduced));
+        if (by_row) {
+            try self.launchBlocks(.row_squares_f64, .{ rows, 1, 1 }, .{ ptrOf(g), ptrOf(sums), cols });
+        } else {
+            try self.launch(.col_squares_f64, cols, .{ ptrOf(g), ptrOf(sums), rows, cols });
+        }
+        const ratio = try self.scratch(1);
+        const red: f32 = @floatFromInt(if (by_row) cols else rows);
+        try self.launchBlocks(.normuon_stats_f32, .{ 1, 1, 1 }, .{ ptrOf(sums), ptrOf(second), ptrOf(ratio), reduced, red, params.beta2 });
+        try self.launch(.muon_update_f32, n, .{ ptrOf(p), ptrOf(g), ptrOf(second), ptrOf(ratio), params.lr, params.lr * params.weight_decay, cols, @as(u32, @intFromBool(by_row)), n });
     }
 
     // -------------------------------------------------------------------------
@@ -372,16 +755,27 @@ pub const CudaBackend = struct {
         return @call(.auto, @field(mod.CpuBackend, op), .{&self.cpu} ++ args);
     }
 
-    /// Launches `kernel` over `threads` threads (blocks of 256) with `args`
-    /// passed by address, as `cuLaunchKernel` wants.
+    /// Launches `kernel` over `threads` threads in blocks of `block_threads`.
     fn launch(self: *Self, kernel: Kernel, threads: u32, args: anytype) !void {
         if (threads == 0) return;
+        try self.launchBlocks(kernel, .{ (threads + block_threads - 1) / block_threads, 1, 1 }, args);
+    }
+
+    /// Launches `kernel` over a `grid` of `block_threads`-thread blocks, with
+    /// `args` passed by address as `cuLaunchKernel` wants.
+    fn launchBlocks(self: *Self, kernel: Kernel, grid: [3]u32, args: anytype) !void {
+        if (grid[0] == 0 or grid[1] == 0 or grid[2] == 0) return;
         try self.current();
-        var values = args;
-        var params: [values.len]?*anyopaque = undefined;
-        inline for (0..values.len) |i| params[i] = @ptrCast(&values[i]);
-        const block: u32 = 256;
-        self.check(self.driver.cuLaunchKernel(self.functions[@intFromEnum(kernel)], (threads + block - 1) / block, 1, 1, block, 1, 1, 0, self.stream, &params, null), "cuLaunchKernel") catch |err| {
+        // A runtime copy of the arguments: constants in `args` are comptime
+        // tuple fields, which have no address to hand the driver.
+        const fields = @typeInfo(@TypeOf(args)).@"struct".fields;
+        comptime var types: [fields.len]type = undefined;
+        inline for (fields, 0..) |f, i| types[i] = f.type;
+        var values: std.meta.Tuple(&types) = undefined;
+        inline for (0..fields.len) |i| values[i] = args[i];
+        var params: [fields.len]?*anyopaque = undefined;
+        inline for (0..fields.len) |i| params[i] = @ptrCast(&values[i]);
+        self.check(self.driver.cuLaunchKernel(self.functions[@intFromEnum(kernel)], grid[0], grid[1], grid[2], block_threads, 1, 1, 0, self.stream, &params, null), "cuLaunchKernel") catch |err| {
             log.warn("launching {t} failed", .{kernel});
             return err;
         };
@@ -406,6 +800,16 @@ pub const CudaBackend = struct {
 
     fn count(t: mod.Tensor) !u32 {
         return std.math.cast(u32, t.numel()) orelse error.TensorTooLarge;
+    }
+
+    fn rowCount(t: mod.Tensor) !u32 {
+        return std.math.cast(u32, t.shape.rows()) orelse error.TensorTooLarge;
+    }
+
+    /// Fails unless `values` holds one f32 per row of `rows_of`.
+    fn checkRowValues(values: mod.Tensor, rows_of: mod.Tensor) !void {
+        if (values.dtype != .f32) return error.DtypeMismatch;
+        if (values.numel() != rows_of.shape.rows()) return error.ShapeMismatch;
     }
 
     fn checkSame(x: mod.Tensor, y: mod.Tensor) !void {
