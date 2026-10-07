@@ -5,16 +5,28 @@ const mod = cli.nanogpt;
 
 pub const JobState = enum { idle, running, succeeded, failed };
 
-/// A validation result, for the training view.
-pub const EvalPoint = struct { step: usize, bpb: f64 };
+/// A validation result, for the training view: bpb (base, SFT) or pass@1 (RL).
+pub const EvalPoint = struct { step: usize, value: f64 };
 
-/// What the console draws for a training job, copied out under the lock.
+/// The latest `onProgress`: `done` of `total` units of `label`.
+pub const JobProgress = struct {
+    label: []const u8,
+    done: usize,
+    total: usize,
+};
+
+/// What the console draws for a job, copied out under the lock.
 pub const TrainSnapshot = struct {
     report: ?mod.StepReport = null,
     losses: []const f32 = &.{},
     evals: []const EvalPoint = &.{},
     samples: []const []const u8 = &.{},
     sample_step: usize = 0,
+    /// RL: the last step and every step's mean reward.
+    rl_report: ?mod.RlStepReport = null,
+    rewards: []const f32 = &.{},
+    /// Work inside the job (an eval, a step's rollouts), while it runs.
+    progress: ?JobProgress = null,
 };
 
 /// Log bytes kept per job; older output is dropped from the front.
@@ -48,6 +60,11 @@ pub const Job = struct {
     samples: std.ArrayList([]u8) = .empty,
     sample_step: usize = 0,
     report: ?mod.StepReport = null,
+    rewards: std.ArrayList(f32) = .empty,
+    rl_report: ?mod.RlStepReport = null,
+    /// The latest progress; `progress_label` holds its label (cut to fit).
+    progress: ?JobProgress = null,
+    progress_label: [64]u8 = undefined,
 
     /// Creates an idle job; it must stay at this address (the writer points into it).
     ///
@@ -73,6 +90,7 @@ pub const Job = struct {
         if (self.thread) |t| t.join();
         self.clearHistory();
         self.samples.deinit(self.allocator);
+        self.rewards.deinit(self.allocator);
         self.evals.deinit(self.allocator);
         self.losses.deinit(self.allocator);
         self.text.deinit(self.allocator);
@@ -170,18 +188,22 @@ pub const Job = struct {
         defer self.unlock();
         const samples = try allocator.alloc([]const u8, self.samples.items.len);
         for (self.samples.items, samples) |s, *d| d.* = try allocator.dupe(u8, s);
+        const progress: ?JobProgress = if (self.progress) |p| .{ .label = try allocator.dupe(u8, p.label), .done = p.done, .total = p.total } else null;
         return .{
             .report = self.report,
             .losses = try allocator.dupe(f32, self.losses.items),
             .evals = try allocator.dupe(EvalPoint, self.evals.items),
             .samples = samples,
             .sample_step = self.sample_step,
+            .rl_report = self.rl_report,
+            .rewards = try allocator.dupe(f32, self.rewards.items),
+            .progress = if (self.state == .running) progress else null,
         };
     }
 
     /// The trainer hooks feeding this job.
     pub fn observer(self: *Self) mod.TrainObserver {
-        return .{ .context = self, .onStep = onStep, .onEval = onEval, .onSample = onSample, .shouldStop = shouldStop };
+        return .{ .context = self, .onStep = onStep, .onEval = onEval, .onSample = onSample, .shouldStop = shouldStop, .onProgress = onProgress, .onRlStep = onRlStep };
     }
 
     fn worker(self: *Self, process: std.process.Init, command: cli.Command, args: []const []const u8) void {
@@ -206,13 +228,33 @@ pub const Job = struct {
         defer self.unlock();
         self.losses.append(self.allocator, @floatCast(report.loss)) catch |err| log.debug("loss history [{t}]", .{err});
         self.report = report;
+        self.progress = null;
+    }
+
+    fn onRlStep(context: *anyopaque, report: mod.RlStepReport) void {
+        const self: *Self = @ptrCast(@alignCast(context));
+        self.lock();
+        defer self.unlock();
+        self.rewards.append(self.allocator, @floatCast(report.reward)) catch |err| log.debug("reward history [{t}]", .{err});
+        self.rl_report = report;
+        self.progress = null;
+    }
+
+    fn onProgress(context: *anyopaque, label: []const u8, done: usize, total: usize) void {
+        const self: *Self = @ptrCast(@alignCast(context));
+        self.lock();
+        defer self.unlock();
+        const n = @min(label.len, self.progress_label.len);
+        @memcpy(self.progress_label[0..n], label[0..n]);
+        self.progress = .{ .label = self.progress_label[0..n], .done = done, .total = total };
     }
 
     fn onEval(context: *anyopaque, step: usize, bpb: f64) void {
         const self: *Self = @ptrCast(@alignCast(context));
         self.lock();
         defer self.unlock();
-        self.evals.append(self.allocator, .{ .step = step, .bpb = bpb }) catch |err| log.debug("eval history [{t}]", .{err});
+        self.evals.append(self.allocator, .{ .step = step, .value = bpb }) catch |err| log.debug("eval history [{t}]", .{err});
+        self.progress = null;
     }
 
     fn onSample(context: *anyopaque, step: usize, text: []const u8) void {
@@ -266,7 +308,10 @@ pub const Job = struct {
         self.samples.clearRetainingCapacity();
         self.evals.clearRetainingCapacity();
         self.losses.clearRetainingCapacity();
+        self.rewards.clearRetainingCapacity();
         self.report = null;
+        self.rl_report = null;
+        self.progress = null;
         self.sample_step = 0;
     }
 

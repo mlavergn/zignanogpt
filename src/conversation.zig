@@ -39,8 +39,19 @@ pub const Conversation = struct {
     pub fn fromJson(arena: std.mem.Allocator, value: std.json.Value) !Self {
         const messages_json = (if (value == .object) value.object.get("messages") else null) orelse return invalid("no messages");
         if (messages_json != .array) return invalid("messages is not an array");
-        const messages = try arena.alloc(Message, messages_json.array.items.len);
-        for (messages_json.array.items, messages) |m, *out| {
+        return fromMessages(arena, messages_json.array.items);
+    }
+
+    /// Converts a JSON array of `{role, content}` messages, borrowing strings.
+    ///
+    /// Parameters:
+    /// - `arena`: holds the message array.
+    /// - `list`: the messages.
+    ///
+    /// Return: the conversation; `error.InvalidConversation` on a malformed message.
+    pub fn fromMessages(arena: std.mem.Allocator, list: []const std.json.Value) !Self {
+        const messages = try arena.alloc(Message, list.len);
+        for (list, messages) |m, *out| {
             if (m != .object) return invalid("message is not an object");
             const role_json = m.object.get("role") orelse return invalid("message without role");
             const content = m.object.get("content") orelse return invalid("message without content");
@@ -64,6 +75,30 @@ pub const Conversation = struct {
             }
         }
         return Self{ .messages = messages };
+    }
+
+    /// Why the conversation cannot be trained on, or null when it can: an
+    /// optional system message first (followed by a user message), then user
+    /// and assistant messages alternating from the user, at least one reply;
+    /// only assistant messages may have parts.
+    ///
+    /// Parameters:
+    /// - `self`: the conversation.
+    ///
+    /// Return: the reason, or null.
+    pub fn problem(self: Self) ?[]const u8 {
+        var messages = self.messages;
+        if (messages.len > 0 and messages[0].role == .system) {
+            if (messages[0].content != .text) return "the system message must be text";
+            messages = messages[1..];
+        }
+        if (messages.len < 2) return "needs a user message and an assistant reply";
+        for (messages, 0..) |m, i| {
+            const want: Role = if (i % 2 == 0) .user else .assistant;
+            if (m.role != want) return if (want == .user) "messages must alternate user, assistant, starting with user" else "messages must alternate user, assistant";
+            if (m.role == .user and m.content != .text) return "user messages must be text";
+        }
+        return null;
     }
 
     fn invalid(reason: []const u8) error{InvalidConversation} {

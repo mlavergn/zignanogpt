@@ -21,6 +21,8 @@ pub const CoreEval = struct {
     allocator: std.mem.Allocator,
     model: *mod.Gpt,
     tokenizer: *const mod.Tokenizer,
+    /// Receives each example's progress, or null.
+    observer: ?mod.TrainObserver = null,
 
     pub fn init(allocator: std.mem.Allocator, model: *mod.Gpt, tokenizer: *const mod.Tokenizer) Self {
         return .{ .allocator = allocator, .model = model, .tokenizer = tokenizer };
@@ -48,6 +50,7 @@ pub const CoreEval = struct {
         defer arena.deinit();
         var correct: usize = 0;
         for (0..n) |i| {
+            mod.TrainObserver.progress(self.observer, task.label, i, n);
             _ = arena.reset(.retain_capacity);
             if (try self.evaluateExample(arena.allocator(), task, data[0..n], i)) correct += 1;
         }

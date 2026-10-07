@@ -40,7 +40,7 @@ pub const ChatEval = struct {
     /// Receives `\r` progress lines, or null.
     progress: ?*std.Io.Writer = null,
     /// Checked between problems (training's ChatCORE): a stop request ends the
-    /// task with `error.Stopped`.
+    /// task with `error.Stopped`. Also receives each problem's progress.
     observer: ?mod.TrainObserver = null,
 
     pub fn init(allocator: std.mem.Allocator, model: *mod.Gpt, tokenizer: *const mod.Tokenizer) Self {
@@ -97,7 +97,7 @@ pub const ChatEval = struct {
             }
             if (try task.evaluate(a, i, letters[best.?])) result.passed += 1;
             result.total += 1;
-            try self.report(result);
+            try self.report(result, n);
         }
         return result;
     }
@@ -128,7 +128,7 @@ pub const ChatEval = struct {
             }
             if (passed) result.passed += 1;
             result.total += 1;
-            try self.report(result);
+            try self.report(result, n);
         }
         return result;
     }
@@ -150,7 +150,8 @@ pub const ChatEval = struct {
         try be.download(bufs.logits, f32, out);
     }
 
-    fn report(self: *Self, r: EvalResult) !void {
+    fn report(self: *Self, r: EvalResult, n: usize) !void {
+        mod.TrainObserver.progress(self.observer, r.kind.name(), r.total, n);
         const w = self.progress orelse return;
         try w.print("\r\x1b[K{s} | {d}/{d} ({d:.2}%)", .{ r.kind.name(), r.passed, r.total, 100 * r.accuracy() });
         try w.flush();
@@ -169,7 +170,7 @@ pub const ChatEval = struct {
         for (results) |r| {
             const baseline: f64 = switch (r.kind) {
                 .mmlu, .arc_easy, .arc_challenge => 0.25,
-                .gsm8k, .smoltalk => 0,
+                .gsm8k, .smoltalk, .custom => 0,
             };
             sum += (r.accuracy() - baseline) / (1 - baseline);
         }

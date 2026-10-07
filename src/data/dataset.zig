@@ -2,16 +2,19 @@ const std = @import("std");
 const log = std.log.scoped(.zignanogpt_dataset);
 const mod = @import("../module.zig");
 
-/// The pretraining shards (nanochat's `dataset.py`): ClimbMix-400B as
-/// `shard_00000.parquet` .. `shard_06542.parquet`, the last one the
-/// validation split. Shards live in `<base dir>/base_data_climbmix`; a shard
-/// already in the Python nanochat directory is used from there, never copied.
+/// The pretraining shards (nanochat's `dataset.py`): `shard_NNNNN.parquet`
+/// files with a `text` column, sorted by name, the last one the validation
+/// split. A dataset is named: `climbmix` (the default) is ClimbMix-400B as
+/// `shard_00000` .. `shard_06542`, downloaded by `download`; others are made by
+/// `repackage`. Shards live in `<base dir>/base_data_<name>`; a shard already
+/// in the Python nanochat directory is used from there, never copied.
 pub const Dataset = struct {
     const Self = @This();
 
     /// The last shard; always the validation split.
     pub const max_shard = 6542;
-    pub const dir_name = "base_data_climbmix";
+    /// The dataset `download` fetches and every command reads by default.
+    pub const default_name = "climbmix";
     /// Download attempts per shard, with 2^attempt seconds between them.
     pub const max_attempts = 5;
 
@@ -24,25 +27,82 @@ pub const Dataset = struct {
     nanochat_dir: []const u8,
     url: []const u8,
 
-    /// Resolves the shard directories from a config.
+    /// Resolves a dataset's shard directories from a config.
     ///
     /// Parameters:
     /// - `allocator`: owns the paths.
     /// - `io`: for storage and downloads.
     /// - `config`: base directories and the data URL (borrowed).
+    /// - `name`: the dataset (`default_name` for ClimbMix).
     ///
-    /// Return: the dataset; allocation errors.
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: *const mod.Config) !Self {
+    /// Return: the dataset; `error.InvalidDatasetName`, allocation errors.
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: *const mod.Config, name: []const u8) !Self {
         log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
-        const dir = try std.fs.path.join(allocator, &.{ config.base_dir, dir_name });
+        const dir = try directory(allocator, config.base_dir, name);
         errdefer allocator.free(dir);
-        const nanochat_dir = try std.fs.path.join(allocator, &.{ config.nanochat_dir, dir_name });
+        const nanochat_dir = try directory(allocator, config.nanochat_dir, name);
         return Self{ .allocator = allocator, .io = io, .storage = mod.Storage.init(allocator, io), .dir = dir, .nanochat_dir = nanochat_dir, .url = config.data_url };
     }
 
     pub fn deinit(self: *Self) void {
         self.allocator.free(self.nanochat_dir);
         self.allocator.free(self.dir);
+    }
+
+    /// Whether `name` can name a dataset: 1-64 of `A-Z a-z 0-9 _ -`.
+    pub fn validName(name: []const u8) bool {
+        if (name.len == 0 or name.len > 64) return false;
+        for (name) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) return false;
+        return true;
+    }
+
+    /// A dataset's directory under a base directory: `<base>/base_data_<name>`.
+    ///
+    /// Parameters:
+    /// - `allocator`: owns the result.
+    /// - `base`: the base directory.
+    /// - `name`: the dataset.
+    ///
+    /// Return: the path; `error.InvalidDatasetName`, allocation errors.
+    pub fn directory(allocator: std.mem.Allocator, base: []const u8, name: []const u8) ![]u8 {
+        if (!validName(name)) {
+            log.warn("invalid dataset name '{s}': use 1-64 letters, digits, '_' or '-'", .{name});
+            return error.InvalidDatasetName;
+        }
+        const leaf = try std.fmt.allocPrint(allocator, "base_data_{s}", .{name});
+        defer allocator.free(leaf);
+        return std.fs.path.join(allocator, &.{ base, leaf });
+    }
+
+    /// The datasets under a base directory (`base_data_<name>` directories).
+    ///
+    /// Parameters:
+    /// - `allocator`: owns the result (each name and the list).
+    /// - `storage`: the file helper.
+    /// - `base`: the base directory.
+    ///
+    /// Return: the names, sorted; empty when `base` is missing; storage errors.
+    pub fn names(allocator: std.mem.Allocator, storage: mod.Storage, base: []const u8) ![][]const u8 {
+        const entries = storage.list(allocator, base) catch |err| switch (err) {
+            error.NotFound => return &.{},
+            else => return err,
+        };
+        defer {
+            for (entries) |e| allocator.free(e);
+            allocator.free(entries);
+        }
+        var out: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (out.items) |n| allocator.free(n);
+            out.deinit(allocator);
+        }
+        for (entries) |e| {
+            if (!std.mem.endsWith(u8, e, "/")) continue;
+            const leaf = std.fs.path.basename(std.mem.trimEnd(u8, e, "/"));
+            if (!std.mem.startsWith(u8, leaf, "base_data_") or !validName(leaf["base_data_".len..])) continue;
+            try out.append(allocator, try allocator.dupe(u8, leaf["base_data_".len..]));
+        }
+        return out.toOwnedSlice(allocator);
     }
 
     /// `shard_NNNNN.parquet`.
@@ -159,7 +219,8 @@ test "dataset lists shards from both directories, sorted, without duplicates" {
     const py_dir = try std.fs.path.join(allocator, &.{ root, "py" });
     defer allocator.free(py_dir);
     const config = mod.Config{ .allocator = allocator, .base_dir = zig_dir, .nanochat_dir = py_dir, .data_url = "http://unused" };
-    var dataset = try mod.Dataset.init(allocator, std.testing.io, &config);
+    try std.testing.expectError(error.InvalidDatasetName, mod.Dataset.init(allocator, std.testing.io, &config, "../up"));
+    var dataset = try mod.Dataset.init(allocator, std.testing.io, &config, mod.Dataset.default_name);
     defer dataset.deinit();
     const paths = try dataset.list(allocator);
     defer {

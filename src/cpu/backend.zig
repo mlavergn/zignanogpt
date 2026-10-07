@@ -341,6 +341,43 @@ pub const CpuBackend = struct {
         try self.rotate(dx, dy, cos, sin, pos0, -1);
     }
 
+    /// Attention's query/key normalization: rotates `x` in place (`rope`),
+    /// then `out = gain * rmsnorm(x)`. Rotation keeps each row's norm, so GPU
+    /// backends do it in one pass per row; the CPU runs the three ops.
+    ///
+    /// Parameters:
+    /// - `self`: the backend.
+    /// - `out`: same shape as `x`; may alias it (then `x` ends normalized).
+    /// - `x`: `[B, T, H, D]`, `D` even; rotated in place.
+    /// - `cos`: `[Tmax, D / 2]`.
+    /// - `sin`: `[Tmax, D / 2]`.
+    /// - `pos0`: the position of `t = 0`.
+    /// - `eps`: the norm's epsilon.
+    /// - `gain`: multiplies the normalized rows (nanochat's 1.2).
+    ///
+    /// Return: nothing; shape/dtype errors, `error.OutOfBounds` past `Tmax`.
+    pub fn ropeNorm(self: *Self, out: mod.Tensor, x: mod.Tensor, cos: mod.Tensor, sin: mod.Tensor, pos0: usize, eps: f32, gain: f32) !void {
+        try self.rope(x, x, cos, sin, pos0);
+        try self.rmsnorm(out, x, eps);
+        try self.scale(out, out, gain);
+    }
+
+    /// Backward of `ropeNorm`: `dx = ropeBackward(rmsnormBackward(gain * dy, x))`.
+    ///
+    /// Parameters:
+    /// - `self`: the backend.
+    /// - `dx`: same shape as `x`; may alias `dy`.
+    /// - `dy`: the output gradient.
+    /// - `x`: the rotated input `ropeNorm` left (the norm's input).
+    /// - `cos`, `sin`, `pos0`, `eps`, `gain`: as in the forward pass.
+    ///
+    /// Return: nothing; shape/dtype errors, `error.OutOfBounds` past `Tmax`.
+    pub fn ropeNormBackward(self: *Self, dx: mod.Tensor, dy: mod.Tensor, x: mod.Tensor, cos: mod.Tensor, sin: mod.Tensor, pos0: usize, eps: f32, gain: f32) !void {
+        try self.scale(dx, dy, gain);
+        try self.rmsnormBackward(dx, dx, x, eps, false);
+        try self.ropeBackward(dx, dx, cos, sin, pos0);
+    }
+
     /// Shared body of `rope` (`sign = 1`) and its inverse (`sign = -1`).
     fn rotate(self: *Self, out: mod.Tensor, x: mod.Tensor, cos: mod.Tensor, sin: mod.Tensor, pos0: usize, sign: f32) !void {
         try checkSame(out, x);

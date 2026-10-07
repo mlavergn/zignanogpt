@@ -5,9 +5,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A port of Karpathy's **nanochat** (tokenizer, pretraining, SFT/RL, eval, inference for a
-GPT-2-class chat model) to Zig 0.16. **`PLAN.md` is the source of truth** for scope, phases,
-and every design decision (resolved Q1–Q25); read it before starting a phase. Each phase
-records its status there; the CLI's pipeline commands print which phase implements them.
+GPT-2-class chat model) to Zig 0.16. The port is complete, and so is the first work beyond it
+(console progress, `infer-bench`, `repackage` and named datasets, custom SFT conversations).
+There is no active plan: a new `PLAN.md`, when written, is the source of truth for its scope
+and phases (a command not built yet prints its phase, `Command.phase`). The port's plan
+(phases 0–13, decisions Q1–Q26) is in git history (`git log -- PLAN.md`). Measured baselines
+and open checks are under **Status** below.
 
 It follows the sibling `../zigmicrogpt` (a Zig port of `microgpt`); read that repo's
 `CLAUDE.md` for the inherited conventions.
@@ -33,8 +36,8 @@ every git operation. Finish a phase at a green `make validate` and report.
 | `nanochat/` | Git submodule (`karpathy/nanochat`): the Python/PyTorch reference. **Read-only upstream; never edit it.** |
 | `src/` | The library: the core nanochat port (model, optimizer, tokenizer, data, training, inference, evals). `module.zig` is the barrel and the `zig build test` root; `root.zig` exists only for `zig build docs`. Supporting plug-ins live in subdirectories |
 | `src/cpu/` | The CPU backend: `backend.zig`, `matmul.zig`, `attention.zig`, `attention_backward.zig`, `math.zig`, `parallel.zig` |
-| `src/data/` | Data I/O: `storage.zig` (file read/write), pretraining shards (`dataset`, `document_stream`, `text_dataset`), Hugging Face downloads (`hub_dataset`), checkpoints and `.pt` import, the CORE eval bundle |
-| `src/formats/` | File-format readers and writers: Parquet (+ Thrift, Snappy), safetensors, zip, pickle |
+| `src/data/` | Data I/O: `storage.zig` (file read/write), pretraining shards (`dataset`, `document_stream`, `text_dataset`, `repackager`), Hugging Face downloads (`hub_dataset`), checkpoints and `.pt` import, the CORE eval bundle |
+| `src/formats/` | File-format readers and writers: Parquet (+ Thrift, Snappy; read and write), safetensors, zip, pickle |
 | `src/metal/` | The Metal backend: `backend.zig`, `objc.zig` (Objective-C runtime), MSL `kernels.metal` and `reduce.metal` |
 | `src/cuda/` | The CUDA backend: `backend.zig` and `kernels.zig` (Zig compiled to PTX by `build.zig`) |
 | `cli/` | The `zignanogpt` executable: `main.zig` (entry), `module.zig` (barrel + test root), `command.zig` (subcommands) |
@@ -106,10 +109,10 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   256-thread blocks (the block reductions assume a multiple of 32); `launchBlocks` copies the
   arguments into a runtime tuple (constants are comptime fields with no address). A new CUDA
   kernel needs its name in both `Kernel` (backend) and the `@export` list. The CUDA backend
-  has never run: see PLAN.md's DGX bring-up checklist before trusting it. `make test` runs the suite
+  has never run: see the DGX bring-up checklist under **Status** before trusting it. `make test` runs the suite
   on the detected backend and `make test-cpu` on the CPU (`make validate` runs both); `make cuda`
   cross-compiles the CUDA build (no GPU to run it on yet).
-- Run `make bench` after touching `CpuMatmul`; phase 1 baseline on an M5 Max is in PLAN.md.
+- Run `make bench` after touching `CpuMatmul`; the M5 Max baseline is under **Status**.
   A with at most 4 rows times a transposed B (decoding) takes a separate matrix-vector path
   (column blocks, contiguous SIMD dots); the bench's `decode` cases cover it.
 
@@ -139,12 +142,18 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
 - `Tokenizer` = tiktoken semantics (rank by merged bytes, leftmost lowest rank);
   `TokenizerTrainer` = rustbpe (count desc, then smaller pair). Specials follow the ranks.
 - CLI options go through `cli/args.zig` (`Args`): every flag must be consumed, `finish`
-  rejects typos. User-facing problems log at `warn` (tests fail on `log.err`).
-- `Storage` (src/data/storage.zig) is the one place files are read/written (zigstorage, atomic).
+  rejects typos. `strings` reads a repeatable option; `positionals` takes the bare arguments
+  (call it after every option). User-facing problems log at `warn` (tests fail on `log.err`).
+- `Storage` (src/data/storage.zig) is the one place files are read/written (zigstorage, atomic):
+  whole files, ranges, listings, and `create` -> `StorageSession` (append in pieces, `save`
+  commits atomically, `deinit` without `save` discards) for files too large to build in memory.
 
 ## Data
 
-- `Dataset` lists/downloads ClimbMix shards (`shard_NNNNN.parquet`, last = val);
+- `Dataset` is a named shard set in `<base>/base_data_<name>` (`shard_NNNNN.parquet`, one `text`
+  column, sorted, last = val): `climbmix` (default; `download` fetches it) or one made by
+  `repackage` (`Repackager`: text/JSONL/Parquet in, two-pass bucket shuffle, `ParquetWriter`
+  shards out, Snappy). `--dataset <name>` selects it in `train`, `tok-train`, `tok-eval`, `eval`.
   `DocumentStream` is nanochat's `_document_batches` as a state machine (files -> row groups ->
   batches, epochs, resume skips to the row group after the saved one); `DataLoader` is the
   BOS-aligned best-fit packer. Its doc buffer must stay ordered (`orderedRemove`): selection
@@ -186,6 +195,9 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   RNG); `testdata/engine.json` (fixture group `engine`) pins greedy tokens and calculator results.
 - `Calculator` replaces Python `eval` for exactly what `use_calculator`'s filter admits; keep
   its output byte-identical to Python's `str()` (the fixture lists edge cases).
+- `infer-bench` (`cli/infer_bench.zig`) is `scripts/infer_bench.py`; its cost model is
+  `GptConfig.decodeFlops`/`prefillFlops`/`kvReadBytes` (pinned to the script's numbers). The
+  device's peaks come from `--peak-bandwidth`/`--peak-flops`; without them MBU/MFU print `-`.
 - `LoadedModel` loads `<base>/<kind>_checkpoints/<tag>/model_<step>.safetensors` + the
   tokenizer; it must not move after `init` (config strings live in its arena). `ChatSession`
   is `chat_cli.py`'s conversation; `cli/chat.zig` (CLI) and `cli/chat_job.zig` (console) both
@@ -199,7 +211,10 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   (CPython's MT19937). Changes must keep `testdata/tasks.json` and `core.json` passing.
 - Fixtures under `testdata/task_base/task_data` are real slices in `load_hub_dataset`'s
   layout; tests point `Config.base_dir` (or `nanochat_dir`, the read-only fallback) at them.
-- `SftLoader` caps renders at `min(2048, seq + 1)` (PLAN.md phase 10): the `sft` fixture runs
+- `sft --conversations <file.jsonl>` adds your own conversations (`ConversationFile`, checked
+  per line by `Conversation.problem`) to the training mixture as a `TaskKind.custom` task
+  (`Task.fromConversations`; training only, it has no evaluation).
+- `SftLoader` caps renders at `min(2048, seq + 1)` (a deliberate deviation): the `sft` fixture runs
   nanochat's chat_sft.py through `runpy` with that one patch and `Task.__len__` clamped.
 - `CoreEval` renders nanochat's three Jinja templates by hand (few-shot blocks joined by
   a blank line, `trim` = Python `str.strip`); `../zigjinja` exists if general templates are needed.
@@ -213,8 +228,14 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   line of live keys. Built on zigtui components (`cli.tui`): `SplitPane` (titles, rules, the
   draggable divider), `StatusLine`, `StatusMark` (job/chat state), `Form` + `LineInput` (the
   operation forms, the chat input), `ProgressBar`, `Sparkline` (loss curve) and `TranscriptView` (chat,
-  job log); colors by `tui.Theme` role. `ConsoleApp` is the root widget; its panes are draw-only
-  `PaneView`s. Generic UI belongs in zigtui (shared), not in `cli/`.
+  job log), with `TextBlock` (lines of spans) and `Column` (stacked widgets) for layout and
+  `Session.run` for the terminal; colors by `tui.Theme` role. `ConsoleApp` is the root widget;
+  its panes are draw-only `PaneView`s whose builders return frame-arena widgets. Those widgets
+  draw after the builder returns, so every row they hold must live in the arena (`a.dupe` a
+  literal with runtime values; a stack temporary renders as a blank line). The console uses
+  zigtui's top-level types (`tui.Surface`, `tui.DrawContext`, ...); the only `tui.vxfw` name
+  left is `vxfw.Event` in the root handler (zigtui keeps it qualified: its `Event` is vaxis's).
+  Generic UI belongs in zigtui (shared), not in `cli/`.
 - `Operation.all` is the left pane, in pipeline order: each entry is a `Command` plus form
   `Field`s that map to its flags (`Operation.args`). An entry can run a second command
   (`alternate`, chosen by a field's value) with per-command fields (`Field.only`): Evaluate runs
@@ -226,7 +247,10 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   the form only knows long names); `-p` or `--no-tui` stay line-based.
 - `Job` runs one command on a worker thread through `Runner.execute` (the same dispatch the
   CLI uses), writing to a mutex-guarded log via a `std.Io.Writer`; training feeds it through
-  `TrainObserver`. While the console holds the terminal, `std.log` goes into the job's log
+  `TrainObserver` (steps, RL steps, evals, samples). Long work in any command reports
+  `TrainObserver.progress(observer, label, done, total)`; the job keeps the latest and the
+  console draws it as a bar above the output. A command that loops for long takes the observer
+  (`Runner` passes it) and reports from its loop. While the console holds the terminal, `std.log` goes into the job's log
   (`Console.captureLog`, wired in `main.zig`'s `logFn`). Quitting during training stops and
   saves; other running jobs are abandoned to the process exit (never freed under the thread).
 - Tests drive `ConsoleApp` headlessly (`handleEvent` with key presses, `draw` into a vxfw
@@ -278,3 +302,31 @@ one primary type per file named for its role (no prefix), import siblings only t
 `module.zig`, scoped logger `.zignanogpt_<file>`, `log.debug` entry trace on non-hot
 functions, doc comments with Parameters/Return, tests at the bottom under `// Unit Tests`.
 Executables set `std_options.log_level = .info`, which compiles the traces out.
+
+## Status
+
+- Measured baselines (M5 Max, 128 GB); quote only measured numbers:
+  - `make bench` (CPU matmul, 18 threads): 80–86 GFLOP/s per core, 0.6–1.1 TFLOP/s total;
+    decode matrix-vector 112–138 GFLOP/s at d20 sizes.
+  - Training step, CPU preset (d6, 32 x 512): CPU backend 3.68 s (PyTorch CPU 2.95 s);
+    Metal 0.244 s, ~66K tok/s (PyTorch MPS 0.26 s). `make train-bench` reproduces it.
+  - `infer-bench` on Metal (d6 base, step 201, 400-token prompt, 64 decode tokens): prefill
+    69,679 tok/s; decode 612 tok/s at batch 1 (TPOT 1.63 ms), 4,108 at 8, 8,077 at 32.
+  - `repackage`: one ClimbMix shard (86,016 documents, 253M characters) in 2.7 s, 267 MB peak;
+    two shards through disk buckets (`--bucket-mib 64`) in 5.3 s, 200 MB peak. Snappy shards
+    are ~1.6x the size of nanochat's zstd ones (std has no zstd encoder).
+- Still to check by hand: the console in a real terminal (every page, the progress bar, the RL
+  view, Prepare data, the dataset and conversation fields); the web page in a browser.
+- Out of scope: FP8, FA3, DDP, wandb, HumanEval (needs a Python sandbox), notebooks, bf16
+  compute, GPT-2 token decoding for ClimbMix's raw source.
+- DGX bring-up checklist (CUDA has never run; native on DGX OS):
+  1. `zig build`, then `./zig-out/bin/zignanogpt version` says `cuda backend`.
+  2. `make test`: the conformance suite and the PyTorch parity fixtures on CUDA. First
+     suspects on failure: the inline PTX (`src/cuda/kernels.zig`, validated only by the
+     driver's JIT), block-size assumptions (256 threads, multiple of 32), the `AttnDims`
+     byval parameter.
+  3. `make train-bench` against PyTorch CUDA on the same Spark (nanochat's `base_train.py`,
+     same d6 settings), and the Mac's Metal number.
+  4. Speed, measured there: TF32 tensor-core matmul (`mma.sync`), flash-style attention,
+     host-readable ids without a sync (GB10 has concurrent managed access), stream-ordered
+     scratch (`cuMemAllocAsync`) instead of managed allocations per op.

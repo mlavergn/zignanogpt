@@ -28,7 +28,7 @@ pub const ChatEval = struct {
     /// - `out`: progress and results.
     ///
     /// Return: the exit code; loading and evaluation errors.
-    pub fn run(init: std.process.Init, args: *cli.Args, out: *std.Io.Writer) !u8 {
+    pub fn run(init: std.process.Init, args: *cli.Args, out: *std.Io.Writer, observer: ?mod.TrainObserver) !u8 {
         log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
         if (args.flag("help")) {
             try out.writeAll(usage);
@@ -49,8 +49,8 @@ pub const ChatEval = struct {
                     try out.print("unknown task: {s} (ARC-Easy, ARC-Challenge, MMLU, GSM8K)\n", .{name});
                     return 2;
                 };
-                if (kind == .smoltalk) {
-                    try out.writeAll("SmolTalk has no evaluation\n");
+                if (kind == .smoltalk or kind == .custom) {
+                    try out.print("{s} has no evaluation\n", .{kind.name()});
                     return 2;
                 }
                 try kinds.append(allocator, kind);
@@ -68,6 +68,7 @@ pub const ChatEval = struct {
 
         var eval = mod.ChatEval.init(allocator, &loaded.model, &loaded.tokenizer);
         eval.progress = out;
+        eval.observer = observer;
         var results: std.ArrayList(mod.EvalResult) = .empty;
         defer results.deinit(allocator);
         for (kinds.items) |kind| {

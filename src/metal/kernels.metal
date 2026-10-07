@@ -242,6 +242,79 @@ kernel void rope_f32(device float* out [[buffer(0)]], device const float* x [[bu
     out[base + p.half_d + j] = x2 * c - x1 * s;
 }
 
+struct RopeNormArgs {
+    uint t;
+    uint h;
+    uint half_d;
+    uint pos0;
+    float eps;
+    float gain;
+};
+
+// rope_norm: one threadgroup per [B, T, H] row. Rotates x in place, then
+// out = gain * x / rms(x) (rotation keeps the row's norm, so one pass serves).
+// out may alias x: each thread reads and writes only its own pairs.
+kernel void rope_norm_f32(device float* out [[buffer(0)]], device float* x [[buffer(1)]], device const float* cos_t [[buffer(2)]],
+                          device const float* sin_t [[buffer(3)]], constant RopeNormArgs& p [[buffer(4)]],
+                          uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float shared[32];
+    const uint pos = p.pos0 + (row / p.h) % p.t;
+    device float* xr = x + row * 2 * p.half_d;
+    device float* o = out + row * 2 * p.half_d;
+    float sq = 0.0f;
+    for (uint j = tid; j < p.half_d; j += threads) {
+        const float c = cos_t[pos * p.half_d + j], s = sin_t[pos * p.half_d + j];
+        const float x1 = xr[j], x2 = xr[p.half_d + j];
+        const float r1 = x1 * c + x2 * s, r2 = x2 * c - x1 * s;
+        xr[j] = r1;
+        xr[p.half_d + j] = r2;
+        sq += r1 * r1 + r2 * r2;
+    }
+    const float total = block_sum(sq, shared, tid, lane, sg, (threads + 31) / 32);
+    const float inv = 1.0f / sqrt(total / float(2 * p.half_d) + p.eps);
+    for (uint j = tid; j < p.half_d; j += threads) {
+        const float r1 = xr[j], r2 = xr[p.half_d + j];
+        o[j] = (r1 * inv) * p.gain;
+        o[p.half_d + j] = (r2 * inv) * p.gain;
+    }
+}
+
+// Backward of rope_norm: dx = rope^-1(rmsnorm_backward(gain * dy, x)), x the
+// rotated input. dx may alias dy: the sums finish (barrier) before any write,
+// and each thread writes only the pairs it read.
+kernel void rope_norm_backward_f32(device float* dx [[buffer(0)]], device const float* dy [[buffer(1)]], device const float* x [[buffer(2)]],
+                                   device const float* cos_t [[buffer(3)]], device const float* sin_t [[buffer(4)]], constant RopeNormArgs& p [[buffer(5)]],
+                                   uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]],
+                                   uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float shared[32];
+    const uint pos = p.pos0 + (row / p.h) % p.t;
+    device const float* xr = x + row * 2 * p.half_d;
+    device const float* gr = dy + row * 2 * p.half_d;
+    float sq = 0.0f, gx = 0.0f;
+    for (uint j = tid; j < p.half_d; j += threads) {
+        const float x1 = xr[j], x2 = xr[p.half_d + j];
+        const float g1 = gr[j] * p.gain, g2 = gr[p.half_d + j] * p.gain;
+        sq += x1 * x1 + x2 * x2;
+        gx += g1 * x1 + g2 * x2;
+    }
+    const uint groups = (threads + 31) / 32;
+    const float sq_total = block_sum(sq, shared, tid, lane, sg, groups);
+    const float gx_total = block_sum(gx, shared, tid, lane, sg, groups);
+    const float n = float(2 * p.half_d);
+    const float inv = 1.0f / sqrt(sq_total / n + p.eps);
+    const float k = inv * inv * inv * gx_total / n;
+    device float* out = dx + row * 2 * p.half_d;
+    for (uint j = tid; j < p.half_d; j += threads) {
+        const float x1 = xr[j], x2 = xr[p.half_d + j];
+        const float d1 = inv * (gr[j] * p.gain) - x1 * k;
+        const float d2 = inv * (gr[p.half_d + j] * p.gain) - x2 * k;
+        const float c = cos_t[pos * p.half_d + j], s = -sin_t[pos * p.half_d + j];
+        out[j] = d1 * c + d2 * s;
+        out[p.half_d + j] = d2 * c - d1 * s;
+    }
+}
+
 struct GateArgs {
     uint cols;
     uint cin;

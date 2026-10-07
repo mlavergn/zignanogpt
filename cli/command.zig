@@ -11,6 +11,7 @@ pub const Command = enum {
     version,
     config,
     download,
+    repackage,
     @"tok-train",
     @"tok-eval",
     train,
@@ -20,6 +21,7 @@ pub const Command = enum {
     sft,
     @"chat-eval",
     rl,
+    @"infer-bench",
 
     /// Looks up a subcommand by its command-line name.
     ///
@@ -42,7 +44,7 @@ pub const Command = enum {
     /// Return: the phase number, or null when the command already works.
     pub fn phase(self: Self) ?u8 {
         return switch (self) {
-            .help, .tui, .version, .config, .@"tok-train", .@"tok-eval", .download, .import, .train, .chat, .@"chat-eval", .sft, .eval, .rl => null,
+            .help, .tui, .version, .config, .repackage, .@"tok-train", .@"tok-eval", .download, .import, .train, .chat, .@"chat-eval", .sft, .eval, .rl, .@"infer-bench" => null,
         };
     }
 
@@ -59,6 +61,7 @@ pub const Command = enum {
             .version => "Print the version",
             .config => "Print the resolved base directories",
             .download => "Download ClimbMix pretraining shards",
+            .repackage => "Shuffle your own corpus into pretraining shards",
             .@"tok-train" => "Train the BPE tokenizer",
             .@"tok-eval" => "Evaluate the tokenizer's compression",
             .train => "Pretrain the base model",
@@ -68,6 +71,7 @@ pub const Command = enum {
             .sft => "Supervised fine-tuning",
             .@"chat-eval" => "Evaluate the chat model (ARC, MMLU, GSM8K)",
             .rl => "Reinforcement learning on GSM8K",
+            .@"infer-bench" => "Benchmark inference: prefill, then decode over batch sizes",
         };
     }
 

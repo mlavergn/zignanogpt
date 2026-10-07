@@ -2,13 +2,15 @@ const std = @import("std");
 const log = std.log.scoped(.zignanogpt_task);
 const mod = @import("module.zig");
 
-/// nanochat's tasks (`tasks/*.py`).
+/// nanochat's tasks (`tasks/*.py`), plus `custom`: conversations from your own
+/// JSONL file (`ConversationFile`, earlier nanochat's `CustomJSON`), for training only.
 pub const TaskKind = enum {
     smoltalk,
     mmlu,
     arc_easy,
     arc_challenge,
     gsm8k,
+    custom,
 
     /// The name chat_eval and chat_sft use, e.g. `ARC-Easy`.
     pub fn name(self: TaskKind) []const u8 {
@@ -18,6 +20,7 @@ pub const TaskKind = enum {
             .arc_easy => "ARC-Easy",
             .arc_challenge => "ARC-Challenge",
             .gsm8k => "GSM8K",
+            .custom => "CustomJSON",
         };
     }
 
@@ -41,6 +44,8 @@ pub const Task = struct {
 
     kind: TaskKind,
     data: mod.HubDataset,
+    /// The conversations of a `custom` task (borrowed; `data` is empty then).
+    custom: ?*const mod.ConversationFile = null,
     start: usize = 0,
     stop: ?usize = null,
     step: usize = 1,
@@ -66,11 +71,24 @@ pub const Task = struct {
             .mmlu => .{ .repo = "cais/mmlu", .subset = "all", .columns = &.{ "question", "choices", "answer" } },
             .arc_easy, .arc_challenge => .{ .repo = "allenai/ai2_arc", .subset = kind.name(), .columns = &.{ "question", "choices.text", "choices.label", "answerKey" } },
             .gsm8k => .{ .repo = "openai/gsm8k", .subset = "main", .columns = &.{ "question", "answer" } },
+            .custom => return error.NotAHubTask,
         };
         var data = try mod.HubDataset.open(allocator, io, config, source.repo, source.subset, split, source.columns, out);
         errdefer data.deinit();
         try data.shuffle(42);
         return Self{ .kind = kind, .data = data };
+    }
+
+    /// A training task over your own conversations (in file order; the
+    /// mixture shuffles them).
+    ///
+    /// Parameters:
+    /// - `allocator`: the (empty) dataset's allocator.
+    /// - `file`: the conversations; must outlive the task.
+    ///
+    /// Return: the task.
+    pub fn fromConversations(allocator: std.mem.Allocator, file: *const mod.ConversationFile) Self {
+        return .{ .kind = .custom, .data = .{ .allocator = allocator, .columns = &.{}, .rows = 0 }, .custom = file };
     }
 
     pub fn deinit(self: *Self) void {
@@ -80,13 +98,14 @@ pub const Task = struct {
     pub fn evalType(self: *const Self) EvalType {
         return switch (self.kind) {
             .mmlu, .arc_easy, .arc_challenge => .categorical,
-            .smoltalk, .gsm8k => .generative,
+            .smoltalk, .gsm8k, .custom => .generative,
         };
     }
 
     /// The examples in the slice (`stop` is clamped to the data).
     pub fn len(self: *const Self) usize {
-        const stop = @min(self.stop orelse self.data.len(), self.data.len());
+        const total = if (self.custom) |c| c.conversations.len else self.data.len();
+        const stop = @min(self.stop orelse total, total);
         if (stop <= self.start) return 0;
         return (stop - self.start + self.step - 1) / self.step;
     }
@@ -137,6 +156,7 @@ pub const Task = struct {
                 messages[1] = .{ .role = .assistant, .content = .{ .parts = try toolParts(arena, answer) } };
                 return .{ .messages = messages };
             },
+            .custom => return self.custom.?.conversations[row],
         }
     }
 
@@ -145,7 +165,7 @@ pub const Task = struct {
         return switch (self.kind) {
             .mmlu => &mmlu_letters,
             .arc_easy, .arc_challenge => self.data.strings(arena, 2, self.start + index * self.step),
-            .smoltalk, .gsm8k => error.NotCategorical,
+            .smoltalk, .gsm8k, .custom => error.NotCategorical,
         };
     }
 
@@ -171,7 +191,7 @@ pub const Task = struct {
                 if (reference == null or predicted == null) return reference == null and predicted == null;
                 return std.mem.eql(u8, reference.?, predicted.?);
             },
-            .smoltalk => return error.NotEvaluable,
+            .smoltalk, .custom => return error.NotEvaluable,
         }
     }
 

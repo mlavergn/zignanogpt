@@ -23,7 +23,20 @@ pub const StepReport = struct {
     state: mod.DataLoaderState,
 };
 
-/// Called after every step, eval and sample (e.g. by the TUI).
+/// One RL step, as `chat_rl.py` prints it: the mean reward over its rollouts.
+pub const RlStepReport = struct {
+    step: usize,
+    num_steps: usize,
+    reward: f64,
+    sequence_length: f64,
+    lrm: f64,
+    /// Seconds this step took (rollouts, gradients, update).
+    dt: f64,
+    total_time: f64,
+};
+
+/// Called after every step, eval and sample (e.g. by the TUI), and during long
+/// work inside any job (evaluations, rollouts, downloads, tokenizer training).
 pub const TrainObserver = struct {
     context: *anyopaque,
     onStep: *const fn (context: *anyopaque, report: StepReport) void,
@@ -32,6 +45,28 @@ pub const TrainObserver = struct {
     /// Checked before each step (and, in SFT and RL, between eval problems and
     /// rollouts): true saves a checkpoint and ends the run.
     shouldStop: *const fn (context: *anyopaque) bool,
+    /// `done` of `total` units of `label` (an eval's problems, a step's
+    /// rollouts, shards downloaded); `label` is borrowed for the call only.
+    onProgress: *const fn (context: *anyopaque, label: []const u8, done: usize, total: usize) void = &ignoreProgress,
+    /// After each RL step.
+    onRlStep: *const fn (context: *anyopaque, report: RlStepReport) void = &ignoreRlStep,
+
+    /// Reports progress to `observer`, if any.
+    ///
+    /// Parameters:
+    /// - `observer`: the hooks, or null (the command line).
+    /// - `label`: what is being counted; borrowed for the call.
+    /// - `done`: units finished.
+    /// - `total`: units in all.
+    ///
+    /// Return: nothing.
+    pub fn progress(observer: ?TrainObserver, label: []const u8, done: usize, total: usize) void {
+        const obs = observer orelse return;
+        obs.onProgress(obs.context, label, done, total);
+    }
+
+    fn ignoreProgress(_: *anyopaque, _: []const u8, _: usize, _: usize) void {}
+    fn ignoreRlStep(_: *anyopaque, _: RlStepReport) void {}
 
     /// Whether `observer` (if any) asks to stop.
     pub fn stopRequested(observer: ?TrainObserver) bool {
@@ -339,7 +374,8 @@ pub const Trainer = struct {
         var nats: f64 = 0;
         var bytes: u64 = 0;
         const logits = try self.acts.logits.reshape(&.{ self.targets.len, self.plan.model.vocab_size });
-        for (0..steps) |_| {
+        for (0..steps) |i| {
+            mod.TrainObserver.progress(self.observer, "validation bpb", i, steps);
             _ = try loader.next(inputs, targets);
             try self.backend.upload(self.idx, i32, inputs);
             try self.backend.upload(self.target_ids, i32, targets);
@@ -360,7 +396,8 @@ pub const Trainer = struct {
     /// Greedy completions of the sample prompts (16 tokens each).
     fn sample(self: *Self) !void {
         const bos = try self.tokenizer.bos();
-        for (sample_prompts) |prompt| {
+        for (sample_prompts, 0..) |prompt, i| {
+            mod.TrainObserver.progress(self.observer, "samples", i, sample_prompts.len);
             var ids: std.ArrayList(u32) = .empty;
             defer ids.deinit(self.allocator);
             try ids.append(self.allocator, bos);

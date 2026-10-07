@@ -57,6 +57,8 @@ const Kernel = enum {
     dot_partial_f32,
     reduce_sum_f32,
     rope_f32,
+    rope_norm_f32,
+    rope_norm_backward_f32,
     gate_linear_f32,
     gate_linear_backward_dx_f32,
     gate_linear_backward_dw_f32,
@@ -506,6 +508,37 @@ pub const MetalBackend = struct {
     }
     pub fn ropeBackward(self: *Self, dx: mod.Tensor, dy: mod.Tensor, cos: mod.Tensor, sin: mod.Tensor, pos0: usize) !void {
         try self.rotate(dx, dy, cos, sin, pos0, -1);
+    }
+
+    const RopeNormArgs = extern struct { t: u32, h: u32, half_d: u32, pos0: u32, eps: f32, gain: f32 };
+
+    /// Rotary embedding, RMS norm and gain in one pass per row (`rope_norm_f32`).
+    pub fn ropeNorm(self: *Self, out: mod.Tensor, x: mod.Tensor, cos: mod.Tensor, sin: mod.Tensor, pos0: usize, eps: f32, gain: f32) !void {
+        const args = try ropeNormArgs(out, x, cos, sin, pos0, eps, gain);
+        const e = try self.begin(.rope_norm_f32);
+        for ([_]mod.Tensor{ out, x, cos, sin }, 0..) |t, i| setTensor(e, t, i);
+        setValue(e, RopeNormArgs, args, 4);
+        dispatchRows(e, x.numel() / x.shape.dims[3], args.half_d);
+    }
+
+    pub fn ropeNormBackward(self: *Self, dx: mod.Tensor, dy: mod.Tensor, x: mod.Tensor, cos: mod.Tensor, sin: mod.Tensor, pos0: usize, eps: f32, gain: f32) !void {
+        try checkSame(dy, x);
+        if (overlaps(dx, x)) return error.Aliasing;
+        const args = try ropeNormArgs(dx, x, cos, sin, pos0, eps, gain);
+        const e = try self.begin(.rope_norm_backward_f32);
+        for ([_]mod.Tensor{ dx, dy, x, cos, sin }, 0..) |t, i| setTensor(e, t, i);
+        setValue(e, RopeNormArgs, args, 5);
+        dispatchRows(e, x.numel() / x.shape.dims[3], args.half_d);
+    }
+
+    /// Checks a rope-norm problem and packs its arguments.
+    fn ropeNormArgs(out: mod.Tensor, x: mod.Tensor, cos: mod.Tensor, sin: mod.Tensor, pos0: usize, eps: f32, gain: f32) !RopeNormArgs {
+        try checkSame(out, x);
+        try checkSame(cos, sin);
+        if (x.shape.rank != 4 or x.shape.dims[3] % 2 != 0 or cos.shape.cols() * 2 != x.shape.dims[3]) return error.ShapeMismatch;
+        if (pos0 + x.shape.dims[1] > cos.shape.rows()) return error.OutOfBounds;
+        _ = try count(x);
+        return .{ .t = @intCast(x.shape.dims[1]), .h = @intCast(x.shape.dims[2]), .half_d = @intCast(x.shape.dims[3] / 2), .pos0 = @intCast(pos0), .eps = eps, .gain = gain };
     }
 
     fn rotate(self: *Self, out: mod.Tensor, x: mod.Tensor, cos: mod.Tensor, sin: mod.Tensor, pos0: usize, sign: f32) !void {

@@ -9,11 +9,12 @@ const mod = cli.nanogpt;
 pub const BaseEval = struct {
     pub const usage =
         \\usage: zignanogpt eval [--eval core,bpb,sample] [--model-tag <tag>] [--step <n>] [--max-per-task <n>]
-        \\                       [--device-batch-size <n>] [--split-tokens <n>] [--threads <n>]
+        \\                       [--device-batch-size <n>] [--split-tokens <n>] [--dataset <name>] [--threads <n>]
         \\  --eval               any of core, bpb, sample (default: all three)
         \\  --max-per-task       CORE examples per task (default: all; runcpu.sh: 16)
         \\  --device-batch-size  bpb batch (default 32; runcpu.sh: 1)
         \\  --split-tokens       bpb tokens per split (default 20971520; runcpu.sh: 16384)
+        \\  --dataset            the shards bpb reads (default climbmix)
         \\
     ;
 
@@ -34,6 +35,7 @@ pub const BaseEval = struct {
         max_per_task: usize = 0,
         device_batch_size: usize = 32,
         split_tokens: usize = 40 * 524288,
+        dataset: []const u8 = mod.Dataset.default_name,
         threads: usize = 0,
     };
 
@@ -45,7 +47,7 @@ pub const BaseEval = struct {
     /// - `out`: progress and results.
     ///
     /// Return: the exit code; loading and evaluation errors.
-    pub fn run(init: std.process.Init, args: *cli.Args, out: *std.Io.Writer) !u8 {
+    pub fn run(init: std.process.Init, args: *cli.Args, out: *std.Io.Writer, observer: ?mod.TrainObserver) !u8 {
         log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
         if (args.flag("help")) {
             try out.writeAll(usage);
@@ -81,9 +83,9 @@ pub const BaseEval = struct {
         try out.print("Evaluating model: base_model (step {d})\n", .{loaded.step});
         try out.flush();
 
-        if (modes.sample) try sample(allocator, loaded, out);
-        if (modes.bpb) try bpb(allocator, init.io, &config, loaded, o, out);
-        if (modes.core) try core(allocator, init.io, &config, loaded, o, out);
+        if (modes.sample) try sample(allocator, loaded, out, observer);
+        if (modes.bpb) try bpb(allocator, init.io, &config, loaded, o, out, observer);
+        if (modes.core) try core(allocator, init.io, &config, loaded, o, out, observer);
         return 0;
     }
 
@@ -92,12 +94,13 @@ pub const BaseEval = struct {
     }
 
     /// Greedy completions of the prompts, then 8 unconditioned samples at temperature 1.
-    fn sample(allocator: std.mem.Allocator, loaded: *mod.LoadedModel, out: *std.Io.Writer) !void {
+    fn sample(allocator: std.mem.Allocator, loaded: *mod.LoadedModel, out: *std.Io.Writer, observer: ?mod.TrainObserver) !void {
         try banner(out, "Model Samples");
         const tok = &loaded.tokenizer;
         const engine = mod.Engine.init(&loaded.model, tok);
         try out.writeAll("\nConditioned samples:\n");
-        for (prompts) |p| {
+        for (prompts, 0..) |p, i| {
+            mod.TrainObserver.progress(observer, "samples", i, prompts.len);
             var ids: std.ArrayList(u32) = .empty;
             defer ids.deinit(allocator);
             try ids.append(allocator, try tok.bos());
@@ -121,7 +124,7 @@ pub const BaseEval = struct {
     }
 
     /// Bits per byte on the train and val shards.
-    fn bpb(allocator: std.mem.Allocator, io: std.Io, config: *const mod.Config, loaded: *mod.LoadedModel, o: Options, out: *std.Io.Writer) !void {
+    fn bpb(allocator: std.mem.Allocator, io: std.Io, config: *const mod.Config, loaded: *mod.LoadedModel, o: Options, out: *std.Io.Writer, observer: ?mod.TrainObserver) !void {
         try banner(out, "BPB Evaluation");
         const seq = loaded.model.config.sequence_len;
         const b = o.device_batch_size;
@@ -132,7 +135,7 @@ pub const BaseEval = struct {
             try out.print("Adjusted split_tokens to {d} (must be divisible by {d})\n", .{ split_tokens, per_step });
         }
         const steps = split_tokens / per_step;
-        var dataset = try mod.Dataset.init(allocator, io, config);
+        var dataset = try mod.Dataset.init(allocator, io, config, o.dataset);
         defer dataset.deinit();
         const shards = try dataset.list(allocator);
         defer {
@@ -169,7 +172,9 @@ pub const BaseEval = struct {
             defer loader.deinit();
             var nats: f64 = 0;
             var bytes: u64 = 0;
-            for (0..steps) |_| {
+            const label = if (std.mem.eql(u8, split, "train")) "bpb train" else "bpb val";
+            for (0..steps) |i| {
+                mod.TrainObserver.progress(observer, label, i, steps);
                 _ = try loader.next(inputs, targets);
                 try be.upload(idx, i32, inputs);
                 try be.upload(target_ids, i32, targets);
@@ -190,13 +195,14 @@ pub const BaseEval = struct {
     }
 
     /// The CORE metric over the eval bundle's tasks, also written as CSV.
-    fn core(allocator: std.mem.Allocator, io: std.Io, config: *const mod.Config, loaded: *mod.LoadedModel, o: Options, out: *std.Io.Writer) !void {
+    fn core(allocator: std.mem.Allocator, io: std.Io, config: *const mod.Config, loaded: *mod.LoadedModel, o: Options, out: *std.Io.Writer, observer: ?mod.TrainObserver) !void {
         try banner(out, "CORE Evaluation");
         try out.flush();
         const storage = mod.Storage.init(allocator, io);
         var bundle = try mod.EvalBundle.open(allocator, io, config, out);
         defer bundle.deinit();
         var eval = mod.CoreEval.init(allocator, &loaded.model, &loaded.tokenizer);
+        eval.observer = observer;
         var csv: std.ArrayList(u8) = .empty;
         defer csv.deinit(allocator);
         try csv.print(allocator, "{s:<35}, {s:<10}, {s:<10}\n", .{ "Task", "Accuracy", "Centered" });

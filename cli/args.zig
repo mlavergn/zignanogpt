@@ -37,7 +37,13 @@ pub const Args = struct {
     ///
     /// Return: the value; `error.MissingValue` for a trailing `--name`.
     pub fn string(self: *Self, name: []const u8) !?[]const u8 {
+        return self.take(name, false);
+    }
+
+    /// The first `--name` value, optionally skipping ones already consumed.
+    fn take(self: *Self, name: []const u8, unused_only: bool) !?[]const u8 {
         for (self.items, 0..) |item, i| {
+            if (unused_only and self.used[i]) continue;
             // `--name`, or `-n` for a one-letter name.
             const dashes: usize = if (std.mem.startsWith(u8, item, "--")) 2 else if (name.len == 1 and std.mem.startsWith(u8, item, "-")) 1 else continue;
             if (!std.mem.startsWith(u8, item[dashes..], name)) continue;
@@ -57,6 +63,41 @@ pub const Args = struct {
             }
         }
         return null;
+    }
+
+    /// Every value of a repeatable `--name` (or `-n`), in order.
+    ///
+    /// Parameters:
+    /// - `self`: the parser.
+    /// - `allocator`: owns the list (the values are borrowed from the arguments).
+    /// - `name`: without the dashes.
+    ///
+    /// Return: the values (empty when absent); `error.MissingValue`.
+    pub fn strings(self: *Self, allocator: std.mem.Allocator, name: []const u8) ![]const []const u8 {
+        var values: std.ArrayList([]const u8) = .empty;
+        errdefer values.deinit(allocator);
+        while (try self.take(name, true)) |v| try values.append(allocator, v);
+        return values.toOwnedSlice(allocator);
+    }
+
+    /// The arguments no option consumed that do not start with `-` (paths and
+    /// the like), marked used. Call it after reading every option, so their
+    /// values are already taken.
+    ///
+    /// Parameters:
+    /// - `self`: the parser.
+    /// - `allocator`: owns the list (the values are borrowed from the arguments).
+    ///
+    /// Return: the arguments, in order.
+    pub fn positionals(self: *Self, allocator: std.mem.Allocator) ![]const []const u8 {
+        var values: std.ArrayList([]const u8) = .empty;
+        errdefer values.deinit(allocator);
+        for (self.items, self.used) |item, *used| {
+            if (used.* or std.mem.startsWith(u8, item, "-")) continue;
+            used.* = true;
+            try values.append(allocator, item);
+        }
+        return values.toOwnedSlice(allocator);
     }
 
     /// An integer option.
@@ -184,5 +225,23 @@ test "args parse both spellings, flags, and reject leftovers" {
     try std.testing.expectError(error.UnknownArgument, args.finish());
     _ = try args.int(usize, "max-chars", 0);
     try std.testing.expectEqual(@as(usize, 3), try args.int(usize, "n", 0));
+    try args.finish();
+}
+
+test "args collect repeated options and positionals" {
+    var args = try Args.init(std.testing.allocator, &.{ "a.txt", "--input", "b.jsonl", "--name", "mine", "--input=c/", "d.parquet", "--overwrite" });
+    defer args.deinit();
+    try std.testing.expectEqualStrings("mine", (try args.string("name")).?);
+    const inputs = try args.strings(std.testing.allocator, "input");
+    defer std.testing.allocator.free(inputs);
+    try std.testing.expectEqual(@as(usize, 2), inputs.len);
+    try std.testing.expectEqualStrings("b.jsonl", inputs[0]);
+    try std.testing.expectEqualStrings("c/", inputs[1]);
+    try std.testing.expect(args.flag("overwrite"));
+    const rest = try args.positionals(std.testing.allocator);
+    defer std.testing.allocator.free(rest);
+    try std.testing.expectEqual(@as(usize, 2), rest.len);
+    try std.testing.expectEqualStrings("a.txt", rest[0]);
+    try std.testing.expectEqualStrings("d.parquet", rest[1]);
     try args.finish();
 }

@@ -321,6 +321,20 @@ pub const CudaBackend = struct {
         try self.rotate(dx, dy, cos, sin, pos0, -1);
     }
 
+    /// `CpuBackend.ropeNorm`, as its three kernels (a fused kernel can come
+    /// once this runs on the Spark).
+    pub fn ropeNorm(self: *Self, out: mod.Tensor, x: mod.Tensor, cos: mod.Tensor, sin: mod.Tensor, pos0: usize, eps: f32, gain: f32) !void {
+        try self.rope(x, x, cos, sin, pos0);
+        try self.rmsnorm(out, x, eps);
+        try self.scale(out, out, gain);
+    }
+
+    pub fn ropeNormBackward(self: *Self, dx: mod.Tensor, dy: mod.Tensor, x: mod.Tensor, cos: mod.Tensor, sin: mod.Tensor, pos0: usize, eps: f32, gain: f32) !void {
+        try self.scale(dx, dy, gain);
+        try self.rmsnormBackward(dx, dx, x, eps, false);
+        try self.ropeBackward(dx, dx, cos, sin, pos0);
+    }
+
     fn rotate(self: *Self, out: mod.Tensor, x: mod.Tensor, cos: mod.Tensor, sin: mod.Tensor, pos0: usize, sign: f32) !void {
         try checkSame(out, x);
         try checkSame(cos, sin);

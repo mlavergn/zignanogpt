@@ -43,6 +43,7 @@ pub const Conformance = struct {
         "dot",               "gateLinearBackward", "smearBackward",     "valueMixBackward",
         "embeddingBackward", "adamwStep",          "muonMomentum",      "muonPrepare",
         "muonFinish",        "crossEntropyRows",   "gatedAdd",          "crossEntropyWeightedBackward",
+        "ropeNorm",          "ropeNormBackward",
     };
 
     /// Fails compilation when `B` misses part of the contract.
@@ -80,6 +81,7 @@ pub const Conformance = struct {
         try ropeOp(B, &backend, allocator);
         try attentionOp(B, &backend, allocator);
         try rowBackward(B, &backend, allocator);
+        try ropeNormOps(B, &backend, allocator);
         try attentionBackwardOp(B, &backend, allocator);
         try gateBackward(B, &backend, allocator);
         try lossBackward(B, &backend, allocator);
@@ -368,6 +370,88 @@ pub const Conformance = struct {
         const out = try allocator.alloc(f32, n);
         rng.fillUniform(out, lo, hi);
         return out;
+    }
+
+    /// ropeNorm against rope, rmsnorm and scale; its backward against finite
+    /// differences and in place.
+    fn ropeNormOps(comptime B: type, backend: *B, allocator: std.mem.Allocator) !void {
+        var rng = mod.Random.init(31);
+        const dims = [_]usize{ 2, 3, 2, 8 }; // B, T, H, D
+        const n = 2 * 3 * 2 * 8;
+        const hx = try randomHost(allocator, &rng, n, -2, 2);
+        defer allocator.free(hx);
+        const w = try randomHost(allocator, &rng, n, -1, 1);
+        defer allocator.free(w);
+        var cos_h: [5 * 4]f32 = undefined;
+        var sin_h: [5 * 4]f32 = undefined;
+        for (&cos_h, &sin_h, 0..) |*c, *s, i| {
+            c.* = @cos(@as(f32, @floatFromInt(i)) * 0.7);
+            s.* = @sin(@as(f32, @floatFromInt(i)) * 0.7);
+        }
+        const cos = try tensorFrom(B, backend, f32, &.{ 5, 4 }, &cos_h);
+        defer backend.free(cos);
+        const sin = try tensorFrom(B, backend, f32, &.{ 5, 4 }, &sin_h);
+        defer backend.free(sin);
+        const eps: f32 = 1e-6;
+        const gain: f32 = 1.2;
+
+        // Fused against the separate ops.
+        const x_fused = try tensorFrom(B, backend, f32, &dims, hx);
+        defer backend.free(x_fused);
+        const x_ref = try tensorFrom(B, backend, f32, &dims, hx);
+        defer backend.free(x_ref);
+        const fused = try backend.alloc(.f32, &dims);
+        defer backend.free(fused);
+        const ref = try backend.alloc(.f32, &dims);
+        defer backend.free(ref);
+        try backend.ropeNorm(fused, x_fused, cos, sin, 1, eps, gain);
+        try backend.rope(x_ref, x_ref, cos, sin, 1);
+        try backend.rmsnorm(ref, x_ref, eps);
+        try backend.scale(ref, ref, gain);
+        const got = try hostCopy(B, backend, allocator, fused);
+        defer allocator.free(got);
+        const want = try hostCopy(B, backend, allocator, ref);
+        defer allocator.free(want);
+        try expectClose(want, got, 1e-5);
+        const rot_got = try hostCopy(B, backend, allocator, x_fused);
+        defer allocator.free(rot_got);
+        const rot_want = try hostCopy(B, backend, allocator, x_ref);
+        defer allocator.free(rot_want);
+        try expectClose(rot_want, rot_got, 1e-6);
+
+        // Backward against finite differences of the forward from the unrotated input.
+        const x_in = try tensorFrom(B, backend, f32, &dims, hx);
+        defer backend.free(x_in);
+        const x_work = try backend.alloc(.f32, &dims);
+        defer backend.free(x_work);
+        const y = try backend.alloc(.f32, &dims);
+        defer backend.free(y);
+        const dy = try tensorFrom(B, backend, f32, &dims, w);
+        defer backend.free(dy);
+        const dx = try backend.alloc(.f32, &dims);
+        defer backend.free(dx);
+        try backend.ropeNormBackward(dx, dy, x_fused, cos, sin, 1, eps, gain);
+        const g = try hostCopy(B, backend, allocator, dx);
+        defer allocator.free(g);
+        const Fwd = struct {
+            be: *B,
+            y: mod.Tensor,
+            x_in: mod.Tensor,
+            x_work: mod.Tensor,
+            cos: mod.Tensor,
+            sin: mod.Tensor,
+            fn run(c: @This()) !void {
+                try c.be.copy(c.x_work, c.x_in);
+                try c.be.ropeNorm(c.y, c.x_work, c.cos, c.sin, 1, 1e-6, 1.2);
+            }
+        };
+        try gradCheck(B, backend, allocator, "ropeNorm", x_in, hx, y, w, g, Fwd{ .be = backend, .y = y, .x_in = x_in, .x_work = x_work, .cos = cos, .sin = sin });
+
+        // In place: dx may alias dy.
+        try backend.ropeNormBackward(dy, dy, x_fused, cos, sin, 1, eps, gain);
+        const in_place = try hostCopy(B, backend, allocator, dy);
+        defer allocator.free(in_place);
+        try expectClose(g, in_place, 1e-6);
     }
 
     /// rmsnorm, rope and reluSquare backward against finite differences.

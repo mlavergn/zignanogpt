@@ -51,11 +51,26 @@ pub const Operation = struct {
     };
 
     /// The most fields any operation has (the form's storage is sized by it).
-    pub const max_fields = 16;
+    pub const max_fields = 20;
 
     /// The console's operations, in the order the left pane lists them.
     pub const all = [_]Operation{
         .{ .title = "Overview", .summary = "Directories, tokenizer, data shards and checkpoints.", .command = null },
+        .{
+            .title = "Prepare data",
+            .summary = "Shuffle your own corpus (text, JSONL, Parquet) into pretraining shards; pick it with the dataset field.",
+            .command = .repackage,
+            .fields = &.{
+                .{ .flag = "name", .label = "dataset name", .hint = "required; shards go to <base>/base_data_<name>" },
+                .{ .flag = "input", .label = "input", .hint = "a file or directory (.txt .md .jsonl .ndjson .parquet); text: blank lines between documents" },
+                .{ .flag = "field", .label = "text field", .placeholder = "text", .hint = "the JSONL field or Parquet column" },
+                .{ .flag = "chars-per-shard", .label = "chars per shard", .placeholder = "250000000", .hint = "~100 MB shards, as nanochat" },
+                .{ .flag = "row-group", .label = "row group", .placeholder = "1024", .hint = "documents per Parquet row group" },
+                .{ .flag = "seed", .label = "shuffle seed", .placeholder = "42" },
+                .{ .flag = "overwrite", .label = "overwrite", .kind = .toggle, .default = "no", .hint = "yes replaces the dataset's shards" },
+                .{ .flag = "", .label = "more options", .placeholder = "none", .hint = "e.g. --input another/dir --bucket-mib 1024" },
+            },
+        },
         .{
             .title = "Download data",
             .summary = "Fetch ClimbMix pretraining shards (the validation shard always comes too).",
@@ -64,13 +79,14 @@ pub const Operation = struct {
         },
         .{
             .title = "Train tokenizer",
-            .summary = "Learn the BPE vocabulary from the train shards (or a text file).",
+            .summary = "Learn the BPE vocabulary from a dataset's train shards (or a text file).",
             .command = .@"tok-train",
             .fields = &.{
                 .{ .flag = "vocab-size", .label = "vocab size", .default = "32768", .hint = "includes the 9 special tokens" },
                 .{ .flag = "max-chars", .label = "max chars", .default = "2000000000" },
                 .{ .flag = "doc-cap", .label = "doc cap", .default = "10000", .hint = "characters kept per document" },
-                .{ .flag = "data", .label = "text file", .placeholder = "downloaded shards" },
+                .{ .flag = "dataset", .label = "dataset", .placeholder = "climbmix", .hint = "shards from Download data or Prepare data" },
+                .{ .flag = "data", .label = "text file", .placeholder = "the dataset's shards" },
             },
         },
         .{
@@ -91,14 +107,15 @@ pub const Operation = struct {
                 .{ .flag = "save-every", .label = "save every" },
                 .{ .flag = "model-tag", .label = "model tag" },
                 .{ .flag = "resume-from-step", .label = "resume from step", .placeholder = "none (new run)" },
-                .{ .flag = "data", .label = "text file", .placeholder = "downloaded shards" },
+                .{ .flag = "dataset", .label = "dataset", .placeholder = "climbmix", .hint = "shards from Download data or Prepare data" },
+                .{ .flag = "data", .label = "text file", .placeholder = "the dataset's shards" },
                 .{ .flag = "threads", .label = "threads", .placeholder = "one per CPU" },
                 .{ .flag = "", .label = "more options", .placeholder = "none", .hint = "any other base_train flags, e.g. --matrix-lr 0.03" },
             },
         },
         .{
             .title = "Fine-tune (SFT)",
-            .summary = "chat_sft.py: SmolTalk + MMLU + GSM8K from a base checkpoint (data ~1 GB on first run). `s` saves and stops.",
+            .summary = "chat_sft.py: SmolTalk + MMLU + GSM8K (+ your conversations) from a base checkpoint (data ~1 GB on first run). `s` saves and stops.",
             .command = .sft,
             .fields = &.{
                 .{ .flag = "model-tag", .label = "base model tag", .placeholder = "largest d<N>" },
@@ -112,6 +129,8 @@ pub const Operation = struct {
                 .{ .flag = "chatcore-every", .label = "ChatCORE every", .default = "200", .hint = "-1 disables" },
                 .{ .flag = "chatcore-max-cat", .label = "ChatCORE max cat", .placeholder = "all", .hint = "problems per multiple-choice task" },
                 .{ .flag = "chatcore-max-sample", .label = "ChatCORE max gen", .default = "24", .hint = "GSM8K problems" },
+                .{ .flag = "conversations", .label = "conversations", .placeholder = "none", .hint = "your JSONL file: one [{role, content}, ...] conversation per line" },
+                .{ .flag = "conversations-epochs", .label = "conversation epochs", .placeholder = "1", .hint = "copies of your conversations in the mixture" },
                 .{ .flag = "threads", .label = "threads", .placeholder = "one per CPU" },
                 .{ .flag = "", .label = "more options", .placeholder = "none", .hint = "any other chat_sft flags, e.g. --mmlu-epochs 1" },
             },
@@ -147,6 +166,7 @@ pub const Operation = struct {
                 .{ .flag = "max-per-task", .label = "max per task", .default = "16", .only = .eval, .placeholder = "all", .hint = "base: CORE examples per task (runcpu.sh: 16)" },
                 .{ .flag = "device-batch-size", .label = "bpb batch", .default = "1", .only = .eval, .hint = "base: runcpu.sh uses 1" },
                 .{ .flag = "split-tokens", .label = "bpb tokens", .default = "16384", .only = .eval, .hint = "base: per split (runcpu.sh: 16384)" },
+                .{ .flag = "dataset", .label = "bpb dataset", .only = .eval, .placeholder = "climbmix", .hint = "base: the shards bpb reads" },
                 .{ .flag = "task-name", .label = "tasks", .only = .@"chat-eval", .placeholder = "all four", .hint = "sft/rl: e.g. ARC-Easy|MMLU" },
                 .{ .flag = "max-problems", .label = "max problems", .only = .@"chat-eval", .placeholder = "all", .hint = "sft/rl: per task" },
                 .{ .flag = "max-new-tokens", .label = "max new tokens", .default = "512", .only = .@"chat-eval", .hint = "sft/rl: GSM8K" },
@@ -297,11 +317,24 @@ test "operation forms become command-line arguments" {
     var values: [Operation.max_fields][]const u8 = @splat("");
     values[0] = "8";
     values[4] = " 20 ";
-    values[15] = "--matrix-lr 0.03";
+    values[13] = "mine";
+    values[16] = "--matrix-lr 0.03";
     const args = try train.args(arena.allocator(), values[0..train.fields.len]);
-    const want = [_][]const u8{ "--depth", "8", "--num-iterations", "20", "--matrix-lr", "0.03" };
+    const want = [_][]const u8{ "--depth", "8", "--num-iterations", "20", "--dataset", "mine", "--matrix-lr", "0.03" };
     try std.testing.expectEqual(want.len, args.len);
     for (want, args) |w, a| try std.testing.expectEqualStrings(w, a);
+
+    // Prepare data: the overwrite toggle is a bare flag, only when "yes".
+    const prepare = Operation.all[Operation.indexOf(.repackage).?];
+    var form: [Operation.max_fields][]const u8 = @splat("");
+    form[0] = "mine";
+    form[1] = "corpus/";
+    form[6] = "no";
+    const quiet = try prepare.args(arena.allocator(), form[0..prepare.fields.len]);
+    try std.testing.expectEqual(@as(usize, 4), quiet.len);
+    form[6] = "Yes";
+    const loud = try prepare.args(arena.allocator(), form[0..prepare.fields.len]);
+    try std.testing.expectEqualStrings("--overwrite", loud[loud.len - 1]);
     for (Operation.all) |op| {
         try std.testing.expect(op.fields.len <= Operation.max_fields);
         try std.testing.expectEqual(@as(?u8, null), op.phase());

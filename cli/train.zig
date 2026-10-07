@@ -6,7 +6,7 @@ const mod = cli.nanogpt;
 /// `zignanogpt train`: base pretraining (nanochat's `base_train.py`).
 pub const Train = struct {
     pub const usage =
-        \\usage: zignanogpt train [--preset cpu] [--data <file>] [--model-tag <tag>] [--resume-from-step <n>]
+        \\usage: zignanogpt train [--preset cpu] [--dataset <name> | --data <file>] [--model-tag <tag>] [--resume-from-step <n>]
         \\                        [--threads <n>] [--no-tui] [base_train.py options...]
         \\  options (defaults as base_train.py; -1 disables like Python):
         \\    --depth --aspect-ratio --head-dim --max-seq-len --window-pattern
@@ -16,6 +16,7 @@ pub const Train = struct {
         \\    --warmup-steps --warmdown-ratio --final-lr-frac
         \\    --eval-every --eval-tokens --sample-every --save-every
         \\  --preset cpu  runs/runcpu.sh's settings (d6, seq 512, window L, 5000 steps); flags override it
+        \\  --dataset     the shards in <base>/base_data_<name> (default climbmix; others come from `repackage`)
         \\  --data        a text file (blank-line-separated documents; last 10% held out) instead of the shards
         \\  --no-tui      plain log lines even on a terminal (otherwise it runs in the console)
         \\
@@ -53,6 +54,7 @@ pub const Train = struct {
         }
         try args.fill(mod.TrainOptions, &options);
         const data_path = try args.string("data");
+        const dataset_name = try args.string("dataset") orelse mod.Dataset.default_name;
         const tag_arg = try args.string("model-tag");
         const resume_from = try args.int(i64, "resume-from-step", -1);
         const threads = try args.int(usize, "threads", 0);
@@ -69,7 +71,7 @@ pub const Train = struct {
         // Documents: a text file split 90/10, or the shards.
         var text: ?mod.TextDataset = null;
         defer if (text) |*t| t.deinit();
-        var dataset = try mod.Dataset.init(allocator, init.io, &config);
+        var dataset = try mod.Dataset.init(allocator, init.io, &config, dataset_name);
         defer dataset.deinit();
         const shards = try dataset.list(allocator);
         defer {
@@ -84,7 +86,7 @@ pub const Train = struct {
             break :blk .{ .text = .{ .train = docs[0 .. docs.len - val], .val = docs[docs.len - val ..] } };
         } else blk: {
             if (shards.len < 2) {
-                try out.print("need at least one train shard and the val shard; run `zignanogpt download -n 8` (or pass --data)\n", .{});
+                try out.print("{s}: need at least one train shard and the val shard; {s} (or pass --data)\n", .{ dataset.dir, cli.Download.hint(dataset_name) });
                 return 1;
             }
             break :blk .{ .shards = shards };

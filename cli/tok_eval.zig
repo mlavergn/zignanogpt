@@ -8,8 +8,9 @@ const mod = cli.nanogpt;
 /// (e.g. GPT-4's `cl100k_base.tiktoken`, which splits digits in runs of 3).
 pub const TokEval = struct {
     pub const usage =
-        \\usage: zignanogpt tok-eval [--data <file>] [--compare <file.tiktoken>]
-        \\  --data     text file; default: the first row group of the first train and the val shard
+        \\usage: zignanogpt tok-eval [--dataset <name> | --data <file>] [--compare <file.tiktoken>]
+        \\  --dataset  shards to sample (default climbmix): the first row group of the first train and the val shard
+        \\  --data     a text file instead
         \\
     ;
 
@@ -26,6 +27,7 @@ pub const TokEval = struct {
         const allocator = init.gpa;
         const data = try args.string("data");
         const compare = try args.string("compare");
+        const dataset_name = try args.string("dataset") orelse mod.Dataset.default_name;
         try args.finish();
 
         var config = try mod.Config.load(allocator, init.environ_map, mod.Storage.init(allocator, init.io));
@@ -52,7 +54,7 @@ pub const TokEval = struct {
             if (other) |*o| try report(allocator, out, std.fs.path.basename(path), other_name, o, dataset.docs);
             return 0;
         }
-        var dataset = try mod.Dataset.init(allocator, init.io, &config);
+        var dataset = try mod.Dataset.init(allocator, init.io, &config, dataset_name);
         defer dataset.deinit();
         const paths = try dataset.list(allocator);
         defer {
@@ -60,10 +62,12 @@ pub const TokEval = struct {
             allocator.free(paths);
         }
         if (paths.len < 2) {
-            try out.print("no shards; pass --data or run `zignanogpt download -n 1`\n", .{});
+            try out.print("{s}: no shards; pass --data or {s}\n", .{ dataset.dir, cli.Download.hint(dataset_name) });
             return 1;
         }
-        for ([_][]const u8{ paths[0], paths[paths.len - 1] }, [_][]const u8{ "climbmix-train", "climbmix-val" }) |path, label| {
+        const labels = [_][]const u8{ try std.fmt.allocPrint(allocator, "{s}-train", .{dataset_name}), try std.fmt.allocPrint(allocator, "{s}-val", .{dataset_name}) };
+        defer for (labels) |l| allocator.free(l);
+        for ([_][]const u8{ paths[0], paths[paths.len - 1] }, labels) |path, label| {
             var file = try mod.ParquetFile.open(allocator, init.io, path);
             defer file.deinit();
             var strings: mod.ParquetStrings = .{};

@@ -62,7 +62,7 @@ pub const Overview = struct {
             try lines.append(a, .{ .label = "tokenizer", .value = "missing: train one, or import --tokenizer-only", .problem = true });
         }
 
-        var dataset = try mod.Dataset.init(a, process.io, &config);
+        var dataset = try mod.Dataset.init(a, process.io, &config, mod.Dataset.default_name);
         const shards = try dataset.list(a);
         const has_val = shards.len > 0 and std.mem.endsWith(u8, shards[shards.len - 1], "06542.parquet");
         try lines.append(a, .{
@@ -70,7 +70,19 @@ pub const Overview = struct {
             .value = if (shards.len == 0) "none: run Download data" else try std.fmt.allocPrint(a, "{d} train + {s} val", .{ shards.len - @intFromBool(has_val), if (has_val) "1" else "no" }),
             .problem = shards.len < 2 or !has_val,
         });
+        // Datasets made by `repackage`: the last shard is always validation.
+        for (try mod.Dataset.names(a, storage, config.base_dir)) |name| {
+            if (std.mem.eql(u8, name, mod.Dataset.default_name)) continue;
+            var other = try mod.Dataset.init(a, process.io, &config, name);
+            const n = (try other.list(a)).len;
+            try lines.append(a, .{
+                .label = try std.fmt.allocPrint(a, "data {s}", .{name}),
+                .value = if (n < 2) "fewer than 2 shards: run Prepare data again" else try std.fmt.allocPrint(a, "{d} train + 1 val", .{n - 1}),
+                .problem = n < 2,
+            });
+        }
 
+        const before_checkpoints = lines.items.len;
         for ([_]mod.CheckpointKind{ .base, .sft, .rl }) |kind| {
             const tags = try mod.Checkpoint.listTags(a, storage, config.base_dir, kind);
             if (tags.len == 0) continue;
@@ -83,7 +95,7 @@ pub const Overview = struct {
                 try lines.append(a, .{ .label = @tagName(kind), .value = try std.fmt.allocPrint(a, "{s} at step {d}", .{ tag, step }) });
             }
         }
-        if (lines.items.len == 6) try lines.append(a, .{ .label = "checkpoints", .value = "none yet" });
+        if (lines.items.len == before_checkpoints) try lines.append(a, .{ .label = "checkpoints", .value = "none yet" });
         return lines.items;
     }
 };

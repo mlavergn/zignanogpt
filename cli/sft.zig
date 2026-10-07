@@ -12,6 +12,10 @@ pub const Sft = struct {
         \\    --embedding-lr --unembedding-lr --matrix-lr --init-lr-frac --warmup-ratio --warmdown-ratio
         \\    --final-lr-frac --eval-every --eval-tokens --chatcore-every --chatcore-max-cat
         \\    --chatcore-max-sample --mmlu-epochs --gsm8k-epochs
+        \\  --conversations <file.jsonl>  your own conversations in the training mixture, one per line:
+        \\                  [{"role": "user", "content": ...}, {"role": "assistant", "content": ...}, ...]
+        \\                  (an optional system message first; or {"messages": [...]})
+        \\  --conversations-epochs <n>    their copies in the mixture (default 1)
         \\  runs/runcpu.sh uses: --num-iterations 1500 --eval-every 200 --eval-tokens 524288
         \\  The task data (SmolTalk, MMLU, GSM8K; ~1 GB) downloads on first use.
         \\
@@ -54,7 +58,12 @@ pub const Sft = struct {
         defer backend.deinit();
         try out.writeAll("Loading the task data...\n");
         try out.flush();
-        const data = try mod.SftData.openStandard(allocator, init.io, &config, options.mmlu_epochs, options.gsm8k_epochs, out);
+        const extra: ?mod.SftData.Extra = if (options.conversations) |path| .{ .path = path, .epochs = options.conversations_epochs } else null;
+        const data = mod.SftData.openStandard(allocator, init.io, &config, options.mmlu_epochs, options.gsm8k_epochs, extra, out) catch |err| switch (err) {
+            // Explained by a warning (file and line).
+            error.InvalidConversation, error.EmptyConversations => return 1,
+            else => return err,
+        };
         defer data.destroy();
         const trainer = try allocator.create(mod.SftTrainer);
         defer allocator.destroy(trainer);

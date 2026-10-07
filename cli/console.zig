@@ -59,18 +59,12 @@ pub const Console = struct {
                 capture = null;
                 owns_terminal = false;
             }
-            var buffer: [4096]u8 = undefined;
-            var app: tui.vxfw.App = try .init(init.io, init.gpa, init.environ_map, &buffer);
-            defer app.deinit();
-            // Legacy SGR colors: Terminal.app ignores vaxis' colon form for index 202.
-            tui.Theme.prepare(&app.vx);
-
             const console = try init.gpa.create(cli.ConsoleApp);
             defer init.gpa.destroy(console);
             console.* = try cli.ConsoleApp.create(init.gpa, init, job, chat);
             defer console.deinit();
             console.pending_start = start;
-            try app.run(console.widget(), .{});
+            try tui.Session.run(init.io, init.gpa, init.environ_map, console.widget());
 
             if (job.running()) {
                 const op = cli.Operation.all[job.operation orelse 0];

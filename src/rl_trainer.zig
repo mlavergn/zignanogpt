@@ -150,9 +150,11 @@ pub const RlTrainer = struct {
         const o = self.options;
         const model = &self.model.model;
         var step: usize = 0;
+        var total_time: f64 = 0;
         while (step < self.num_steps) : (step += 1) {
             try self.checkStop(step);
             if (o.eval_every > 0 and step % o.eval_every == 0) try self.evaluate(step);
+            const started = std.Io.Clock.awake.now(self.io);
 
             try self.grads.zero();
             var reward_sum: f64 = 0;
@@ -161,6 +163,7 @@ pub const RlTrainer = struct {
             for (0..o.examples_per_step) |example_step| {
                 // A stop mid-step drops this step's gradients: the model stays at the last completed step.
                 try self.checkStop(step);
+                mod.TrainObserver.progress(self.observer, "rollouts", example_step, o.examples_per_step);
                 var arena = std.heap.ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
                 const rollout = try self.collect(arena.allocator(), step);
@@ -185,6 +188,17 @@ pub const RlTrainer = struct {
             // chat_rl.py only rescales the LRs: Muon keeps momentum 0.95 and the given weight decay.
             self.optimizer.setSchedule(lrm, 0.95, o.weight_decay);
             try self.optimizer.step(&model.weights, &self.grads);
+            const dt = @as(f64, @floatFromInt(started.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds)) / 1e9;
+            total_time += dt;
+            if (self.observer) |obs| obs.onRlStep(obs.context, .{
+                .step = step,
+                .num_steps = self.num_steps,
+                .reward = mean_reward,
+                .sequence_length = @as(f64, @floatFromInt(length_sum)) / @as(f64, @floatFromInt(@max(sequences, 1))),
+                .lrm = lrm,
+                .dt = dt,
+                .total_time = total_time,
+            });
             if ((step > 0 and o.save_every > 0 and step % o.save_every == 0) or step == self.num_steps - 1) try self.save(step);
         }
     }
@@ -312,6 +326,7 @@ pub const RlTrainer = struct {
         const n = @min(o.eval_examples, self.val.len());
         for (0..n) |i| {
             try self.checkStop(step);
+            mod.TrainObserver.progress(self.observer, "pass@k eval", i, n);
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
             const a = arena.allocator();

@@ -294,12 +294,8 @@ pub const Gpt = struct {
                 try be.gateLinear(bufs.ve_gate, try bufs.xn.reshape(&.{ bt, c }), layer.ve_gate.?);
                 try be.valueMix(bufs.v, bufs.ve, bufs.ve_gate);
             }
-            try be.rope(bufs.q, bufs.q, self.cos, self.sin, pos);
-            try be.rope(bufs.k, bufs.k, self.cos, self.sin, pos);
-            try be.rmsnorm(bufs.q, bufs.q, eps);
-            try be.rmsnorm(bufs.k, bufs.k, eps);
-            try be.scale(bufs.q, bufs.q, mod.GptConfig.qk_scale);
-            try be.scale(bufs.k, bufs.k, mod.GptConfig.qk_scale);
+            try be.ropeNorm(bufs.q, bufs.q, self.cos, self.sin, pos, eps, mod.GptConfig.qk_scale);
+            try be.ropeNorm(bufs.k, bufs.k, self.cos, self.sin, pos, eps, mod.GptConfig.qk_scale);
             try cache.write(i, bufs.k, bufs.v);
             const l = cache.layers[i];
             try be.attention(bufs.y, bufs.q, l.k, l.v, null, .{ .window = cfg.windowSize(i), .keys = pos + t });
@@ -397,12 +393,8 @@ pub const Gpt = struct {
         try be.attentionBackward(g.dq, g.dk, g.dv, g.dy, la.q, la.k, la.v, la.y, la.lse, .{ .window = window });
 
         // q = 1.2 * norm(rope(c_q(xn))), likewise k.
-        try be.scale(g.dq, g.dq, mod.GptConfig.qk_scale);
-        try be.rmsnormBackward(g.dq, g.dq, la.q_rot, eps, false);
-        try be.ropeBackward(g.dq, g.dq, self.cos, self.sin, 0);
-        try be.scale(g.dk, g.dk, mod.GptConfig.qk_scale);
-        try be.rmsnormBackward(g.dk, g.dk, la.k_rot, eps, false);
-        try be.ropeBackward(g.dk, g.dk, self.cos, self.sin, 0);
+        try be.ropeNormBackward(g.dq, g.dq, la.q_rot, self.cos, self.sin, 0, eps, mod.GptConfig.qk_scale);
+        try be.ropeNormBackward(g.dk, g.dk, la.k_rot, self.cos, self.sin, 0, eps, mod.GptConfig.qk_scale);
 
         const dq = try g.dq.reshape(&.{ bt, c });
         const dk = try g.dk.reshape(&.{ bt, kv });
@@ -441,12 +433,8 @@ pub const Gpt = struct {
             try be.gateLinear(la.ve_gate.?, try la.xn.reshape(&.{ bt, c }), layer.ve_gate.?);
             try be.valueMix(la.v, la.ve.?, la.ve_gate.?);
         }
-        try be.rope(la.q_rot, la.q_rot, self.cos, self.sin, 0);
-        try be.rope(la.k_rot, la.k_rot, self.cos, self.sin, 0);
-        try be.rmsnorm(la.q, la.q_rot, eps);
-        try be.rmsnorm(la.k, la.k_rot, eps);
-        try be.scale(la.q, la.q, scale);
-        try be.scale(la.k, la.k, scale);
+        try be.ropeNorm(la.q, la.q_rot, self.cos, self.sin, 0, eps, scale);
+        try be.ropeNorm(la.k, la.k_rot, self.cos, self.sin, 0, eps, scale);
         try be.attention(la.y, la.q, la.k, la.v, la.lse, .{ .window = window });
         try be.matmul(out, try la.y.reshape(&.{ bt, c }), layer.c_proj, .{ .transpose_b = true });
     }

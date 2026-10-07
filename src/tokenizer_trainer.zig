@@ -38,6 +38,8 @@ pub const TokenizerTrainer = struct {
     arena: std.heap.ArenaAllocator,
     counts: std.StringHashMapUnmanaged(i64),
     max_digits: usize,
+    /// Receives the merges' progress, or null.
+    observer: ?mod.TrainObserver = null,
 
     /// Creates an empty trainer.
     ///
@@ -167,6 +169,8 @@ pub const TokenizerTrainer = struct {
         defer deltas.deinit(gpa);
         const merges = vocab_size - 256;
         while (tokens.items.len - 256 < merges) {
+            const done = tokens.items.len - 256;
+            if (done % 64 == 0) mod.TrainObserver.progress(self.observer, "merges", done, merges);
             var top = heap.pop() orelse break;
             const current = pair_counts.get(top.pair) orelse 0;
             if (current <= 0) {

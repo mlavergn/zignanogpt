@@ -186,6 +186,59 @@ pub const GptConfig = struct {
         return total + 2 * self.n_layer + 2; // resid/x0 lambdas, smear_lambda, backout_lambda
     }
 
+    /// Forward FLOPs to decode one token at a context length
+    /// (`estimate_decode_flops`): 2 per matmul weight, plus attention over
+    /// `min(context, window)` keys per layer.
+    ///
+    /// Parameters:
+    /// - `self`: the config.
+    /// - `context`: the tokens already in the cache.
+    ///
+    /// Return: the FLOPs.
+    pub fn decodeFlops(self: Self, context: usize) usize {
+        var attention: usize = 0;
+        for (0..self.n_layer) |i| attention += 4 * self.n_head * self.headDim() * @min(context, self.windowSize(i));
+        return 2 * self.numMatmulParams() + attention;
+    }
+
+    /// Forward FLOPs to prefill a prompt (`estimate_prefill_flops`): causal, so
+    /// token t attends `min(t, window)` keys.
+    ///
+    /// Parameters:
+    /// - `self`: the config.
+    /// - `tokens`: the prompt length.
+    ///
+    /// Return: the FLOPs.
+    pub fn prefillFlops(self: Self, tokens: usize) usize {
+        var attention: usize = 0;
+        for (0..self.n_layer) |i| {
+            const w = @min(self.windowSize(i), tokens);
+            const attended = w * (w + 1) / 2 + (tokens - w) * w; // ramp up to w, then flat
+            attention += 4 * self.n_head * self.headDim() * attended;
+        }
+        return 2 * self.numMatmulParams() * tokens + attention;
+    }
+
+    /// Bytes one token of KV cache stores per row, all layers
+    /// (`kv_bytes_per_token`; this port's cache is f32).
+    pub fn kvBytesPerToken(self: Self) usize {
+        return self.n_layer * 2 * self.kvDim() * @sizeOf(f32);
+    }
+
+    /// Bytes of KV cache one decode step reads per row at a context length
+    /// (`kv_read_bytes`): sliding-window layers read only their window.
+    ///
+    /// Parameters:
+    /// - `self`: the config.
+    /// - `context`: the tokens in the cache.
+    ///
+    /// Return: the bytes.
+    pub fn kvReadBytes(self: Self, context: usize) usize {
+        var total: usize = 0;
+        for (0..self.n_layer) |i| total += 2 * self.kvDim() * @sizeOf(f32) * @min(context, self.windowSize(i));
+        return total;
+    }
+
     /// Training FLOPs per token, forward + backward (`estimate_flops`).
     pub fn flopsPerToken(self: Self) usize {
         var attention: usize = 0;
@@ -214,6 +267,22 @@ test "gpt config counts match the python fixture" {
     try std.testing.expectEqual(@as(usize, 1892784), config.flopsPerToken());
     try std.testing.expectEqual(@as(usize, 241746 - 320 * 64 - 2 * 320 * 32 - 2 * 4 - 2 - 24), config.numScalingParams());
     try std.testing.expect(config.hasValueEmbed(1) and config.hasValueEmbed(3) and !config.hasValueEmbed(0));
+}
+
+test "gpt config inference costs match nanochat's estimators" {
+    // From nanochat's GPT on the meta device (f32 KV, as this port's cache).
+    const small = mod.GptConfig{ .sequence_len = 256, .vocab_size = 1000, .n_layer = 4, .n_head = 4, .n_kv_head = 2, .n_embd = 128, .window_pattern = "SSSL" };
+    try std.testing.expectEqual(@as(usize, 852040), small.numMatmulParams());
+    try std.testing.expectEqual(@as(usize, 2003088), small.decodeFlops(200));
+    try std.testing.expectEqual(@as(usize, 377944192), small.prefillFlops(200));
+    try std.testing.expectEqual(@as(usize, 2048), small.kvBytesPerToken());
+    try std.testing.expectEqual(@as(usize, 299008), small.kvReadBytes(200));
+    const d20 = mod.GptConfig{ .sequence_len = 2048, .vocab_size = 32768, .n_layer = 20, .n_head = 10, .n_kv_head = 10, .n_embd = 1280, .window_pattern = "SSSL" };
+    try std.testing.expectEqual(@as(usize, 435160264), d20.numMatmulParams());
+    try std.testing.expectEqual(@as(usize, 890800528), d20.decodeFlops(200));
+    try std.testing.expectEqual(@as(usize, 176122345600), d20.prefillFlops(200));
+    try std.testing.expectEqual(@as(usize, 204800), d20.kvBytesPerToken());
+    try std.testing.expectEqual(@as(usize, 40960000), d20.kvReadBytes(200));
 }
 
 test "gpt config round-trips nanochat's model_config json" {

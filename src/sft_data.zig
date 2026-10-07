@@ -6,6 +6,7 @@ const mod = @import("module.zig");
 /// `mmlu_epochs` times, GSM8K train `gsm8k_epochs` times), the validation
 /// mixture (SmolTalk test, the first 5,200 MMLU test rows, the first 420 GSM8K
 /// test rows) and the ChatCORE tasks (ARC-Easy, ARC-Challenge, MMLU, GSM8K tests).
+/// Your own conversations (a `ConversationFile`) can join the training mixture.
 /// Heap-allocated: the mixtures point at its task lists.
 pub const SftData = struct {
     const Self = @This();
@@ -18,6 +19,8 @@ pub const SftData = struct {
     /// Evaluated for ChatCORE; opened on first use by `chatcoreTasks`.
     chatcore: []const *const mod.Task = &.{},
     chatcore_loaded: bool = false,
+    /// Your conversations, when given (the custom task borrows them).
+    conversations: ?*mod.ConversationFile = null,
     config: ?*const mod.Config = null,
     io: ?std.Io = null,
     train: mod.TaskMixture,
@@ -31,10 +34,11 @@ pub const SftData = struct {
     /// - `config`: the base directories (outlives the data).
     /// - `mmlu_epochs`: copies of MMLU auxiliary_train in the training mixture.
     /// - `gsm8k_epochs`: copies of GSM8K train.
+    /// - `extra`: your conversations (a JSONL path) and their copies in training, or null.
     /// - `out`: download progress, or null.
     ///
-    /// Return: the data (`destroy` it); task errors.
-    pub fn openStandard(allocator: std.mem.Allocator, io: std.Io, config: *const mod.Config, mmlu_epochs: usize, gsm8k_epochs: usize, out: ?*std.Io.Writer) !*Self {
+    /// Return: the data (`destroy` it); task and conversation-file errors.
+    pub fn openStandard(allocator: std.mem.Allocator, io: std.Io, config: *const mod.Config, mmlu_epochs: usize, gsm8k_epochs: usize, extra: ?Extra, out: ?*std.Io.Writer) !*Self {
         log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
         const self = try allocator.create(Self);
         self.* = .{ .allocator = allocator, .train = undefined, .val = undefined, .config = config, .io = io };
@@ -48,6 +52,7 @@ pub const SftData = struct {
         try train.append(allocator, smoltalk);
         try train.appendNTimes(allocator, mmlu, mmlu_epochs);
         try train.appendNTimes(allocator, gsm8k, gsm8k_epochs);
+        if (extra) |e| try train.appendNTimes(allocator, try self.openConversations(io, e.path), e.epochs);
 
         const smoltalk_test = try self.open(io, config, .smoltalk, "test", out);
         const mmlu_test = try self.open(io, config, .mmlu, "test", out);
@@ -78,6 +83,9 @@ pub const SftData = struct {
         return self;
     }
 
+    /// Conversations from your own file, mixed into training `epochs` times.
+    pub const Extra = struct { path: []const u8, epochs: usize = 1 };
+
     pub fn destroy(self: *Self) void {
         log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
         self.val.deinit();
@@ -87,6 +95,15 @@ pub const SftData = struct {
         self.allocator.free(self.chatcore);
         self.freeOwned();
         self.allocator.destroy(self);
+    }
+
+    /// The training rows that come from your conversations (all epochs).
+    pub fn customRows(self: *const Self) usize {
+        var n: usize = 0;
+        for (self.train_tasks) |t| {
+            if (t.kind == .custom) n += t.len();
+        }
+        return n;
     }
 
     /// The ChatCORE tasks, opened on first use.
@@ -121,11 +138,79 @@ pub const SftData = struct {
         return task;
     }
 
+    /// Loads the conversation file and a task over it (both owned).
+    fn openConversations(self: *Self, io: std.Io, path: []const u8) !*mod.Task {
+        const file = try self.allocator.create(mod.ConversationFile);
+        errdefer self.allocator.destroy(file);
+        file.* = try mod.ConversationFile.load(self.allocator, mod.Storage.init(self.allocator, io), path);
+        self.conversations = file;
+        const task = try self.allocator.create(mod.Task);
+        errdefer self.allocator.destroy(task);
+        task.* = mod.Task.fromConversations(self.allocator, file);
+        try self.owned.append(self.allocator, task);
+        return task;
+    }
+
     fn freeOwned(self: *Self) void {
         for (self.owned.items) |t| {
             t.deinit();
             self.allocator.destroy(t);
         }
         self.owned.deinit(self.allocator);
+        if (self.conversations) |file| {
+            file.deinit();
+            self.allocator.destroy(file);
+            self.conversations = null;
+        }
     }
 };
+
+// -----------------------------------------------------------------------------
+// Unit Tests
+
+test "your conversations join the training mixture and render for training" {
+    const allocator = std.testing.allocator;
+    const root = mod.build_options.source_root ++ "/testdata";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const storage = mod.Storage.init(allocator, std.testing.io);
+    const path = try std.fs.path.join(allocator, &.{ base, "identity.jsonl" });
+    defer allocator.free(path);
+    try storage.write(path,
+        \\[{"role": "user", "content": "What is your name?"}, {"role": "assistant", "content": "I am zignanogpt."}]
+        \\[{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Who made you?"}, {"role": "assistant", "content": "Someone with a Mac."}, {"role": "user", "content": "Thanks"}, {"role": "assistant", "content": "Sure."}]
+        \\
+    );
+    const config = mod.Config{ .allocator = allocator, .base_dir = base, .nanochat_dir = root ++ "/task_base", .data_url = "http://unused" };
+    const plain = try SftData.openStandard(allocator, std.testing.io, &config, 1, 1, null, null);
+    defer plain.destroy();
+    const data = try SftData.openStandard(allocator, std.testing.io, &config, 1, 1, .{ .path = path, .epochs = 3 }, null);
+    defer data.destroy();
+    try std.testing.expectEqual(@as(usize, 6), data.customRows());
+    try std.testing.expectEqual(plain.train.len() + 6, data.train.len());
+    try std.testing.expectEqual(plain.val.len(), data.val.len());
+
+    // Every custom row renders: the assistant's tokens are the ones trained on.
+    var tok = try mod.TorchImport.loadTokenizer(allocator, storage, root ++ "/nanochat_base/tokenizer/tokenizer.pkl");
+    defer tok.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var found: usize = 0;
+    for (0..data.train.len()) |i| {
+        const e = data.train.entries[i];
+        if (data.train.tasks[e.task].kind != .custom) continue;
+        found += 1;
+        var rendered = try tok.renderConversation(allocator, try data.train.conversation(arena.allocator(), i), 2048);
+        defer rendered.deinit(allocator);
+        var trained: usize = 0;
+        for (rendered.mask.items) |m| trained += m;
+        try std.testing.expect(trained > 0 and trained < rendered.ids.items.len);
+    }
+    try std.testing.expectEqual(@as(usize, 6), found);
+
+    // A bad line fails the load and frees what was opened.
+    try storage.write(path, "[{\"role\": \"user\", \"content\": \"no reply\"}]\n");
+    try std.testing.expectError(error.InvalidConversation, SftData.openStandard(allocator, std.testing.io, &config, 1, 1, .{ .path = path }, null));
+}

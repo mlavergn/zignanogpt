@@ -3,8 +3,7 @@ const log = std.log.scoped(.zignanogpt_console_app);
 const cli = @import("module.zig");
 const mod = cli.nanogpt;
 const tui = cli.tui;
-const vxfw = tui.vxfw;
-const Span = vxfw.RichText.TextSpan;
+const Span = tui.TextSpan;
 const Theme = tui.Theme;
 
 /// Which pane the keys go to.
@@ -28,15 +27,16 @@ const PaneView = struct {
     const Self = @This();
 
     app: *ConsoleApp,
-    part: enum { nav, detail },
+    part: enum { split, nav, detail },
 
-    fn widget(self: *const Self) vxfw.Widget {
+    fn widget(self: *const Self) tui.Widget {
         return .{ .userdata = @constCast(self), .drawFn = typeErasedDrawFn };
     }
 
-    fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+    fn typeErasedDrawFn(ptr: *anyopaque, ctx: tui.DrawContext) std.mem.Allocator.Error!tui.Surface {
         const self: *const Self = @ptrCast(@alignCast(ptr));
         return switch (self.part) {
+            .split => self.app.splitPane(ctx),
             .nav => self.app.navPane(ctx),
             .detail => self.app.detailPane(ctx),
         };
@@ -153,14 +153,14 @@ pub const ConsoleApp = struct {
         try self.run(index);
     }
 
-    pub fn widget(self: *Self) vxfw.Widget {
+    pub fn widget(self: *Self) tui.Widget {
         return .{ .userdata = self, .eventHandler = typeErasedEventHandler, .drawFn = typeErasedDrawFn };
     }
 
     // -------------------------------------------------------------------------
     // Events
 
-    pub fn handleEvent(self: *Self, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
+    pub fn handleEvent(self: *Self, ctx: *tui.EventContext, event: tui.vxfw.Event) anyerror!void {
         switch (event) {
             .init => {
                 self.overview.refresh(self.init);
@@ -195,7 +195,7 @@ pub const ConsoleApp = struct {
         }
     }
 
-    fn handleKey(self: *Self, ctx: *vxfw.EventContext, key: tui.Key) !void {
+    fn handleKey(self: *Self, ctx: *tui.EventContext, key: tui.Key) !void {
         if (key.matches('c', .{ .ctrl = true })) {
             ctx.quit = true;
             return;
@@ -364,7 +364,7 @@ pub const ConsoleApp = struct {
     }
 
     /// Quits; while a job runs, only on the second `q` (`armed`).
-    fn quit(self: *Self, ctx: *vxfw.EventContext, armed: bool) void {
+    fn quit(self: *Self, ctx: *tui.EventContext, armed: bool) void {
         self.chat.requestStop();
         if (self.job.running() and !armed) {
             self.quit_armed = true;
@@ -382,54 +382,48 @@ pub const ConsoleApp = struct {
     // -------------------------------------------------------------------------
     // Drawing
 
-    pub fn draw(self: *Self, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const width = ctx.max.width orelse 0;
-        const height = ctx.max.height orelse 0;
+    pub fn draw(self: *Self, ctx: tui.DrawContext) std.mem.Allocator.Error!tui.Surface {
         const a = ctx.arena;
-        const op = operations[self.nav];
+        const split = try a.create(PaneView);
+        split.* = .{ .app = self, .part = .split };
+        // The split takes every row but the last, which is the status line.
+        const status = try textBlock(a, &.{try self.statusLine().spans(a)});
+        const column = try a.create(tui.Column);
+        column.* = .{ .items = try a.dupe(tui.ColumnItem, &.{ .{ .widget = split.widget() }, .{ .widget = status, .height = 1 } }) };
+        var surface = try column.draw(ctx);
+        surface.widget = self.widget();
+        return surface;
+    }
+
+    /// The two panes under their titles.
+    fn splitPane(self: *Self, ctx: tui.DrawContext) std.mem.Allocator.Error!tui.Surface {
+        const a = ctx.arena;
         const bold: tui.Style = .{ .fg = Theme.primaryText.color(), .bold = true };
-        const left_title = try a.create(vxfw.Text);
-        left_title.* = .{ .text = "  Operations", .style = bold, .softwrap = false };
-        const right_title = try a.create(vxfw.Text);
-        right_title.* = .{ .text = op.title, .style = bold, .softwrap = false };
         const views = try a.alloc(PaneView, 2);
         views[0] = .{ .app = self, .part = .nav };
         views[1] = .{ .app = self, .part = .detail };
-
-        // The split takes every row but the last, which is the status line.
-        const split_height = height -| 1;
-        const split_size: vxfw.Size = .{ .width = width, .height = split_height };
-        const children = try a.dupe(vxfw.SubSurface, &.{
-            .{ .origin = .{ .row = 0, .col = 0 }, .surface = try self.split.draw(ctx.withConstraints(split_size, .fromSize(split_size)), .{
-                .left_title = left_title.widget(),
-                .right_title = right_title.widget(),
-                .left = views[0].widget(),
-                .right = views[1].widget(),
-            }) },
-            .{ .origin = .{ .row = split_height, .col = 0 }, .surface = try self.statusLine().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 })) },
+        return self.split.draw(ctx, .{
+            .left_title = try textBlock(a, &.{try a.dupe(Span, &.{.{ .text = "  Operations", .style = bold }})}),
+            .right_title = try textBlock(a, &.{try a.dupe(Span, &.{.{ .text = operations[self.nav].title, .style = bold }})}),
+            .left = views[0].widget(),
+            .right = views[1].widget(),
         });
-        return .{
-            .size = .{ .width = width, .height = height },
-            .widget = self.widget(),
-            .buffer = &.{},
-            .children = children,
-        };
     }
 
     /// The left pane: one row per operation.
-    fn navPane(self: *Self, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+    fn navPane(self: *Self, ctx: tui.DrawContext) std.mem.Allocator.Error!tui.Surface {
         const width = ctx.max.width orelse 0;
-        var lines: std.ArrayList([]const Span) = .empty;
-        for (operations, 0..) |entry, i| try lines.append(ctx.arena, try self.navRow(ctx.arena, entry, i, width));
-        return (try self.block(ctx, 0, 0, width, ctx.max.height orelse 0, lines.items)).surface;
+        var rows: std.ArrayList([]const Span) = .empty;
+        for (operations, 0..) |entry, i| try rows.append(ctx.arena, try self.navRow(ctx.arena, entry, i, width));
+        const block: tui.TextBlock = .{ .lines = rows.items };
+        return block.draw(ctx);
     }
 
     /// The right pane, one column in from the divider.
-    fn detailPane(self: *Self, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const width = ctx.max.width orelse 0;
-        const height = ctx.max.height orelse 0;
-        const children = try ctx.arena.dupe(vxfw.SubSurface, &.{try self.pane(ctx, 0, 1, width -| 1, height)});
-        return .{ .size = .{ .width = width, .height = height }, .widget = self.widget(), .buffer = &.{}, .children = children };
+    fn detailPane(self: *Self, ctx: tui.DrawContext) std.mem.Allocator.Error!tui.Surface {
+        const content = try self.pane(ctx.arena, (ctx.max.width orelse 0) -| 1, ctx.max.height orelse 0);
+        const column: tui.Column = .{ .items = &.{.{ .widget = content }}, .indent = 1 };
+        return column.draw(ctx);
     }
 
     fn navRow(self: *Self, a: std.mem.Allocator, entry: cli.Operation, index: usize, width: u16) ![]const Span {
@@ -450,104 +444,100 @@ pub const ConsoleApp = struct {
     }
 
     /// The right pane: summary, form, Run row, then output or training progress.
-    fn pane(self: *Self, ctx: vxfw.DrawContext, row: u16, col: u16, width: u16, height: u16) !vxfw.SubSurface {
-        const a = ctx.arena;
+    fn pane(self: *Self, a: std.mem.Allocator, width: u16, height: u16) !tui.Widget {
         const op = operations[self.nav];
-        var lines: std.ArrayList([]const Span) = .empty;
-        try lines.append(a, &.{.{ .text = op.summary, .style = Theme.secondaryText.style() }});
-        try lines.append(a, &.{});
+        var rows: std.ArrayList([]const Span) = .empty;
+        for (try tui.TextWidth.wrap(a, op.summary, @max(width, 1))) |line| {
+            try rows.append(a, try a.dupe(Span, &.{.{ .text = line, .style = Theme.secondaryText.style() }}));
+        }
+        try rows.append(a, &.{});
 
         if (op.command == null) {
             for (self.overview.lines) |l| {
-                try lines.append(a, try a.dupe(Span, &.{
+                try rows.append(a, try a.dupe(Span, &.{
                     .{ .text = try pad(a, l.label, label_width), .style = Theme.secondaryText.style() },
                     .{ .text = l.value, .style = if (l.problem) Theme.warningText.style() else Theme.primaryText.style() },
                 }));
             }
-            try lines.append(a, &.{});
-            try lines.append(a, try a.dupe(Span, &.{ .{ .text = "r", .style = Theme.keyHint.style() }, .{ .text = " refreshes", .style = Theme.secondaryText.style() } }));
-            return self.block(ctx, row, col, width, height, lines.items);
+            try rows.append(a, &.{});
+            try rows.append(a, try a.dupe(Span, &.{ .{ .text = "r", .style = Theme.keyHint.style() }, .{ .text = " refreshes", .style = Theme.secondaryText.style() } }));
+            return textBlock(a, rows.items);
         }
         if (op.phase()) |p| {
-            try lines.append(a, &.{.{ .text = try std.fmt.allocPrint(a, "Arrives in PLAN.md phase {d}.", .{p}), .style = Theme.warningText.style() }});
-            return self.block(ctx, row, col, width, height, lines.items);
+            try rows.append(a, try a.dupe(Span, &.{.{ .text = try std.fmt.allocPrint(a, "Arrives in PLAN.md phase {d}.", .{p}), .style = Theme.warningText.style() }}));
+            return textBlock(a, rows.items);
         }
 
-        if (op.command == .chat) return self.chatPane(ctx, row, col, width, height, lines);
-        return self.formPane(ctx, row, col, width, height, lines);
+        if (op.command == .chat) return self.chatPane(a, height, rows);
+        return self.formPane(a, width, height, rows);
     }
 
     /// The form rows and the Run row, then this operation's output.
-    fn formPane(self: *Self, ctx: vxfw.DrawContext, row: u16, col: u16, width: u16, height: u16, start: std.ArrayList([]const Span)) !vxfw.SubSurface {
-        const a = ctx.arena;
+    fn formPane(self: *Self, a: std.mem.Allocator, width: u16, height: u16, start: std.ArrayList([]const Span)) !tui.Widget {
         const op = operations[self.nav];
-        var lines = start;
-        try self.formLines(a, &lines);
+        var rows = start;
+        try self.formLines(a, &rows);
         const running_here = self.job.operation == self.nav and self.job.currentState() == .running;
         const on_run = self.focus == .form and self.form.cursor == op.fields.len;
-        try lines.append(a, try a.dupe(Span, &.{
+        try rows.append(a, try a.dupe(Span, &.{
             self.form.marker(op.fields.len, self.focus == .form),
             if (running_here)
                 .{ .text = if (op.command == .train or op.command == .sft or op.command == .rl) "■ running (s stops and saves)" else "■ running", .style = Theme.warningText.style() }
             else
                 .{ .text = "▶ Run", .style = .{ .fg = Theme.keyHint.color(), .bold = on_run } },
         }));
-        try lines.append(a, &.{});
+        try rows.append(a, &.{});
+        if (self.job.operation != self.nav) return textBlock(a, rows.items);
 
-        // Output of this operation's last job.
-        if (self.job.operation == self.nav) {
-            const state = self.job.currentState();
-            try lines.append(a, try markLine(a, jobMark(state), switch (state) {
-                .running => " running",
-                .succeeded => " finished",
-                .failed => try std.fmt.allocPrint(a, " failed: {s}", .{self.job.failure orelse "exit code"}),
-                .idle => "",
-            }));
-            const used: u16 = @intCast(@min(lines.items.len, height));
-            const top = try self.block(ctx, row, col, width, used, lines.items);
-            const rest = height -| used;
-            const snap = try self.job.snapshot(a);
-            const body = if ((op.command == .train or op.command == .sft) and snap.report != null)
-                try self.trainView(ctx, snap, width, rest)
-            else
-                try self.logView(ctx, width, rest);
-            return self.stack(ctx, row, col, width, height, top, body, used);
-        }
-        return self.block(ctx, row, col, width, height, lines.items);
+        // Output of this operation's last job, below the form.
+        const state = self.job.currentState();
+        try rows.append(a, try markLine(a, jobMark(state), switch (state) {
+            .running => " running",
+            .succeeded => " finished",
+            .failed => try std.fmt.allocPrint(a, " failed: {s}", .{self.job.failure orelse "exit code"}),
+            .idle => "",
+        }));
+        const snap = try self.job.snapshot(a);
+        if (snap.progress) |p| try rows.append(a, try progressLine(a, p, width));
+        const used: u16 = @intCast(@min(rows.items.len, height));
+        const rest = height -| used;
+        const body = if ((op.command == .train or op.command == .sft) and snap.report != null)
+            try trainView(a, snap, width, rest)
+        else if (op.command == .rl and snap.rl_report != null)
+            try rlView(a, snap, width, rest)
+        else
+            try self.logView(a, rest);
+        return stacked(a, try textBlock(a, rows.items), used, body);
     }
 
     /// The chat page: the settings form until a model is loaded (or while it
     /// is being edited), then the transcript and the message being typed.
-    fn chatPane(self: *Self, ctx: vxfw.DrawContext, row: u16, col: u16, width: u16, height: u16, start: std.ArrayList([]const Span)) !vxfw.SubSurface {
-        const a = ctx.arena;
+    fn chatPane(self: *Self, a: std.mem.Allocator, height: u16, start: std.ArrayList([]const Span)) !tui.Widget {
         const op = operations[self.nav];
-        var lines = start;
+        var rows = start;
         const snap = try self.chat.snapshot(a);
         const open = snap.state == .loading or snap.state == .ready or snap.state == .replying;
         if (!open or self.focus == .form) {
-            try self.formLines(a, &lines);
+            try self.formLines(a, &rows);
             const on_run = self.focus == .form and self.form.cursor == op.fields.len;
-            try lines.append(a, try a.dupe(Span, &.{
+            try rows.append(a, try a.dupe(Span, &.{
                 self.form.marker(op.fields.len, self.focus == .form),
                 .{ .text = if (open) "▶ Load another model" else "▶ Load model", .style = .{ .fg = Theme.keyHint.color(), .bold = on_run } },
             }));
-            try lines.append(a, &.{});
+            try rows.append(a, &.{});
         }
-        try lines.append(a, try markLine(a, chatMark(snap.state), switch (snap.state) {
+        try rows.append(a, try markLine(a, chatMark(snap.state), switch (snap.state) {
             .idle => "",
             .loading => " loading the model",
             .ready, .replying => try std.fmt.allocPrint(a, " {s}", .{snap.label}),
             .failed => try std.fmt.allocPrint(a, " failed: {s}", .{snap.failure orelse "error"}),
         }));
-        const used: u16 = @intCast(@min(lines.items.len, height));
-        const top = try self.block(ctx, row, col, width, used, lines.items);
-        const body = try self.chatView(ctx, snap, width, height -| used);
-        return self.stack(ctx, row, col, width, height, top, body, used);
+        const used: u16 = @intCast(@min(rows.items.len, height));
+        return stacked(a, try textBlock(a, rows.items), used, try self.chatView(a, snap));
     }
 
     /// The transcript's last lines above the input line.
-    fn chatView(self: *Self, ctx: vxfw.DrawContext, snap: cli.ChatSnapshot, width: u16, height: u16) !vxfw.Surface {
-        const a = ctx.arena;
+    fn chatView(self: *Self, a: std.mem.Allocator, snap: cli.ChatSnapshot) !tui.Widget {
         const entries = try a.alloc(tui.TranscriptEntry, snap.turns.len);
         for (snap.turns, entries, 0..) |turn, *entry, i| {
             var text = std.mem.trimEnd(u8, turn.text, "\n");
@@ -560,21 +550,18 @@ pub const ConsoleApp = struct {
         }
         const record = try a.create(tui.TranscriptView);
         record.* = .{ .entries = entries };
-        const room: vxfw.Size = .{ .width = width, .height = height -| 1 };
 
         const chatting = self.focus == .chat and operations[self.nav].command == .chat;
         const input_line: []const Span = if (chatting) blk: {
             const typed = try self.input.spans(a, .{ .fg = Theme.primaryText.color(), .bold = true });
             break :blk try a.dupe(Span, &.{ .{ .text = "› ", .style = .{ .fg = Theme.cursor.color(), .bold = true } }, typed[0], typed[1] });
         } else if (snap.state == .ready or snap.state == .replying)
-            &.{.{ .text = "  enter or → to type a message", .style = Theme.secondaryText.style() }}
+            try a.dupe(Span, &.{.{ .text = "  enter or → to type a message", .style = Theme.secondaryText.style() }})
         else
             &.{};
-        const children = try a.dupe(vxfw.SubSurface, &.{
-            .{ .origin = .{ .row = 0, .col = 0 }, .surface = try record.draw(ctx.withConstraints(room, .fromSize(room))) },
-            try self.line(ctx, height -| 1, 0, width, input_line),
-        });
-        return .{ .size = .{ .width = width, .height = height }, .widget = self.widget(), .buffer = &.{}, .children = children };
+        const column = try a.create(tui.Column);
+        column.* = .{ .items = try a.dupe(tui.ColumnItem, &.{ .{ .widget = record.widget() }, .{ .widget = try textBlock(a, &.{input_line}), .height = 1 } }) };
+        return column.widget();
     }
 
     /// The operation's form rows.
@@ -599,55 +586,99 @@ pub const ConsoleApp = struct {
     }
 
     /// The last lines of the job's output.
-    fn logView(self: *Self, ctx: vxfw.DrawContext, width: u16, height: u16) !vxfw.Surface {
-        const a = ctx.arena;
+    fn logView(self: *Self, a: std.mem.Allocator, height: u16) !tui.Widget {
         const tail = try self.job.tail(a, height);
         const entries = try a.alloc(tui.TranscriptEntry, tail.len);
         for (tail, entries) |t, *entry| entry.* = .{ .text = t, .role = .secondaryText };
         const record = try a.create(tui.TranscriptView);
         record.* = .{ .entries = entries, .indent = 0, .spaced = false, .wrap = false };
-        const size: vxfw.Size = .{ .width = width, .height = height };
-        return record.draw(ctx.withConstraints(size, .fromSize(size)));
+        return record.widget();
     }
 
     /// Progress, live numbers, the loss curve, val bpb and samples.
-    fn trainView(self: *Self, ctx: vxfw.DrawContext, snap: cli.TrainSnapshot, width: u16, height: u16) !vxfw.Surface {
-        const a = ctx.arena;
+    fn trainView(a: std.mem.Allocator, snap: cli.TrainSnapshot, width: u16, height: u16) !tui.Widget {
         const r = snap.report.?;
-        var lines: std.ArrayList([]const Span) = .empty;
+        var rows: std.ArrayList([]const Span) = .empty;
         const done = @as(f64, @floatFromInt(r.step + 1)) / @as(f64, @floatFromInt(r.num_iterations));
         const bar: tui.ProgressBar = .{ .done = done, .width = @max(@as(usize, width) -| 28, 10) };
         const eta = if (r.step > 10) r.total_time / @as(f64, @floatFromInt(r.step - 10)) * @as(f64, @floatFromInt(r.num_iterations - r.step)) / 60 else 0;
-        try lines.append(a, try a.dupe(Span, &.{
+        try rows.append(a, try a.dupe(Span, &.{
             try bar.span(a),
             .{ .text = try std.fmt.allocPrint(a, " {d}/{d}  eta {d:.1}m", .{ r.step + 1, r.num_iterations, eta }) },
         }));
-        try lines.append(a, &.{.{ .text = try std.fmt.allocPrint(a, "loss {d:.4} · lrm {d:.2} · {d:.0} tok/s · {d:.3} TFLOP/s · {d:.0} ms/step · epoch {d}", .{ r.loss, r.lrm, r.tok_per_sec, r.tflops, r.dt * 1000, r.state.epoch }) }});
+        try rows.append(a, try a.dupe(Span, &.{.{ .text = try std.fmt.allocPrint(a, "loss {d:.4} · lrm {d:.2} · {d:.0} tok/s · {d:.3} TFLOP/s · {d:.0} ms/step · epoch {d}", .{ r.loss, r.lrm, r.tok_per_sec, r.tflops, r.dt * 1000, r.state.epoch }) }}));
         var bpb: std.ArrayList(u8) = .empty;
         try bpb.appendSlice(a, "val bpb");
         const first = snap.evals.len -| 6;
-        for (snap.evals[first..]) |e| try bpb.print(a, "  {d:.4}@{d}", .{ e.bpb, e.step });
-        try lines.append(a, &.{.{ .text = bpb.items, .style = Theme.secondaryText.style() }});
-        const header: u16 = @intCast(lines.items.len);
+        for (snap.evals[first..]) |e| try bpb.print(a, "  {d:.4}@{d}", .{ e.value, e.step });
+        try rows.append(a, try a.dupe(Span, &.{.{ .text = bpb.items, .style = Theme.secondaryText.style() }}));
+        const header: u16 = @intCast(rows.items.len);
 
         var tail: std.ArrayList([]const Span) = .empty;
         if (snap.samples.len > 0) {
-            try tail.append(a, &.{.{ .text = try std.fmt.allocPrint(a, "samples at step {d}", .{snap.sample_step}), .style = .{ .bold = true } }});
-            for (snap.samples) |s| try tail.append(a, &.{.{ .text = try std.mem.replaceOwned(u8, a, s, "\n", " ") }});
+            try tail.append(a, try a.dupe(Span, &.{.{ .text = try std.fmt.allocPrint(a, "samples at step {d}", .{snap.sample_step}), .style = .{ .bold = true } }}));
+            for (snap.samples) |s| try tail.append(a, try a.dupe(Span, &.{.{ .text = try std.mem.replaceOwned(u8, a, s, "\n", " ") }}));
         }
         const tail_h: u16 = @intCast(@min(tail.items.len, height / 3));
         const curve_h = height -| header -| tail_h -| 1;
 
-        var children: std.ArrayList(vxfw.SubSurface) = .empty;
-        try children.append(a, try self.block(ctx, 0, 0, width, header, lines.items));
-        if (curve_h >= 3) {
-            const chart = try a.create(tui.Sparkline);
-            chart.* = .{ .values = snap.losses };
-            const size: vxfw.Size = .{ .width = width, .height = curve_h };
-            try children.append(a, .{ .origin = .{ .row = header, .col = 0 }, .surface = try chart.draw(ctx.withConstraints(size, .fromSize(size))) });
-        }
-        if (tail_h > 0) try children.append(a, try self.block(ctx, header + curve_h + 1, 0, width, tail_h, tail.items[0..tail_h]));
-        return .{ .size = .{ .width = width, .height = height }, .widget = self.widget(), .buffer = &.{}, .children = children.items };
+        // Header, loss curve (when it has room), a blank row, samples.
+        const chart = try a.create(tui.Sparkline);
+        chart.* = .{ .values = snap.losses };
+        const blank = try textBlock(a, &.{});
+        const column = try a.create(tui.Column);
+        column.* = .{ .items = try a.dupe(tui.ColumnItem, &.{
+            .{ .widget = try textBlock(a, rows.items), .height = header },
+            .{ .widget = if (curve_h >= 3) chart.widget() else blank, .height = curve_h },
+            .{ .widget = blank, .height = 1 },
+            .{ .widget = try textBlock(a, tail.items[0..tail_h]), .height = tail_h },
+        }) };
+        return column.widget();
+    }
+
+    /// RL progress: steps, reward and sequence length, pass@1, the reward curve.
+    fn rlView(a: std.mem.Allocator, snap: cli.TrainSnapshot, width: u16, height: u16) !tui.Widget {
+        const r = snap.rl_report.?;
+        var rows: std.ArrayList([]const Span) = .empty;
+        const finished = r.step + 1;
+        const done = @as(f64, @floatFromInt(finished)) / @as(f64, @floatFromInt(@max(r.num_steps, 1)));
+        const bar: tui.ProgressBar = .{ .done = done, .width = @max(@as(usize, width) -| 28, 10) };
+        const eta = r.total_time / @as(f64, @floatFromInt(finished)) * @as(f64, @floatFromInt(r.num_steps -| finished)) / 60;
+        try rows.append(a, try a.dupe(Span, &.{
+            try bar.span(a),
+            .{ .text = try std.fmt.allocPrint(a, " {d}/{d}  eta {d:.1}m", .{ finished, r.num_steps, eta }) },
+        }));
+        try rows.append(a, try a.dupe(Span, &.{.{ .text = try std.fmt.allocPrint(a, "reward {d:.4} · sequence length {d:.1} · lrm {d:.2} · {d:.1} s/step", .{ r.reward, r.sequence_length, r.lrm, r.dt }) }}));
+        var passk: std.ArrayList(u8) = .empty;
+        try passk.appendSlice(a, "pass@1");
+        const first = snap.evals.len -| 6;
+        for (snap.evals[first..]) |e| try passk.print(a, "  {d:.4}@{d}", .{ e.value, e.step });
+        try rows.append(a, try a.dupe(Span, &.{.{ .text = passk.items, .style = Theme.secondaryText.style() }}));
+        try rows.append(a, try a.dupe(Span, &.{.{ .text = "mean reward per step", .style = .{ .bold = true } }}));
+        const header: u16 = @intCast(rows.items.len);
+
+        const chart = try a.create(tui.Sparkline);
+        chart.* = .{ .values = snap.rewards };
+        const curve_h = height -| header;
+        const column = try a.create(tui.Column);
+        column.* = .{ .items = try a.dupe(tui.ColumnItem, &.{
+            .{ .widget = try textBlock(a, rows.items), .height = header },
+            .{ .widget = if (curve_h >= 3) chart.widget() else try textBlock(a, &.{}), .height = curve_h },
+        }) };
+        return column.widget();
+    }
+
+    /// The job's current work as a bar: `label  ████░░░░ done/total`.
+    fn progressLine(a: std.mem.Allocator, p: cli.JobProgress, width: u16) ![]const Span {
+        const done = if (p.total == 0) 0 else @as(f64, @floatFromInt(p.done)) / @as(f64, @floatFromInt(p.total));
+        const count = try std.fmt.allocPrint(a, " {d}/{d}", .{ p.done, p.total });
+        const label = try std.fmt.allocPrint(a, "{s}  ", .{p.label});
+        const bar: tui.ProgressBar = .{ .done = done, .width = @max(@as(usize, width) -| (displayWidth(label) + count.len + 2), 10) };
+        return a.dupe(Span, &.{
+            .{ .text = label, .style = Theme.secondaryText.style() },
+            try bar.span(a),
+            .{ .text = count, .style = Theme.secondaryText.style() },
+        });
     }
 
     /// The bottom line: where the keys go, then the keys that work there, or the notice.
@@ -716,25 +747,20 @@ pub const ConsoleApp = struct {
     // -------------------------------------------------------------------------
     // Layout helpers
 
-    /// One line of spans at `(row, col)`.
-    fn line(self: *Self, ctx: vxfw.DrawContext, row: u16, col: u16, width: u16, spans: []const Span) !vxfw.SubSurface {
-        _ = self;
-        const text = try ctx.arena.create(vxfw.RichText);
-        text.* = .{ .text = spans, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
-        return .{ .origin = .{ .row = row, .col = col }, .surface = try text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 })) };
+    /// Lines of spans as a frame-arena widget. The widget draws after its
+    /// builder returns, so the list is copied into the arena; each row must
+    /// already live there (`a.dupe` a literal holding runtime values).
+    fn textBlock(a: std.mem.Allocator, rows: []const []const Span) !tui.Widget {
+        const block = try a.create(tui.TextBlock);
+        block.* = .{ .lines = try a.dupe([]const Span, rows) };
+        return block.widget();
     }
 
-    /// Lines stacked from `(row, col)`, clipped to `height`.
-    fn block(self: *Self, ctx: vxfw.DrawContext, row: u16, col: u16, width: u16, height: u16, lines: []const []const Span) !vxfw.SubSurface {
-        var children: std.ArrayList(vxfw.SubSurface) = .empty;
-        for (lines[0..@min(lines.len, height)], 0..) |spans, r| try children.append(ctx.arena, try self.line(ctx, @intCast(r), 0, width, spans));
-        return .{ .origin = .{ .row = row, .col = col }, .surface = .{ .size = .{ .width = width, .height = height }, .widget = self.widget(), .buffer = &.{}, .children = children.items } };
-    }
-
-    /// `top` above `body`, as one sub-surface.
-    fn stack(self: *Self, ctx: vxfw.DrawContext, row: u16, col: u16, width: u16, height: u16, top: vxfw.SubSurface, body: vxfw.Surface, split: u16) !vxfw.SubSurface {
-        const children = try ctx.arena.dupe(vxfw.SubSurface, &.{ .{ .origin = .{ .row = 0, .col = 0 }, .surface = top.surface }, .{ .origin = .{ .row = split, .col = 0 }, .surface = body } });
-        return .{ .origin = .{ .row = row, .col = col }, .surface = .{ .size = .{ .width = width, .height = height }, .widget = self.widget(), .buffer = &.{}, .children = children } };
+    /// `top` (taking `top_rows`) over `body` (the rest), as a frame-arena widget.
+    fn stacked(a: std.mem.Allocator, top: tui.Widget, top_rows: u16, body: tui.Widget) !tui.Widget {
+        const column = try a.create(tui.Column);
+        column.* = .{ .items = try a.dupe(tui.ColumnItem, &.{ .{ .widget = top, .height = top_rows }, .{ .widget = body } }) };
+        return column.widget();
     }
 
     fn pad(a: std.mem.Allocator, text: []const u8, width: usize) ![]const u8 {
@@ -757,12 +783,12 @@ pub const ConsoleApp = struct {
         return std.unicode.utf8CountCodepoints(text) catch text.len;
     }
 
-    fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
+    fn typeErasedEventHandler(ptr: *anyopaque, ctx: *tui.EventContext, event: tui.vxfw.Event) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.handleEvent(ctx, event);
     }
 
-    fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+    fn typeErasedDrawFn(ptr: *anyopaque, ctx: tui.DrawContext) std.mem.Allocator.Error!tui.Surface {
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.draw(ctx);
     }
@@ -797,12 +823,12 @@ const TestSupport = struct {
         self.env.deinit();
     }
 
-    fn context(allocator: std.mem.Allocator) vxfw.EventContext {
+    fn context(allocator: std.mem.Allocator) tui.EventContext {
         return .{ .io = std.testing.io, .alloc = allocator, .cmds = .empty, .phase = .at_target };
     }
 };
 
-fn press(app: *ConsoleApp, ctx: *vxfw.EventContext, key: tui.Key) !void {
+fn press(app: *ConsoleApp, ctx: *tui.EventContext, key: tui.Key) !void {
     try app.handleEvent(ctx, .{ .key_press = key });
 }
 
@@ -817,6 +843,8 @@ test "console navigates operations and edits a form field" {
     defer ctx.cmds.deinit(allocator);
 
     try press(&app, &ctx, .{ .codepoint = tui.Key.down });
+    try std.testing.expectEqualStrings("Prepare data", operations[app.nav].title);
+    try press(&app, &ctx, .{ .codepoint = tui.Key.down });
     try std.testing.expectEqualStrings("Download data", operations[app.nav].title);
     try press(&app, &ctx, .{ .codepoint = tui.Key.enter });
     try std.testing.expectEqual(Focus.form, app.focus);
@@ -827,11 +855,13 @@ test "console navigates operations and edits a form field" {
     try press(&app, &ctx, .{ .codepoint = '2', .text = "2" });
     try press(&app, &ctx, .{ .codepoint = tui.Key.enter });
     try std.testing.expect(!app.form.editing);
-    try std.testing.expectEqualStrings("2", app.values[1][0].items);
+    try std.testing.expectEqualStrings("2", app.values[2][0].items);
     try press(&app, &ctx, .{ .codepoint = tui.Key.escape });
     try std.testing.expectEqual(Focus.nav, app.focus);
     // Wrapping upward from the first entry lands on the last.
     try press(&app, &ctx, .{ .codepoint = tui.Key.up });
+    try press(&app, &ctx, .{ .codepoint = tui.Key.up });
+    try std.testing.expectEqualStrings("Overview", operations[app.nav].title);
     try press(&app, &ctx, .{ .codepoint = tui.Key.up });
     try std.testing.expectEqualStrings("Chat", operations[app.nav].title);
     try press(&app, &ctx, .{ .codepoint = 'q', .text = "q" });
@@ -853,7 +883,7 @@ test "console fills a form from command-line arguments" {
     try std.testing.expectEqual(train, app.nav);
     try std.testing.expectEqualStrings("4", app.values[train][0].items);
     try std.testing.expectEqualStrings("20", app.values[train][4].items);
-    try std.testing.expectEqualStrings("--matrix-lr 0.03", app.values[train][15].items);
+    try std.testing.expectEqualStrings("--matrix-lr 0.03", app.values[train][16].items);
     try std.testing.expectEqual(cli.JobState.failed, support.job.currentState());
 }
 
@@ -867,8 +897,8 @@ test "console draws titles, panes, rules and the status line" {
     app.overview.refresh(app.init);
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    vxfw.DrawContext.init(.unicode);
-    const ctx: vxfw.DrawContext = .{ .arena = arena.allocator(), .min = .{ .width = 0, .height = 0 }, .max = .{ .width = 100, .height = 30 }, .cell_size = .{ .width = 10, .height = 20 } };
+    tui.DrawContext.init(.unicode);
+    const ctx: tui.DrawContext = .{ .arena = arena.allocator(), .min = .{ .width = 0, .height = 0 }, .max = .{ .width = 100, .height = 30 }, .cell_size = .{ .width = 10, .height = 20 } };
     for (0..operations.len) |i| {
         app.nav = i;
         app.focus = if (operations[i].command != null and operations[i].phase() == null) .form else .nav;
@@ -921,8 +951,8 @@ test "console chat page loads a model, sends a message and draws the transcript"
     const snap = try support.chat.snapshot(arena.allocator());
     try std.testing.expectEqual(@as(usize, 3), snap.turns.len);
     try std.testing.expectEqualStrings("Hi", snap.turns[1].text);
-    vxfw.DrawContext.init(.unicode);
-    const draw_ctx: vxfw.DrawContext = .{ .arena = arena.allocator(), .min = .{ .width = 0, .height = 0 }, .max = .{ .width = 100, .height = 30 }, .cell_size = .{ .width = 10, .height = 20 } };
+    tui.DrawContext.init(.unicode);
+    const draw_ctx: tui.DrawContext = .{ .arena = arena.allocator(), .min = .{ .width = 0, .height = 0 }, .max = .{ .width = 100, .height = 30 }, .cell_size = .{ .width = 10, .height = 20 } };
     const surface = try app.draw(draw_ctx);
     try std.testing.expectEqual(@as(u16, 100), surface.size.width);
     // "quit" leaves the conversation; tab opens the settings.
@@ -933,4 +963,89 @@ test "console chat page loads a model, sends a message and draws the transcript"
     for ("quit") |c| try press(&app, &ctx, .{ .codepoint = c, .text = &.{c} });
     try press(&app, &ctx, .{ .codepoint = tui.Key.enter });
     try std.testing.expectEqual(Focus.nav, app.focus);
+}
+
+/// A drawn surface as text, one line per row: every cell of the surface and
+/// its children at their origins (blank cells as spaces).
+fn screenText(a: std.mem.Allocator, surface: tui.Surface) ![]const u8 {
+    const w = surface.size.width;
+    const grid = try a.alloc([]const u8, @as(usize, w) * surface.size.height);
+    @memset(grid, " ");
+    paint(grid, w, surface.size.height, surface, 0, 0);
+    var out: std.ArrayList(u8) = .empty;
+    for (0..surface.size.height) |r| {
+        for (grid[r * w ..][0..w]) |g| try out.appendSlice(a, g);
+        try out.append(a, '\n');
+    }
+    return out.items;
+}
+
+fn paint(grid: [][]const u8, w: u16, h: u16, surface: tui.Surface, row: i32, col: i32) void {
+    for (surface.buffer, 0..) |cell, i| {
+        const r = row + @as(i32, @intCast(i / surface.size.width));
+        const c = col + @as(i32, @intCast(i % surface.size.width));
+        if (r < 0 or c < 0 or r >= h or c >= w or cell.char.grapheme.len == 0) continue;
+        grid[@as(usize, @intCast(r)) * w + @as(usize, @intCast(c))] = cell.char.grapheme;
+    }
+    for (surface.children) |child| paint(grid, w, h, child.surface, row + child.origin.row, col + child.origin.col);
+}
+
+test "console wraps an operation's summary to the pane instead of cutting it" {
+    const allocator = std.testing.allocator;
+    var support: TestSupport = undefined;
+    try TestSupport.create(allocator, &support);
+    defer support.destroy();
+    var app = try ConsoleApp.create(allocator, support.processInit(allocator), &support.job, &support.chat);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    tui.DrawContext.init(.unicode);
+    // The width of the screenshot's terminal.
+    const ctx: tui.DrawContext = .{ .arena = a, .min = .{ .width = 0, .height = 0 }, .max = .{ .width = 80, .height = 24 }, .cell_size = .{ .width = 10, .height = 20 } };
+    app.nav = cli.Operation.indexOf(.download).?;
+    const text = try screenText(a, try app.draw(ctx));
+    try std.testing.expect(std.mem.indexOf(u8, text, "…") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "always comes too).") != null);
+}
+
+test "console shows a running job's progress and the RL training view" {
+    const allocator = std.testing.allocator;
+    var support: TestSupport = undefined;
+    try TestSupport.create(allocator, &support);
+    defer support.destroy();
+    var app = try ConsoleApp.create(allocator, support.processInit(allocator), &support.job, &support.chat);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    tui.DrawContext.init(.unicode);
+    const ctx: tui.DrawContext = .{ .arena = a, .min = .{ .width = 0, .height = 0 }, .max = .{ .width = 100, .height = 30 }, .cell_size = .{ .width = 10, .height = 20 } };
+
+    // An RL job mid-step: its rollouts' progress over the log (no step yet).
+    const rl = cli.Operation.indexOf(.rl).?;
+    app.nav = rl;
+    app.focus = .form;
+    support.job.operation = rl;
+    support.job.state = .running;
+    const obs = support.job.observer();
+    mod.TrainObserver.progress(obs, "rollouts", 3, 16);
+    var text = try screenText(a, try app.draw(ctx));
+    try std.testing.expect(std.mem.indexOf(u8, text, "rollouts  ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, " 3/16") != null);
+
+    // After a step and an eval: the RL view, and the finished step cleared the progress.
+    obs.onEval(obs.context, 0, 0.25);
+    obs.onRlStep(obs.context, .{ .step = 0, .num_steps = 4, .reward = 0.5, .sequence_length = 120, .lrm = 1, .dt = 2, .total_time = 2 });
+    text = try screenText(a, try app.draw(ctx));
+    try std.testing.expect(std.mem.indexOf(u8, text, "rollouts") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "1/4  eta 0.1m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "reward 0.5000 · sequence length 120.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "pass@1  0.2500@0") != null);
+
+    // A finished job shows no progress.
+    mod.TrainObserver.progress(obs, "rollouts", 5, 16);
+    support.job.state = .succeeded;
+    text = try screenText(a, try app.draw(ctx));
+    try std.testing.expect(std.mem.indexOf(u8, text, "5/16") == null);
 }

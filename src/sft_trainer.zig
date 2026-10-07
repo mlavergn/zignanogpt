@@ -30,6 +30,10 @@ pub const SftOptions = struct {
     chatcore_max_sample: usize = 24,
     mmlu_epochs: usize = 3,
     gsm8k_epochs: usize = 4,
+    /// Your own conversations: a JSONL file, one per line (beyond chat_sft.py).
+    conversations: ?[]const u8 = null,
+    /// Copies of them in the training mixture.
+    conversations_epochs: usize = 1,
 };
 
 /// nanochat's supervised fine-tuning (`chat_sft.py`) on one process: a base
@@ -219,7 +223,10 @@ pub const SftTrainer = struct {
     pub fn describe(self: *Self) !void {
         try self.out.print("Tokens / micro-batch: {d} x {d} = {d}\n", .{ self.batch, self.seq, self.batch * self.seq });
         try self.out.print("Total batch size {d} => gradient accumulation steps: {d}\n", .{ self.total_batch_size, self.grad_accum_steps });
-        try self.out.print("Training mixture: {d} rows (MMLU x{d}, GSM8K x{d}); validation {d} rows\n", .{ self.data.train.len(), self.options.mmlu_epochs, self.options.gsm8k_epochs, self.data.val.len() });
+        try self.out.print("Training mixture: {d} rows (MMLU x{d}, GSM8K x{d}", .{ self.data.train.len(), self.options.mmlu_epochs, self.options.gsm8k_epochs });
+        const custom = self.data.customRows();
+        if (custom > 0) try self.out.print(", {d} of your conversations", .{custom});
+        try self.out.print("); validation {d} rows\n", .{self.data.val.len()});
         try self.out.print("Checkpoint: {s}\n", .{self.checkpoint.dir});
         try self.out.flush();
     }
@@ -359,7 +366,8 @@ pub const SftTrainer = struct {
         const logits = try self.acts.logits.reshape(&.{ self.targets.len, self.config.vocab_size });
         var nats: f64 = 0;
         var bytes: u64 = 0;
-        for (0..steps) |_| {
+        for (0..steps) |i| {
+            mod.TrainObserver.progress(self.observer, "validation bpb", i, steps);
             try loader.next(inputs, targets);
             try self.backend.upload(self.idx, i32, inputs);
             try self.backend.upload(self.target_ids, i32, targets);
@@ -481,7 +489,7 @@ test "sft trainer reproduces chat_sft.py's losses, val bpb and weights" {
 
     // The tasks come from the fixture slices (nanochat's dir is the fallback location).
     const config = mod.Config{ .allocator = allocator, .base_dir = base, .nanochat_dir = root ++ "/task_base", .data_url = "http://unused" };
-    const data = try mod.SftData.openStandard(allocator, std.testing.io, &config, 1, 2, null);
+    const data = try mod.SftData.openStandard(allocator, std.testing.io, &config, 1, 2, null, null);
     defer data.destroy();
     var log_text: std.Io.Writer.Allocating = .init(allocator);
     defer log_text.deinit();
