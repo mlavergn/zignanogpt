@@ -57,9 +57,9 @@ pub const ThriftWriter = struct {
     pub fn list(self: *Self, id: i16, elem: ThriftType, len: usize) !void {
         try self.header(id, .list);
         if (len < 15) {
-            try self.out.append(self.allocator, @as(u8, @intCast(len)) << 4 | @intFromEnum(elem));
+            try self.out.append(self.allocator, @as(u8, @intCast(len)) << 4 | @backingInt(elem));
         } else {
-            try self.out.append(self.allocator, 0xf0 | @as(u8, @intFromEnum(elem)));
+            try self.out.append(self.allocator, 0xf0 | @as(u8, @backingInt(elem)));
             try self.varint(len);
         }
     }
@@ -98,9 +98,9 @@ pub const ThriftWriter = struct {
     fn header(self: *Self, id: i16, kind: ThriftType) !void {
         const delta = id - self.last_field;
         if (delta > 0 and delta <= 15) {
-            try self.out.append(self.allocator, @as(u8, @intCast(delta)) << 4 | @intFromEnum(kind));
+            try self.out.append(self.allocator, @as(u8, @intCast(delta)) << 4 | @backingInt(kind));
         } else {
-            try self.out.append(self.allocator, @intFromEnum(kind));
+            try self.out.append(self.allocator, @backingInt(kind));
             try self.varint(zigzag(id));
         }
         self.last_field = id;

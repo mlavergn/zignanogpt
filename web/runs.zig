@@ -33,8 +33,8 @@ pub const Runs = struct {
         for ([_]mod.CheckpointKind{ .base, .sft, .rl }) |kind| {
             const tags = try mod.Checkpoint.listTags(arena, storage, base_dir, kind);
             for (tags) |tag| {
-                const name = try std.fmt.allocPrint(arena, "{s}/{s}", .{ kind.dirName(), tag });
-                const path = try std.fs.path.join(arena, &.{ base_dir, name, "metrics.jsonl" });
+                const name = try arena.print("{s}/{s}", .{ kind.dirName(), tag });
+                const path = try std.Io.Dir.path.join(arena, &.{ base_dir, name, "metrics.jsonl" });
                 if (!try storage.exists(path)) continue;
                 const bytes = try storage.read(path);
                 defer storage.allocator.free(bytes);
@@ -62,12 +62,12 @@ pub const Runs = struct {
             log.debug("metrics requested for unknown run {s}", .{name});
             return error.UnknownRun;
         }
-        const path = try std.fs.path.join(arena, &.{ base_dir, name, "metrics.jsonl" });
+        const path = try std.Io.Dir.path.join(arena, &.{ base_dir, name, "metrics.jsonl" });
         const bytes = try storage.read(path);
         defer storage.allocator.free(bytes);
         // A file that shrank (a new run) starts over.
         const from = if (offset <= bytes.len) offset else 0;
-        const end = if (std.mem.lastIndexOfScalar(u8, bytes[from..], '\n')) |i| from + i + 1 else from;
+        const end = if (std.mem.findScalarLast(u8, bytes[from..], '\n')) |i| from + i + 1 else from;
         return .{ .offset = end, .text = try arena.dupe(u8, bytes[from..end]) };
     }
 };
@@ -79,15 +79,15 @@ test "runs lists metrics files and tails whole lines" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
     const storage = mod.Storage.init(allocator, std.testing.io);
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try storage.write(try std.fs.path.join(a, &.{ root, "base_checkpoints/d6/metrics.jsonl" }), "{\"step\":0}\n{\"step\":1}\n{\"st");
-    try storage.write(try std.fs.path.join(a, &.{ root, "chatsft_checkpoints/d6/metrics.jsonl" }), "{\"step\":0}\n");
-    try storage.write(try std.fs.path.join(a, &.{ root, "chatrl_checkpoints/d6/meta_000001.json" }), "{}");
+    try storage.write(try std.Io.Dir.path.join(a, &.{ root, "base_checkpoints/d6/metrics.jsonl" }), "{\"step\":0}\n{\"step\":1}\n{\"st");
+    try storage.write(try std.Io.Dir.path.join(a, &.{ root, "chatsft_checkpoints/d6/metrics.jsonl" }), "{\"step\":0}\n");
+    try storage.write(try std.Io.Dir.path.join(a, &.{ root, "chatrl_checkpoints/d6/meta_000001.json" }), "{}");
 
     const runs = try Runs.list(a, storage, root);
     try std.testing.expectEqual(@as(usize, 2), runs.len);

@@ -230,7 +230,7 @@ test "chat eval matches chat_eval.py on the task slices" {
         var batch = try engine.generateBatch(allocator, prompt, .{ .max_tokens = 20, .temperature = 0, .top_k = 50 });
         defer batch.deinit();
         const text = try tok.decode(a, batch.results[0][prompt.len..]);
-        const replaced = try std.fmt.allocPrint(a, "{f}", .{std.unicode.fmtUtf8(text)});
+        const replaced = try a.print("{f}", .{std.unicode.fmtUtf8(text)});
         try std.testing.expectEqualStrings(w, replaced);
     }
     try std.testing.expectApproxEqAbs(@as(f64, (0.3 - 0.25) / 0.75), ChatEval.chatCore(&.{.{ .kind = .mmlu, .passed = 3, .total = 10 }}), 1e-12);

@@ -272,7 +272,7 @@ test "chat job loads an imported model, streams a reply and clears" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const base = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
     {
         var backend = try mod.Backend.init(allocator, std.testing.io, .{});
@@ -302,7 +302,7 @@ test "chat job loads an imported model, streams a reply and clears" {
     try std.testing.expectEqualStrings("base d2 step 5", snap.label);
     // note (fallback + loaded), user, assistant
     try std.testing.expectEqual(@as(usize, 3), snap.turns.len);
-    try std.testing.expect(std.mem.indexOf(u8, snap.turns[0].text, "No sft model") != null);
+    try std.testing.expect(std.mem.find(u8, snap.turns[0].text, "No sft model") != null);
     try std.testing.expectEqualStrings("Hello", snap.turns[1].text);
     try std.testing.expect(snap.turns[2].text.len > 0);
     try chat.clear();

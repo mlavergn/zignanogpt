@@ -182,7 +182,7 @@ pub const Pretokenizer = struct {
             if ((cp >= 0x09 and cp <= 0x0D) or cp == 0x20) return .space;
             return .other;
         }
-        if (std.mem.indexOfScalar(u21, &white_space, cp) != null) return .space;
+        if (std.mem.findScalar(u21, &white_space, cp) != null) return .space;
         return switch (mod.uucode.get(.general_category, cp)) {
             .letter_uppercase, .letter_lowercase, .letter_titlecase, .letter_modifier, .letter_other => .letter,
             .number_decimal_digit, .number_letter, .number_other => .number,

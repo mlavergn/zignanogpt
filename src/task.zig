@@ -25,8 +25,8 @@ pub const TaskKind = enum {
     }
 
     pub fn parse(text: []const u8) ?TaskKind {
-        inline for (@typeInfo(TaskKind).@"enum".fields) |f| {
-            const kind: TaskKind = @enumFromInt(f.value);
+        inline for (@typeInfo(TaskKind).@"enum".field_names) |tag| {
+            const kind = @field(TaskKind, tag);
             if (std.mem.eql(u8, text, kind.name())) return kind;
         }
         return null;
@@ -204,7 +204,7 @@ pub const Task = struct {
     /// Return: the number's text, or null when there is none.
     pub fn extractAnswer(arena: std.mem.Allocator, text: []const u8) !?[]const u8 {
         var from: usize = 0;
-        while (std.mem.indexOfPos(u8, text, from, "#### ")) |at| : (from = at + 1) {
+        while (std.mem.findPos(u8, text, from, "#### ")) |at| : (from = at + 1) {
             var i = at + 5;
             if (i < text.len and text[i] == '-') i += 1;
             const digits = i;
@@ -247,7 +247,7 @@ pub const Task = struct {
             }
             try parts.append(arena, .{ .kind = .text, .text = answer[text_start..i] });
             const inner = answer[i + 2 .. j];
-            const eq = std.mem.lastIndexOfScalar(u8, inner, '=');
+            const eq = std.mem.findScalarLast(u8, inner, '=');
             try parts.append(arena, .{ .kind = .python, .text = if (eq) |e| inner[0..e] else inner });
             try parts.append(arena, .{ .kind = .python_output, .text = if (eq) |e| inner[e + 1 ..] else "" });
             i = j + 2;

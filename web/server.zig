@@ -72,8 +72,8 @@ pub const Server = struct {
         const a = arena.allocator();
         // The head's strings die when the body is read: copy the target first.
         const target = try a.dupe(u8, request.head.target);
-        const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
-        const query = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[q + 1 ..] else "";
+        const path = target[0 .. std.mem.findScalar(u8, target, '?') orelse target.len];
+        const query = if (std.mem.findScalar(u8, target, '?')) |q| target[q + 1 ..] else "";
         const method = request.head.method;
         log.debug("{t} {s}", .{ method, target });
 
@@ -81,7 +81,7 @@ pub const Server = struct {
             return request.respond(page, .{ .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=utf-8" }} });
         }
         if (method == .GET and std.mem.eql(u8, path, "/api/info")) {
-            const label: ?[]const u8 = if (self.model) |m| try std.fmt.allocPrint(a, "{s} {s} step {d}", .{ @tagName(m.kind), m.tag, m.step }) else null;
+            const label: ?[]const u8 = if (self.model) |m| try a.print("{s} {s} step {d}", .{ @tagName(m.kind), m.tag, m.step }) else null;
             return json(request, a, .{ .model = label, .version = mod.build_options.version }, .ok);
         }
         if (method == .GET and std.mem.eql(u8, path, "/api/runs")) {
@@ -132,7 +132,7 @@ pub const Server = struct {
     fn param(a: std.mem.Allocator, query: []const u8, name: []const u8) !?[]const u8 {
         var it = std.mem.splitScalar(u8, query, '&');
         while (it.next()) |pair| {
-            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            const eq = std.mem.findScalar(u8, pair, '=') orelse continue;
             if (!std.mem.eql(u8, pair[0..eq], name)) continue;
             const raw = try a.dupe(u8, pair[eq + 1 ..]);
             std.mem.replaceScalar(u8, raw, '+', ' ');

@@ -320,7 +320,7 @@ pub const Tokenizer = struct {
         var tokens: std.ArrayList([]const u8) = .empty;
         var lines = std.mem.tokenizeScalar(u8, text, '\n');
         while (lines.next()) |line| {
-            const space = std.mem.indexOfScalar(u8, line, ' ') orelse return error.InvalidTiktoken;
+            const space = std.mem.findScalar(u8, line, ' ') orelse return error.InvalidTiktoken;
             const encoded = line[0..space];
             const rank = std.fmt.parseInt(usize, std.mem.trimEnd(u8, line[space + 1 ..], "\r"), 10) catch return error.InvalidTiktoken;
             if (rank != tokens.items.len) {
@@ -351,7 +351,7 @@ pub const Tokenizer = struct {
         var buffer: std.Io.Writer.Allocating = .init(self.allocator);
         defer buffer.deinit();
         try self.writeTiktoken(&buffer.writer);
-        const path = try std.fs.path.join(self.allocator, &.{ dir, file_name });
+        const path = try std.Io.Dir.path.join(self.allocator, &.{ dir, file_name });
         defer self.allocator.free(path);
         try storage.write(path, buffer.written());
     }
@@ -366,7 +366,7 @@ pub const Tokenizer = struct {
     /// Return: the tokenizer; storage or format errors.
     pub fn load(allocator: std.mem.Allocator, storage: mod.Storage, dir: []const u8) !Self {
         log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
-        const path = try std.fs.path.join(allocator, &.{ dir, file_name });
+        const path = try std.Io.Dir.path.join(allocator, &.{ dir, file_name });
         defer allocator.free(path);
         const text = storage.read(path) catch |err| {
             log.warn("no tokenizer at {s}; run `zignanogpt tok-train` first [{t}]", .{ path, err });

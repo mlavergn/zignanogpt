@@ -64,7 +64,7 @@ pub const LoadedModel = struct {
         errdefer self.model.deinit();
         try ckpt.loadModel(self.step, &self.model.weights);
 
-        const tok_dir = try std.fs.path.join(allocator, &.{ base_dir, "tokenizer" });
+        const tok_dir = try std.Io.Dir.path.join(allocator, &.{ base_dir, "tokenizer" });
         defer allocator.free(tok_dir);
         self.tokenizer = try mod.Tokenizer.load(allocator, storage, tok_dir);
         errdefer self.tokenizer.deinit();
@@ -89,7 +89,7 @@ test "loaded model picks the largest tag and last step of an imported checkpoint
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const base = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
     const storage = mod.Storage.init(allocator, std.testing.io);
     var backend = try mod.Backend.init(allocator, std.testing.io, .{});

@@ -104,7 +104,7 @@ pub const CoreEval = struct {
                 const rows = try arena.alloc(f32, (e - s) * config.vocab_size);
                 try be.download(try logits.rows(s - 1, e - s), f32, rows);
                 for (0..e - s) |k| {
-                    const predicted = std.mem.indexOfMax(f32, rows[k * config.vocab_size ..][0..config.vocab_size]);
+                    const predicted = std.mem.findMax(f32, rows[k * config.vocab_size ..][0..config.vocab_size]);
                     if (predicted != prepared.tokens[0][s + k]) return false;
                 }
                 return true;
@@ -287,7 +287,7 @@ pub const CoreEval = struct {
         return switch (value) {
             .string => |s| s,
             .number_string => |s| s,
-            .integer => |i| std.fmt.allocPrint(arena, "{d}", .{i}),
+            .integer => |i| arena.print("{d}", .{i}),
             else => {
                 log.warn("unsupported CORE field value: {t}", .{value});
                 return error.InvalidCoreExample;
@@ -329,7 +329,7 @@ test "core eval reproduces nanochat's prompts, spans and scores" {
     const root = mod.build_options.source_root ++ "/testdata";
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const base = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
     try mod.EvalBundle.extract(allocator, std.testing.io, root ++ "/eval_bundle.zip", base);
     const config = mod.Config{ .allocator = allocator, .base_dir = base, .nanochat_dir = "/nonexistent-nanochat", .data_url = "http://unused" };

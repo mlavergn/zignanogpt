@@ -48,11 +48,11 @@ pub const Import = struct {
         const from = try storage.absolute(from_arg orelse config.nanochat_dir);
         defer allocator.free(from);
         if (tokenizer_only) {
-            const pkl = try std.fs.path.join(allocator, &.{ from, "tokenizer", "tokenizer.pkl" });
+            const pkl = try std.Io.Dir.path.join(allocator, &.{ from, "tokenizer", "tokenizer.pkl" });
             defer allocator.free(pkl);
             var tokenizer = try mod.TorchImport.loadTokenizer(allocator, storage, pkl);
             defer tokenizer.deinit();
-            const dir = try std.fs.path.join(allocator, &.{ config.base_dir, "tokenizer" });
+            const dir = try std.Io.Dir.path.join(allocator, &.{ config.base_dir, "tokenizer" });
             defer allocator.free(dir);
             try tokenizer.save(storage, dir);
             try out.print("Imported tokenizer ({d} tokens) into {s}\n", .{ tokenizer.vocabSize(), dir });

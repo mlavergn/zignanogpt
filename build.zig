@@ -2,138 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const zon = @import("build.zig.zon");
-
-const Git = struct {
-    const Self = @This();
-
-    /// Clones every missing cloneable dependency and exits 1; returns when none are missing.
-    ///
-    /// Parameters:
-    /// - `b`: the build graph.
-    ///
-    /// Return: nothing when all are present; otherwise never.
-    pub fn cloneDeps(b: *std.Build) if (Self.hasAllDeps()) void else noreturn {
-        if (comptime Self.hasAllDeps()) return;
-        const io = b.graph.io;
-        var missing: usize = 0;
-        var cloned: usize = 0;
-        inline for (@typeInfo(@TypeOf(zon.dependencies)).@"struct".fields) |field| {
-            if (comptime Self.isCloneable(field.name) and !Self.isCloned(field.name)) {
-                const dep = @field(zon.dependencies, field.name);
-                const dest = b.pathFromRoot(dep.path);
-                missing += 1;
-                if (std.Io.Dir.cwd().access(io, dest, .{})) |_| {
-                    std.debug.print("{s} exists but is not a Zig package\n", .{dep.path});
-                } else |err| switch (err) {
-                    error.FileNotFound => if (Self.clone(io, dep.clone, dest)) {
-                        cloned += 1;
-                    } else |clone_err| {
-                        std.debug.print("git clone {s} {s} failed [{any}]\n", .{ dep.clone, dep.path, clone_err });
-                    },
-                    else => std.debug.print("cannot check {s} [{any}]\n", .{ dep.path, err }),
-                }
-            }
-        }
-        if (cloned > 0) std.debug.print("cloned {d} of {d} missing dependencies; re-run zig build\n", .{ cloned, missing });
-        std.process.exit(1);
-    }
-
-    /// Reports whether every cloneable dependency is present.
-    ///
-    /// Return: `true` when none is missing.
-    fn hasAllDeps() bool {
-        inline for (@typeInfo(@TypeOf(zon.dependencies)).@"struct".fields) |field| {
-            if (Self.isCloneable(field.name) and !Self.isCloned(field.name)) return false;
-        }
-        return true;
-    }
-
-    /// Reports whether dependency `name` was present when the build runner was compiled.
-    ///
-    /// Parameters:
-    /// - `name`: the dependency's field name in `build.zig.zon`.
-    ///
-    /// Return: `true` when present, or when this package is not the root.
-    fn isCloned(comptime name: []const u8) bool {
-        const deps = @import("root").dependencies;
-        for (deps.root_deps) |dep| {
-            if (std.mem.eql(u8, dep[0], name)) return @hasDecl(@field(deps.packages, dep[1]), "build_zig");
-        }
-        return true;
-    }
-
-    /// Reports whether dependency `name` declares both a `.path` and a `.clone`.
-    ///
-    /// Parameters:
-    /// - `name`: the dependency's field name in `build.zig.zon`.
-    ///
-    /// Return: `true` when both fields are present.
-    fn isCloneable(comptime name: []const u8) bool {
-        const Dep = @TypeOf(@field(zon.dependencies, name));
-        return @hasField(Dep, "path") and @hasField(Dep, "clone");
-    }
-
-    /// Clones the repository at `url` into `dest`.
-    ///
-    /// Parameters:
-    /// - `io`: IO the `git` child is spawned on.
-    /// - `url`: the repository to clone.
-    /// - `dest`: the directory to clone into.
-    ///
-    /// Return: nothing on success; `error.GitCloneFailed` when `git` fails.
-    fn clone(io: std.Io, url: []const u8, dest: []const u8) !void {
-        var child = try std.process.spawn(io, .{ .argv = &.{ "git", "clone", url, dest } });
-        switch (try child.wait(io)) {
-            .exited => |code| if (code != 0) return error.GitCloneFailed,
-            else => return error.GitCloneFailed,
-        }
-    }
-};
-
-const Xcode = struct {
-    const Self = @This();
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    target: std.Target,
-    sdk: []const u8,
-
-    /// Creates an unresolved `Xcode` handle.
-    ///
-    /// Parameters:
-    /// - `allocator`: allocator for the SDK lookup.
-    /// - `io`: IO for the SDK lookup.
-    ///
-    /// Return: the handle; `target` and `sdk` are unset until `resolve`.
-    pub fn init(allocator: std.mem.Allocator, io: std.Io) !Self {
-        return Self{
-            .allocator = allocator,
-            .io = io,
-            // SAFETY: populated by resolve() before either field is read.
-            .target = undefined,
-            // SAFETY: populated by resolve() before either field is read.
-            .sdk = undefined,
-        };
-    }
-
-    /// Resolves the Apple Silicon macOS target and SDK path into the handle.
-    ///
-    /// Parameters:
-    /// - `self`: the handle to populate.
-    ///
-    /// Return: nothing on success; `error.FailedToResolveSDK` when no SDK is found.
-    pub fn resolve(self: *Self) !void {
-        const query = std.Target.Query{
-            .cpu_arch = .aarch64,
-            .os_tag = .macos,
-        };
-        self.target = try std.zig.system.resolveTargetQuery(self.io, query);
-        self.sdk = std.zig.system.darwin.getSdk(
-            self.allocator,
-            self.io,
-            &self.target,
-        ) orelse return error.FailedToResolveSDK;
-    }
-};
+const zigbuildx = @import("zigbuildx");
 
 /// The compute backend the library is built for: its choice (`-Dbackend=`, or
 /// detected from the target and the host), what it links and the kernels it
@@ -218,14 +87,36 @@ const Backend = struct {
         }
     }
 
+    /// Whether `path` exists on this machine, made a configure input (Zig 0.17
+    /// skips `build()` when no input changed): the path itself when it exists,
+    /// else the entries of its nearest existing ancestor, since a missing input
+    /// fails the build. Installing or removing it then configures again.
+    ///
+    /// Parameters:
+    /// - `b`: the build.
+    /// - `path`: an absolute path.
+    ///
+    /// Return: whether it exists.
     fn exists(b: *std.Build, path: []const u8) bool {
-        std.Io.Dir.cwd().access(b.graph.io, path, .{}) catch return false;
-        return true;
+        const io = b.graph.io;
+        const cwd = std.Io.Dir.cwd();
+        if (cwd.statFile(io, path, .{})) |stat| {
+            const lazy = b.graph.cwdRelativePath(path);
+            if (stat.kind == .directory) b.dependOnDirectoryMetadata(lazy) else b.dependOnFileMetadata(lazy);
+            return true;
+        } else |_| {}
+        var ancestor = path;
+        while (std.Io.Dir.path.dirname(ancestor)) |parent| {
+            ancestor = parent;
+            cwd.access(io, ancestor, .{}) catch continue;
+            b.dependOnDirectoryContents(b.graph.cwdRelativePath(ancestor));
+            break;
+        }
+        return false;
     }
 
-    /// Builds the CUDA kernels' PTX: `src/cuda/kernels.zig` to LLVM IR for
-    /// nvptx64-cuda (sm_80, JIT-compiled forward by the driver), the kernel
-    /// aliases Zig emits rewritten (`tools/nvptx_fixup.zig`), then `zig cc` to PTX.
+    /// Builds the CUDA kernels' PTX: `src/cuda/kernels.zig` compiled for nvptx64-cuda
+    /// (sm_80, JIT-compiled forward by the driver), whose assembly is PTX.
     ///
     /// Parameters:
     /// - `b`: the build.
@@ -242,23 +133,10 @@ const Backend = struct {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/cuda/kernels.zig"),
                 .target = nvptx,
-                .optimize = .ReleaseFast,
+                .optimize = .fast,
             }),
         });
-        const fixup = b.addExecutable(.{
-            .name = "nvptx_fixup",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("tools/nvptx_fixup.zig"),
-                .target = b.graph.host,
-            }),
-        });
-        const run_fixup = b.addRunArtifact(fixup);
-        run_fixup.addFileArg(object.getEmittedLlvmIr());
-        const fixed = run_fixup.addOutputFileArg("cuda_kernels.ll");
-        const to_ptx = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-target", "nvptx64-cuda", "-march=sm_80", "-S", "-Wno-unused-command-line-argument" });
-        to_ptx.addFileArg(fixed);
-        to_ptx.addArg("-o");
-        return to_ptx.addOutputFileArg("cuda_kernels.ptx");
+        return object.getEmittedAsm();
     }
 };
 
@@ -267,7 +145,7 @@ const Config = struct {
     mod_name: []const u8,
     web_name: []const u8,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     module_source_file: std.Build.LazyPath,
     cli_source_file: std.Build.LazyPath,
     version: std.SemanticVersion,
@@ -328,7 +206,7 @@ fn addAppImports(module: *std.Build.Module, options: *std.Build.Step.Options, li
 /// parsing, and macOS SDK resolution.
 pub fn build(b: *std.Build) !void {
     // Pre-flight: ensure any local dependencies are cloned
-    Git.cloneDeps(b);
+    zigbuildx.Deps.cloneMissing(b, zon);
 
     // Build config
     const cfg = Config{
@@ -355,7 +233,8 @@ pub fn build(b: *std.Build) !void {
     options.addOption([]const u8, "version", zon.version);
     // Absolute build root, so tests find committed fixtures under testdata/
     // whatever directory the test runner starts in.
-    options.addOption([]const u8, "source_root", b.build_root.path orelse ".");
+    const source_root = try b.root.root_dir.handle.realPathFileAlloc(b.graph.io, b.root.subPathOrDot(), b.allocator);
+    options.addOption([]const u8, "source_root", source_root);
 
     // -------------------------------------------------------------------------
     // Dependencies
@@ -396,9 +275,9 @@ pub fn build(b: *std.Build) !void {
     const lib = b.addLibrary(.{ .name = cfg.name, .root_module = module, .linkage = .static });
 
     if (builtin.os.tag == .macos) {
-        var xcode = try Xcode.init(b.allocator, b.graph.io);
+        var xcode = try zigbuildx.Xcode.init(b);
         try xcode.resolve();
-        lib.root_module.addFrameworkPath(.{ .cwd_relative = xcode.sdk });
+        xcode.addFrameworkPath(lib.root_module);
     }
 
     const lib_install = b.addInstallArtifact(lib, .{});
@@ -448,9 +327,7 @@ pub fn build(b: *std.Build) !void {
 
     const web_run = b.addRunArtifact(web);
     web_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        web_run.addArgs(args);
-    }
+    web_run.addPassthruArgs();
 
     const web_run_step = b.step("serve", "Run the web console");
     web_run_step.dependOn(&web_run.step);
@@ -464,9 +341,7 @@ pub fn build(b: *std.Build) !void {
     cli_run.step.dependOn(b.getInstallStep());
 
     // Support arguments like: `zig build run -- argA argB`
-    if (b.args) |args| {
-        cli_run.addArgs(args);
-    }
+    cli_run.addPassthruArgs();
 
     const run_step = b.step("run", "Run the CLI app");
     run_step.dependOn(&cli_run.step);
@@ -477,13 +352,13 @@ pub fn build(b: *std.Build) !void {
     const bench_lib = b.createModule(.{
         .root_source_file = cfg.module_source_file,
         .target = cfg.target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
     });
     addLibImports(bench_lib, options, deps);
     const bench_module = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),
         .target = cfg.target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
     });
     addAppImports(bench_module, options, cfg.mod_name, bench_lib);
     const bench = b.addExecutable(.{
@@ -549,19 +424,6 @@ pub fn build(b: *std.Build) !void {
     web_tests_run.skip_foreign_checks = true;
     tests_step.dependOn(&web_tests_run.step);
 
-    // Build tools (host): the CUDA kernels' IR fixup.
-    const tools_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/nvptx_fixup.zig"),
-            .target = b.graph.host,
-            .optimize = cfg.optimize,
-        }),
-        .filters = test_filters,
-    });
-    const tools_tests_run = b.addRunArtifact(tools_tests);
-    tools_tests_run.has_side_effects = true;
-    tests_step.dependOn(&tools_tests_run.step);
-
     // -------------------------------------------------------------------------
     // Docs
 
@@ -584,9 +446,9 @@ pub fn build(b: *std.Build) !void {
     });
 
     if (builtin.os.tag == .macos) {
-        var docs_xcode = try Xcode.init(b.allocator, b.graph.io);
+        var docs_xcode = try zigbuildx.Xcode.init(b);
         try docs_xcode.resolve();
-        docs_lib.root_module.addFrameworkPath(.{ .cwd_relative = docs_xcode.sdk });
+        docs_xcode.addFrameworkPath(docs_lib.root_module);
     }
 
     const docs = b.addInstallDirectory(.{

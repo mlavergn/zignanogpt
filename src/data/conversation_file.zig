@@ -97,7 +97,7 @@ test "conversation files read both shapes, skip blank lines and name the bad lin
     try std.testing.expectEqualStrings("zignanogpt, a small model.", file.conversations[0].messages[1].content.text);
     try std.testing.expectEqual(mod.Role.system, file.conversations[1].messages[0].role);
 
-    const first_line = good[0 .. std.mem.indexOfScalar(u8, good, '\n').? + 1];
+    const first_line = good[0 .. std.mem.findScalar(u8, good, '\n').? + 1];
     const cases = [_][]const u8{
         "[{\"role\": \"user\", \"content\": \"hi\"}]", // no reply
         "[{\"role\": \"assistant\", \"content\": \"hi\"}, {\"role\": \"user\", \"content\": \"?\"}]", // wrong order
@@ -106,7 +106,7 @@ test "conversation files read both shapes, skip blank lines and name the bad lin
         "not json",
     };
     for (cases) |case| {
-        const text = try std.fmt.allocPrint(allocator, "{s}{s}\n", .{ first_line, case });
+        const text = try allocator.print("{s}{s}\n", .{ first_line, case });
         defer allocator.free(text);
         try std.testing.expectError(error.InvalidConversation, ConversationFile.parse(allocator, text, "case.jsonl"));
     }

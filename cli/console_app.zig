@@ -123,7 +123,7 @@ pub const ConsoleApp = struct {
         while (i < start.args.len) : (i += 1) {
             const arg = start.args[i];
             const name = if (std.mem.startsWith(u8, arg, "--")) arg[2..] else "";
-            const eq = std.mem.indexOfScalar(u8, name, '=');
+            const eq = std.mem.findScalar(u8, name, '=');
             const flag = if (eq) |e| name[0..e] else name;
             const slot = for (op.fields, 0..) |f, k| {
                 if (f.flag.len > 0 and std.mem.eql(u8, f.flag, flag)) break k;
@@ -321,7 +321,7 @@ pub const ConsoleApp = struct {
         const op = operations[index];
         if (op.command == null) return;
         if (op.phase()) |p| {
-            self.setNotice(true, try std.fmt.allocPrint(self.init.arena.allocator(), "{s} arrives in PLAN.md phase {d}", .{ op.title, p }));
+            self.setNotice(true, try self.init.arena.allocator().print("{s} arrives in PLAN.md phase {d}", .{ op.title, p }));
             return;
         }
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -436,7 +436,7 @@ pub const ConsoleApp = struct {
         const dim = entry.phase() != null;
         try spans.append(a, .{ .text = entry.title, .style = .{ .fg = if (dim) Theme.secondaryText.color() else Theme.primaryText.color(), .bold = on_cursor } });
         const mark: tui.StatusMark = if (entry.command == .chat) chatMark(self.chat.currentState()) else if (self.job.operation == index) jobMark(self.job.currentState()) else .idle;
-        const tag: Span = if (mark != .idle) mark.span() else if (entry.phase()) |p| .{ .text = try std.fmt.allocPrint(a, "p{d}", .{p}), .style = Theme.secondaryText.style() } else .{ .text = "" };
+        const tag: Span = if (mark != .idle) mark.span() else if (entry.phase()) |p| .{ .text = try a.print("p{d}", .{p}), .style = Theme.secondaryText.style() } else .{ .text = "" };
         const used = 2 + entry.title.len + displayWidth(tag.text);
         try spans.append(a, .{ .text = try spaces(a, if (width > used + 1) width - used - 1 else 1) });
         try spans.append(a, tag);
@@ -464,7 +464,7 @@ pub const ConsoleApp = struct {
             return textBlock(a, rows.items);
         }
         if (op.phase()) |p| {
-            try rows.append(a, try a.dupe(Span, &.{.{ .text = try std.fmt.allocPrint(a, "Arrives in PLAN.md phase {d}.", .{p}), .style = Theme.warningText.style() }}));
+            try rows.append(a, try a.dupe(Span, &.{.{ .text = try a.print("Arrives in PLAN.md phase {d}.", .{p}), .style = Theme.warningText.style() }}));
             return textBlock(a, rows.items);
         }
 
@@ -494,7 +494,7 @@ pub const ConsoleApp = struct {
         try rows.append(a, try markLine(a, jobMark(state), switch (state) {
             .running => " running",
             .succeeded => " finished",
-            .failed => try std.fmt.allocPrint(a, " failed: {s}", .{self.job.failure orelse "exit code"}),
+            .failed => try a.print(" failed: {s}", .{self.job.failure orelse "exit code"}),
             .idle => "",
         }));
         const snap = try self.job.snapshot(a);
@@ -529,8 +529,8 @@ pub const ConsoleApp = struct {
         try rows.append(a, try markLine(a, chatMark(snap.state), switch (snap.state) {
             .idle => "",
             .loading => " loading the model",
-            .ready, .replying => try std.fmt.allocPrint(a, " {s}", .{snap.label}),
-            .failed => try std.fmt.allocPrint(a, " failed: {s}", .{snap.failure orelse "error"}),
+            .ready, .replying => try a.print(" {s}", .{snap.label}),
+            .failed => try a.print(" failed: {s}", .{snap.failure orelse "error"}),
         }));
         const used: u16 = @intCast(@min(rows.items.len, height));
         return stacked(a, try textBlock(a, rows.items), used, try self.chatView(a, snap));
@@ -541,7 +541,7 @@ pub const ConsoleApp = struct {
         const entries = try a.alloc(tui.TranscriptEntry, snap.turns.len);
         for (snap.turns, entries, 0..) |turn, *entry, i| {
             var text = std.mem.trimEnd(u8, turn.text, "\n");
-            if (turn.role == .assistant and i + 1 == snap.turns.len and snap.state == .replying) text = try std.fmt.allocPrint(a, "{s}▍", .{text});
+            if (turn.role == .assistant and i + 1 == snap.turns.len and snap.state == .replying) text = try a.print("{s}▍", .{text});
             entry.* = switch (turn.role) {
                 .user => .{ .heading = "You", .heading_role = .keyHint, .text = text },
                 .assistant => .{ .heading = "Assistant", .heading_role = .successText, .text = text },
@@ -604,9 +604,9 @@ pub const ConsoleApp = struct {
         const eta = if (r.step > 10) r.total_time / @as(f64, @floatFromInt(r.step - 10)) * @as(f64, @floatFromInt(r.num_iterations - r.step)) / 60 else 0;
         try rows.append(a, try a.dupe(Span, &.{
             try bar.span(a),
-            .{ .text = try std.fmt.allocPrint(a, " {d}/{d}  eta {d:.1}m", .{ r.step + 1, r.num_iterations, eta }) },
+            .{ .text = try a.print(" {d}/{d}  eta {d:.1}m", .{ r.step + 1, r.num_iterations, eta }) },
         }));
-        try rows.append(a, try a.dupe(Span, &.{.{ .text = try std.fmt.allocPrint(a, "loss {d:.4} · lrm {d:.2} · {d:.0} tok/s · {d:.3} TFLOP/s · {d:.0} ms/step · epoch {d}", .{ r.loss, r.lrm, r.tok_per_sec, r.tflops, r.dt * 1000, r.state.epoch }) }}));
+        try rows.append(a, try a.dupe(Span, &.{.{ .text = try a.print("loss {d:.4} · lrm {d:.2} · {d:.0} tok/s · {d:.3} TFLOP/s · {d:.0} ms/step · epoch {d}", .{ r.loss, r.lrm, r.tok_per_sec, r.tflops, r.dt * 1000, r.state.epoch }) }}));
         var bpb: std.ArrayList(u8) = .empty;
         try bpb.appendSlice(a, "val bpb");
         const first = snap.evals.len -| 6;
@@ -616,7 +616,7 @@ pub const ConsoleApp = struct {
 
         var tail: std.ArrayList([]const Span) = .empty;
         if (snap.samples.len > 0) {
-            try tail.append(a, try a.dupe(Span, &.{.{ .text = try std.fmt.allocPrint(a, "samples at step {d}", .{snap.sample_step}), .style = .{ .bold = true } }}));
+            try tail.append(a, try a.dupe(Span, &.{.{ .text = try a.print("samples at step {d}", .{snap.sample_step}), .style = .{ .bold = true } }}));
             for (snap.samples) |s| try tail.append(a, try a.dupe(Span, &.{.{ .text = try std.mem.replaceOwned(u8, a, s, "\n", " ") }}));
         }
         const tail_h: u16 = @intCast(@min(tail.items.len, height / 3));
@@ -646,9 +646,9 @@ pub const ConsoleApp = struct {
         const eta = r.total_time / @as(f64, @floatFromInt(finished)) * @as(f64, @floatFromInt(r.num_steps -| finished)) / 60;
         try rows.append(a, try a.dupe(Span, &.{
             try bar.span(a),
-            .{ .text = try std.fmt.allocPrint(a, " {d}/{d}  eta {d:.1}m", .{ finished, r.num_steps, eta }) },
+            .{ .text = try a.print(" {d}/{d}  eta {d:.1}m", .{ finished, r.num_steps, eta }) },
         }));
-        try rows.append(a, try a.dupe(Span, &.{.{ .text = try std.fmt.allocPrint(a, "reward {d:.4} · sequence length {d:.1} · lrm {d:.2} · {d:.1} s/step", .{ r.reward, r.sequence_length, r.lrm, r.dt }) }}));
+        try rows.append(a, try a.dupe(Span, &.{.{ .text = try a.print("reward {d:.4} · sequence length {d:.1} · lrm {d:.2} · {d:.1} s/step", .{ r.reward, r.sequence_length, r.lrm, r.dt }) }}));
         var passk: std.ArrayList(u8) = .empty;
         try passk.appendSlice(a, "pass@1");
         const first = snap.evals.len -| 6;
@@ -671,8 +671,8 @@ pub const ConsoleApp = struct {
     /// The job's current work as a bar: `label  ████░░░░ done/total`.
     fn progressLine(a: std.mem.Allocator, p: cli.JobProgress, width: u16) ![]const Span {
         const done = if (p.total == 0) 0 else @as(f64, @floatFromInt(p.done)) / @as(f64, @floatFromInt(p.total));
-        const count = try std.fmt.allocPrint(a, " {d}/{d}", .{ p.done, p.total });
-        const label = try std.fmt.allocPrint(a, "{s}  ", .{p.label});
+        const count = try a.print(" {d}/{d}", .{ p.done, p.total });
+        const label = try a.print("{s}  ", .{p.label});
         const bar: tui.ProgressBar = .{ .done = done, .width = @max(@as(usize, width) -| (displayWidth(label) + count.len + 2), 10) };
         return a.dupe(Span, &.{
             .{ .text = label, .style = Theme.secondaryText.style() },
@@ -765,7 +765,7 @@ pub const ConsoleApp = struct {
 
     fn pad(a: std.mem.Allocator, text: []const u8, width: usize) ![]const u8 {
         const n = displayWidth(text);
-        if (n >= width) return std.fmt.allocPrint(a, "{s} ", .{text});
+        if (n >= width) return a.print("{s} ", .{text});
         const out = try a.alloc(u8, text.len + width - n);
         @memcpy(out[0..text.len], text);
         @memset(out[text.len..], ' ');
@@ -920,7 +920,7 @@ test "console chat page loads a model, sends a message and draws the transcript"
     defer support.destroy();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const base = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
     {
         var backend = try mod.Backend.init(allocator, std.testing.io, .{});
@@ -1005,8 +1005,8 @@ test "console wraps an operation's summary to the pane instead of cutting it" {
     const ctx: tui.DrawContext = .{ .arena = a, .min = .{ .width = 0, .height = 0 }, .max = .{ .width = 80, .height = 24 }, .cell_size = .{ .width = 10, .height = 20 } };
     app.nav = cli.Operation.indexOf(.download).?;
     const text = try screenText(a, try app.draw(ctx));
-    try std.testing.expect(std.mem.indexOf(u8, text, "…") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "always comes too).") != null);
+    try std.testing.expect(std.mem.find(u8, text, "…") == null);
+    try std.testing.expect(std.mem.find(u8, text, "always comes too).") != null);
 }
 
 test "console shows a running job's progress and the RL training view" {
@@ -1031,21 +1031,21 @@ test "console shows a running job's progress and the RL training view" {
     const obs = support.job.observer();
     mod.TrainObserver.progress(obs, "rollouts", 3, 16);
     var text = try screenText(a, try app.draw(ctx));
-    try std.testing.expect(std.mem.indexOf(u8, text, "rollouts  ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, " 3/16") != null);
+    try std.testing.expect(std.mem.find(u8, text, "rollouts  ") != null);
+    try std.testing.expect(std.mem.find(u8, text, " 3/16") != null);
 
     // After a step and an eval: the RL view, and the finished step cleared the progress.
     obs.onEval(obs.context, 0, 0.25);
     obs.onRlStep(obs.context, .{ .step = 0, .num_steps = 4, .reward = 0.5, .sequence_length = 120, .lrm = 1, .dt = 2, .total_time = 2 });
     text = try screenText(a, try app.draw(ctx));
-    try std.testing.expect(std.mem.indexOf(u8, text, "rollouts") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "1/4  eta 0.1m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "reward 0.5000 · sequence length 120.0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "pass@1  0.2500@0") != null);
+    try std.testing.expect(std.mem.find(u8, text, "rollouts") == null);
+    try std.testing.expect(std.mem.find(u8, text, "1/4  eta 0.1m") != null);
+    try std.testing.expect(std.mem.find(u8, text, "reward 0.5000 · sequence length 120.0") != null);
+    try std.testing.expect(std.mem.find(u8, text, "pass@1  0.2500@0") != null);
 
     // A finished job shows no progress.
     mod.TrainObserver.progress(obs, "rollouts", 5, 16);
     support.job.state = .succeeded;
     text = try screenText(a, try app.draw(ctx));
-    try std.testing.expect(std.mem.indexOf(u8, text, "5/16") == null);
+    try std.testing.expect(std.mem.find(u8, text, "5/16") == null);
 }

@@ -180,7 +180,7 @@ pub const Trainer = struct {
         const t = options.max_seq_len;
         self.checkpoint = try mod.Checkpoint.init(allocator, self.storage, base_dir, .base, tag);
         errdefer self.checkpoint.deinit();
-        self.metrics_path = try std.fs.path.join(allocator, &.{ self.checkpoint.dir, "metrics.jsonl" });
+        self.metrics_path = try std.Io.Dir.path.join(allocator, &.{ self.checkpoint.dir, "metrics.jsonl" });
         errdefer allocator.free(self.metrics_path);
 
         self.model = try mod.Gpt.init(allocator, backend, plan.model);
@@ -500,7 +500,7 @@ pub const Trainer = struct {
 
     /// Appends a line to `metrics.jsonl`.
     fn metric(self: *Self, comptime fmt: []const u8, args: anytype) !void {
-        const line = try std.fmt.allocPrint(self.allocator, fmt, args);
+        const line = try self.allocator.print(fmt, args);
         defer self.allocator.free(line);
         try self.storage.append(self.metrics_path, line);
     }
@@ -513,7 +513,7 @@ test "trainer trains, evaluates, saves and resumes a tiny model" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
 
     // A byte-level tokenizer: 256 single-byte tokens, no merges.

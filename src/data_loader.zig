@@ -138,7 +138,7 @@ const Fixture = struct {
     bytes: []u8,
 
     fn load(allocator: std.mem.Allocator, name: []const u8) !Fixture {
-        const path = try std.fs.path.join(allocator, &.{ mod.build_options.source_root, "testdata", name });
+        const path = try std.Io.Dir.path.join(allocator, &.{ mod.build_options.source_root, "testdata", name });
         defer allocator.free(path);
         const bytes = try mod.Storage.init(allocator, std.testing.io).read(path);
         errdefer allocator.free(bytes);
@@ -205,7 +205,7 @@ test "data loader packs batches exactly like nanochat" {
 
     var paths: [3][]const u8 = undefined;
     var path_bufs: [3][256]u8 = undefined;
-    for (&paths, &path_bufs, 0..) |*p, *buf, i| p.* = try std.fmt.bufPrint(buf, "{s}/testdata/shards/shard_{d:0>5}.parquet", .{ mod.build_options.source_root, i });
+    for (&paths, &path_bufs, 0..) |*p, *buf, i| p.* = try std.mem.print(buf, "{s}/testdata/shards/shard_{d:0>5}.parquet", .{ mod.build_options.source_root, i });
 
     // Train: every shard but the last; val: the last.
     try expectBatches(allocator, &tok, paths[0..2], obj.get("train").?.array.items, null, b, t, tok_batch, buffer);

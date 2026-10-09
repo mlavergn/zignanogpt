@@ -41,9 +41,9 @@ const Driver = struct {
 
     fn load(lib: *std.DynLib) !Driver {
         var d: Driver = undefined;
-        inline for (@typeInfo(Driver).@"struct".fields) |f| {
-            @field(d, f.name) = lib.lookup(f.type, f.name) orelse {
-                log.warn("libcuda lacks {s}", .{f.name});
+        inline for (@typeInfo(Driver).@"struct".field_names, @typeInfo(Driver).@"struct".field_types) |name, F| {
+            @field(d, name) = lib.lookup(F, name) orelse {
+                log.warn("libcuda lacks {s}", .{name});
                 return error.CudaUnavailable;
             };
         }
@@ -139,7 +139,7 @@ pub const CudaBackend = struct {
     context: Context,
     stream: Stream,
     module: Module,
-    functions: [@typeInfo(Kernel).@"enum".fields.len]Function,
+    functions: [@typeInfo(Kernel).@"enum".field_names.len]Function,
     /// Device allocations to free once the work issued so far completes
     /// (freed tensors and per-op scratch).
     deferred: std.ArrayList(u64) = .empty,
@@ -181,8 +181,8 @@ pub const CudaBackend = struct {
         errdefer _ = driver.cuStreamDestroy_v2(self.stream);
         try self.check(driver.cuModuleLoadData(&self.module, ptx), "cuModuleLoadData");
         errdefer _ = driver.cuModuleUnload(self.module);
-        inline for (@typeInfo(Kernel).@"enum".fields, 0..) |f, i| {
-            try self.check(driver.cuModuleGetFunction(&self.functions[i], self.module, f.name), "cuModuleGetFunction " ++ f.name);
+        inline for (@typeInfo(Kernel).@"enum".field_names, 0..) |tag, i| {
+            try self.check(driver.cuModuleGetFunction(&self.functions[i], self.module, tag), "cuModuleGetFunction " ++ tag);
         }
         self.cpu = try mod.CpuBackend.init(allocator, io, .{ .threads = options.threads });
         return self;
@@ -782,14 +782,12 @@ pub const CudaBackend = struct {
         try self.current();
         // A runtime copy of the arguments: constants in `args` are comptime
         // tuple fields, which have no address to hand the driver.
-        const fields = @typeInfo(@TypeOf(args)).@"struct".fields;
-        comptime var types: [fields.len]type = undefined;
-        inline for (fields, 0..) |f, i| types[i] = f.type;
-        var values: std.meta.Tuple(&types) = undefined;
-        inline for (0..fields.len) |i| values[i] = args[i];
-        var params: [fields.len]?*anyopaque = undefined;
-        inline for (0..fields.len) |i| params[i] = @ptrCast(&values[i]);
-        self.check(self.driver.cuLaunchKernel(self.functions[@intFromEnum(kernel)], grid[0], grid[1], grid[2], block_threads, 1, 1, 0, self.stream, &params, null), "cuLaunchKernel") catch |err| {
+        const types = @typeInfo(@TypeOf(args)).@"struct".field_types;
+        var values: @Tuple(types) = undefined;
+        inline for (0..types.len) |i| values[i] = args[i];
+        var params: [types.len]?*anyopaque = undefined;
+        inline for (0..types.len) |i| params[i] = @ptrCast(&values[i]);
+        self.check(self.driver.cuLaunchKernel(self.functions[@backingInt(kernel)], grid[0], grid[1], grid[2], block_threads, 1, 1, 0, self.stream, &params, null), "cuLaunchKernel") catch |err| {
             log.warn("launching {t} failed", .{kernel});
             return err;
         };

@@ -33,7 +33,7 @@ pub const TokEval = struct {
         var config = try mod.Config.load(allocator, init.environ_map, mod.Storage.init(allocator, init.io));
         defer config.deinit();
         const storage = mod.Storage.init(allocator, init.io);
-        const dir = try std.fs.path.join(allocator, &.{ config.base_dir, "tokenizer" });
+        const dir = try std.Io.Dir.path.join(allocator, &.{ config.base_dir, "tokenizer" });
         defer allocator.free(dir);
         var ours = try mod.Tokenizer.load(allocator, storage, dir);
         defer ours.deinit();
@@ -44,14 +44,14 @@ pub const TokEval = struct {
             defer allocator.free(text);
             other = try mod.Tokenizer.parseTiktoken(allocator, text, &.{}, 3);
         }
-        const other_name = if (compare) |path| std.fs.path.stem(path) else "";
+        const other_name = if (compare) |path| std.Io.Dir.path.stem(path) else "";
 
         try out.print("{s:<16} {s:<12} {s:>12} {s:>12} {s:>10}\n", .{ "data", "tokenizer", "bytes", "tokens", "bytes/tok" });
         if (data) |path| {
             var dataset = try mod.TextDataset.load(allocator, storage, path);
             defer dataset.deinit();
-            try report(allocator, out, std.fs.path.basename(path), "ours", &ours, dataset.docs);
-            if (other) |*o| try report(allocator, out, std.fs.path.basename(path), other_name, o, dataset.docs);
+            try report(allocator, out, std.Io.Dir.path.basename(path), "ours", &ours, dataset.docs);
+            if (other) |*o| try report(allocator, out, std.Io.Dir.path.basename(path), other_name, o, dataset.docs);
             return 0;
         }
         var dataset = try mod.Dataset.init(allocator, init.io, &config, dataset_name);
@@ -65,7 +65,7 @@ pub const TokEval = struct {
             try out.print("{s}: no shards; pass --data or {s}\n", .{ dataset.dir, cli.Download.hint(dataset_name) });
             return 1;
         }
-        const labels = [_][]const u8{ try std.fmt.allocPrint(allocator, "{s}-train", .{dataset_name}), try std.fmt.allocPrint(allocator, "{s}-val", .{dataset_name}) };
+        const labels = [_][]const u8{ try allocator.print("{s}-train", .{dataset_name}), try allocator.print("{s}-val", .{dataset_name}) };
         defer for (labels) |l| allocator.free(l);
         for ([_][]const u8{ paths[0], paths[paths.len - 1] }, labels) |path, label| {
             var file = try mod.ParquetFile.open(allocator, init.io, path);

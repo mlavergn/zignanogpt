@@ -74,7 +74,7 @@ pub const Chat = struct {
             try out.writeAll("\n");
             return 0;
         }
-        try out.writeAll("\nNanoChat Interactive Mode\n" ++ "-" ** 50 ++ "\nType 'quit' or 'exit' to end the conversation\nType 'clear' to start a new conversation\n" ++ "-" ** 50 ++ "\n");
+        try out.writeAll("\nNanoChat Interactive Mode\n" ++ &@as([50]u8, @splat('-')) ++ "\nType 'quit' or 'exit' to end the conversation\nType 'clear' to start a new conversation\n" ++ &@as([50]u8, @splat('-')) ++ "\n");
         var in_buffer: [64 * 1024]u8 = undefined;
         var stdin = std.Io.File.stdin().reader(init.io, &in_buffer);
         while (true) {

@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // CUDA kernels of CudaBackend (src/cuda/backend.zig), compiled for
-// nvptx64-cuda to LLVM IR, then to PTX (build.zig: tools/nvptx_fixup.zig and
-// `zig cc`). Each mirrors one CpuBackend op (and its Metal kernel's layout).
+// nvptx64-cuda, whose assembly is PTX (build.zig: `cudaKernels`). Each
+// mirrors one CpuBackend op (and its Metal kernel's layout).
 //
 // No libm on the device: math is PTX-native (`@sqrt`, division) or inline PTX
 // (`ex2.approx`, `lg2.approx`, barriers, warp shuffles). Shared memory is a

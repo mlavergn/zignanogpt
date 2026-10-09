@@ -108,6 +108,6 @@ test "command usage lists every command" {
     try cli.Command.writeUsage(&writer);
     const text = writer.buffered();
     for (std.enums.values(cli.Command)) |command| {
-        try std.testing.expect(std.mem.indexOf(u8, text, @tagName(command)) != null);
+        try std.testing.expect(std.mem.find(u8, text, @tagName(command)) != null);
     }
 }

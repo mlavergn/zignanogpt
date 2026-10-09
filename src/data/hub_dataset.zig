@@ -62,7 +62,7 @@ pub const HubDataset = struct {
     /// Return: the dataset; storage and parquet errors.
     pub fn load(allocator: std.mem.Allocator, io: std.Io, storage: mod.Storage, dir: []const u8, names: []const []const u8) !Self {
         log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
-        const manifest_path = try std.fs.path.join(allocator, &.{ dir, "manifest.json" });
+        const manifest_path = try std.Io.Dir.path.join(allocator, &.{ dir, "manifest.json" });
         defer allocator.free(manifest_path);
         const manifest = try storage.read(manifest_path);
         defer allocator.free(manifest);
@@ -84,7 +84,7 @@ pub const HubDataset = struct {
         }
         var rows: usize = 0;
         for (files.value) |name| {
-            const path = try std.fs.path.join(allocator, &.{ dir, name });
+            const path = try std.Io.Dir.path.join(allocator, &.{ dir, name });
             defer allocator.free(path);
             const location = try storage.absolute(path);
             defer allocator.free(location);
@@ -179,14 +179,14 @@ pub const HubDataset = struct {
         const slug = try std.mem.replaceOwned(u8, allocator, repo, "/", "--");
         defer allocator.free(slug);
         for ([_][]const u8{ config.base_dir, config.nanochat_dir }) |root| {
-            const dir = try std.fs.path.join(allocator, &.{ root, "task_data", slug, subset, split });
+            const dir = try std.Io.Dir.path.join(allocator, &.{ root, "task_data", slug, subset, split });
             errdefer allocator.free(dir);
-            const manifest = try std.fs.path.join(allocator, &.{ dir, "manifest.json" });
+            const manifest = try std.Io.Dir.path.join(allocator, &.{ dir, "manifest.json" });
             defer allocator.free(manifest);
             if (try storage.exists(manifest)) return dir;
             allocator.free(dir);
         }
-        const dir = try std.fs.path.join(allocator, &.{ config.base_dir, "task_data", slug, subset, split });
+        const dir = try std.Io.Dir.path.join(allocator, &.{ config.base_dir, "task_data", slug, subset, split });
         errdefer allocator.free(dir);
         try download(allocator, io, storage, repo, subset, split, dir, out);
         return dir;
@@ -195,7 +195,7 @@ pub const HubDataset = struct {
     /// Lists the split's parquet files through the hub API and downloads them.
     fn download(allocator: std.mem.Allocator, io: std.Io, storage: mod.Storage, repo: []const u8, subset: []const u8, split: []const u8, dir: []const u8, out: ?*std.Io.Writer) !void {
         log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
-        const listing_url = try std.fmt.allocPrint(allocator, "{s}/{s}/parquet/{s}/{s}", .{ api_url, repo, subset, split });
+        const listing_url = try allocator.print("{s}/{s}/parquet/{s}/{s}", .{ api_url, repo, subset, split });
         defer allocator.free(listing_url);
         const listing = try fetch(allocator, io, listing_url);
         defer allocator.free(listing);
@@ -220,16 +220,16 @@ pub const HubDataset = struct {
                 log.warn("{s} did not return a parquet file ({d} bytes)", .{ url, body.len });
                 return error.InvalidParquet;
             }
-            const name = try std.fmt.allocPrint(allocator, "{d:0>5}.parquet", .{i});
+            const name = try allocator.print("{d:0>5}.parquet", .{i});
             try names.append(allocator, name);
-            const path = try std.fs.path.join(allocator, &.{ dir, name });
+            const path = try std.Io.Dir.path.join(allocator, &.{ dir, name });
             defer allocator.free(path);
             try storage.write(path, body);
         }
         // The manifest goes last: its presence means the download completed.
         const manifest = try std.json.Stringify.valueAlloc(allocator, names.items, .{});
         defer allocator.free(manifest);
-        const path = try std.fs.path.join(allocator, &.{ dir, "manifest.json" });
+        const path = try std.Io.Dir.path.join(allocator, &.{ dir, "manifest.json" });
         defer allocator.free(path);
         try storage.write(path, manifest);
     }

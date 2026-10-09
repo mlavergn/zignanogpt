@@ -86,7 +86,7 @@ pub const GptWeights = struct {
         self.backout_lambda = try add(arena, backend, &params, "backout_lambda", &.{1});
         for (self.layers, 0..) |*layer, i| {
             layer.value_embed = if (config.hasValueEmbed(i))
-                try add(arena, backend, &params, try std.fmt.allocPrint(arena, "value_embeds.{d}.weight", .{i}), &.{ vpad, kv })
+                try add(arena, backend, &params, try arena.print("value_embeds.{d}.weight", .{i}), &.{ vpad, kv })
             else
                 null;
         }
@@ -177,7 +177,7 @@ pub const GptWeights = struct {
 
     /// `transformer.h.<layer>.<suffix>`.
     fn name(arena: std.mem.Allocator, layer: usize, suffix: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "transformer.h.{d}.{s}", .{ layer, suffix });
+        return arena.print("transformer.h.{d}.{s}", .{ layer, suffix });
     }
 };
 

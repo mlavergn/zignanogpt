@@ -253,25 +253,25 @@ pub const Operation = struct {
             // d<depth>, from the depth field when it is filled in.
             for (self.fields, values) |f, v| {
                 const typed = std.mem.trim(u8, v, " \t");
-                if (std.mem.eql(u8, f.flag, "depth") and typed.len > 0) return std.fmt.bufPrint(buf, "d{s}", .{typed}) catch null;
+                if (std.mem.eql(u8, f.flag, "depth") and typed.len > 0) return std.mem.print(buf, "d{s}", .{typed}) catch null;
             }
-            return std.fmt.bufPrint(buf, "d{d}", .{options.depth}) catch null;
+            return std.mem.print(buf, "d{d}", .{options.depth}) catch null;
         }
-        inline for (@typeInfo(mod.TrainOptions).@"struct".fields) |f| {
+        inline for (@typeInfo(mod.TrainOptions).@"struct".field_names, @typeInfo(mod.TrainOptions).@"struct".field_types) |field_name, FieldType| {
             const name = comptime blk: {
-                var kebab: [f.name.len]u8 = undefined;
-                for (f.name, 0..) |c, i| kebab[i] = if (c == '_') '-' else c;
+                var kebab: [field_name.len]u8 = undefined;
+                for (field_name, 0..) |c, i| kebab[i] = if (c == '_') '-' else c;
                 const final = kebab;
                 break :blk &final;
             };
             if (std.mem.eql(u8, flag, name)) {
-                const value = @field(options, f.name);
-                return switch (f.type) {
+                const value = @field(options, field_name);
+                return switch (FieldType) {
                     usize => if (value == 0)
-                        (if (std.mem.eql(u8, f.name, "save_every")) "end only" else if (std.mem.eql(u8, f.name, "eval_every") or std.mem.eql(u8, f.name, "sample_every")) "off" else "auto")
+                        (if (std.mem.eql(u8, field_name, "save_every")) "end only" else if (std.mem.eql(u8, field_name, "eval_every") or std.mem.eql(u8, field_name, "sample_every")) "off" else "auto")
                     else
-                        std.fmt.bufPrint(buf, "{d}", .{value}) catch null,
-                    f64 => std.fmt.bufPrint(buf, "{d}", .{value}) catch null,
+                        std.mem.print(buf, "{d}", .{value}) catch null,
+                    f64 => std.mem.print(buf, "{d}", .{value}) catch null,
                     []const u8 => value,
                     else => null,
                 };

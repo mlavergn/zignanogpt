@@ -50,7 +50,7 @@ pub const Calculator = struct {
         const expr = try std.mem.replaceOwned(u8, allocator, expr_in, ",", "");
         defer allocator.free(expr);
         if (onlyChars(expr, math_chars)) {
-            if (std.mem.indexOf(u8, expr, "**") != null) return null;
+            if (std.mem.find(u8, expr, "**") != null) return null;
             var parser = Arithmetic{ .text = expr };
             const value = parser.parse() catch |err| {
                 log.debug("calculator rejected {s} [{t}]", .{ expr, err });
@@ -62,9 +62,9 @@ pub const Calculator = struct {
         const lower = try std.ascii.allocLowerString(allocator, expr);
         defer allocator.free(lower);
         for (dangerous) |pattern| {
-            if (std.mem.indexOf(u8, lower, pattern) != null) return null;
+            if (std.mem.find(u8, lower, pattern) != null) return null;
         }
-        if (std.mem.indexOf(u8, expr, ".count(") == null) return null;
+        if (std.mem.find(u8, expr, ".count(") == null) return null;
         const count = countCall(allocator, expr) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {
@@ -72,12 +72,12 @@ pub const Calculator = struct {
                 return null;
             },
         };
-        return try std.fmt.allocPrint(allocator, "{d}", .{count});
+        return try allocator.print("{d}", .{count});
     }
 
     fn onlyChars(text: []const u8, allowed: []const u8) bool {
         for (text) |ch| {
-            if (std.mem.indexOfScalar(u8, allowed, ch) == null) return false;
+            if (std.mem.findScalar(u8, allowed, ch) == null) return false;
         }
         return true;
     }
@@ -85,7 +85,7 @@ pub const Calculator = struct {
     /// Python's `str()` of a number.
     fn format(allocator: std.mem.Allocator, value: Value) ![]u8 {
         return switch (value) {
-            .int => |i| std.fmt.allocPrint(allocator, "{d}", .{i}),
+            .int => |i| allocator.print("{d}", .{i}),
             .float => |f| formatFloat(allocator, f),
         };
     }
@@ -97,10 +97,10 @@ pub const Calculator = struct {
         if (std.math.isInf(f)) return allocator.dupe(u8, if (f < 0) "-inf" else "inf");
         // Zig's `{e}` gives the same shortest digits: "[-]d[.ddd]e[-]x".
         var buf: [64]u8 = undefined;
-        const sci = try std.fmt.bufPrint(&buf, "{e}", .{f});
+        const sci = try std.mem.print(&buf, "{e}", .{f});
         const negative = sci[0] == '-';
         const body = if (negative) sci[1..] else sci;
-        const e_at = std.mem.indexOfScalar(u8, body, 'e') orelse return error.InvalidFormat;
+        const e_at = std.mem.findScalar(u8, body, 'e') orelse return error.InvalidFormat;
         const exponent = try std.fmt.parseInt(i32, body[e_at + 1 ..], 10);
         var digits_buf: [32]u8 = undefined;
         var n: usize = 0;
@@ -236,7 +236,7 @@ pub const Calculator = struct {
             if (literal.len == 0 or std.mem.eql(u8, literal, ".")) return error.Syntax;
             if (is_float) return .{ .float = try std.fmt.parseFloat(f64, literal) };
             // "007" is a syntax error; "000" is zero.
-            if (int_end - start > 1 and literal[0] == '0' and std.mem.indexOfNone(u8, literal, "0") != null) return error.Syntax;
+            if (int_end - start > 1 and literal[0] == '0' and std.mem.findNone(u8, literal, "0") != null) return error.Syntax;
             return .{ .int = try std.fmt.parseInt(i128, literal, 10) };
         }
 
@@ -331,7 +331,7 @@ pub const Calculator = struct {
             skip(expr, at);
             if (at.* >= expr.len or (expr[at.*] != '\'' and expr[at.*] != '"')) break;
             const quote = expr[at.*];
-            const end = std.mem.indexOfScalarPos(u8, expr, at.* + 1, quote) orelse return error.Syntax;
+            const end = std.mem.findScalarPos(u8, expr, at.* + 1, quote) orelse return error.Syntax;
             try out.appendSlice(allocator, expr[at.* + 1 .. end]);
             at.* = end + 1;
             any = true;

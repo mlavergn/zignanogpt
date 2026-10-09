@@ -18,7 +18,7 @@ fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime
     if (!cli.Console.quiet()) return std.log.defaultLog(level, scope, format, args);
     var buf: [1024]u8 = undefined;
     const prefix = "[" ++ comptime level.asText() ++ "] ";
-    const text = std.fmt.bufPrint(&buf, prefix ++ format ++ "\n", args) catch return;
+    const text = std.mem.print(&buf, prefix ++ format ++ "\n", args) catch return;
     cli.Console.captureLog(text);
 }
 

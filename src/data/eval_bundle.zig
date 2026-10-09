@@ -43,13 +43,13 @@ pub const EvalBundle = struct {
         log.debug("{s}:{d} :: {s}", .{ @src().file, @src().line, @src().fn_name });
         const storage = mod.Storage.init(allocator, io);
         for ([_][]const u8{ config.base_dir, config.nanochat_dir }) |root| {
-            const dir = try std.fs.path.join(allocator, &.{ root, "eval_bundle" });
+            const dir = try std.Io.Dir.path.join(allocator, &.{ root, "eval_bundle" });
             defer allocator.free(dir);
-            const yaml = try std.fs.path.join(allocator, &.{ dir, "core.yaml" });
+            const yaml = try std.Io.Dir.path.join(allocator, &.{ dir, "core.yaml" });
             defer allocator.free(yaml);
             if (try storage.exists(yaml)) return load(allocator, storage, dir);
         }
-        const zip_path = try std.fs.path.join(allocator, &.{ config.base_dir, "eval_bundle.zip" });
+        const zip_path = try std.Io.Dir.path.join(allocator, &.{ config.base_dir, "eval_bundle.zip" });
         defer allocator.free(zip_path);
         if (!try storage.exists(zip_path)) {
             if (out) |w| {
@@ -63,7 +63,7 @@ pub const EvalBundle = struct {
             try storage.write(zip_path, body);
         }
         try extract(allocator, io, zip_path, config.base_dir);
-        const dir = try std.fs.path.join(allocator, &.{ config.base_dir, "eval_bundle" });
+        const dir = try std.Io.Dir.path.join(allocator, &.{ config.base_dir, "eval_bundle" });
         defer allocator.free(dir);
         return load(allocator, storage, dir);
     }
@@ -88,7 +88,7 @@ pub const EvalBundle = struct {
         var marker: ?mod.ZipEntry = null;
         for (zip.entries) |entry| {
             if (std.mem.endsWith(u8, entry.name, "/")) continue;
-            if (std.mem.indexOf(u8, entry.name, "..") != null or std.fs.path.isAbsolute(entry.name)) return error.InvalidZip;
+            if (std.mem.find(u8, entry.name, "..") != null or std.Io.Dir.path.isAbsolute(entry.name)) return error.InvalidZip;
             if (std.mem.endsWith(u8, entry.name, "/core.yaml")) {
                 marker = entry;
                 continue;
@@ -101,7 +101,7 @@ pub const EvalBundle = struct {
     fn writeMember(allocator: std.mem.Allocator, storage: mod.Storage, zip: *mod.ZipArchive, entry: mod.ZipEntry, root: []const u8) !void {
         const bytes = try zip.read(entry);
         defer allocator.free(bytes);
-        const path = try std.fs.path.join(allocator, &.{ root, entry.name });
+        const path = try std.Io.Dir.path.join(allocator, &.{ root, entry.name });
         defer allocator.free(path);
         try storage.write(path, bytes);
     }
@@ -119,10 +119,10 @@ pub const EvalBundle = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
         // The tasks borrow their strings from the YAML text, kept in the arena.
-        const raw = try storage.read(try std.fs.path.join(a, &.{ dir, "core.yaml" }));
+        const raw = try storage.read(try std.Io.Dir.path.join(a, &.{ dir, "core.yaml" }));
         defer allocator.free(raw);
         const tasks = try parseCoreYaml(a, try a.dupe(u8, raw));
-        const csv = try storage.read(try std.fs.path.join(a, &.{ dir, "eval_meta_data.csv" }));
+        const csv = try storage.read(try std.Io.Dir.path.join(a, &.{ dir, "eval_meta_data.csv" }));
         defer allocator.free(csv);
         try applyBaselines(a, csv, tasks);
         return Self{ .allocator = allocator, .arena = arena, .dir = try a.dupe(u8, dir), .tasks = tasks };
@@ -142,7 +142,7 @@ pub const EvalBundle = struct {
     ///
     /// Return: the examples in file order; storage and JSON errors.
     pub fn readExamples(self: *const Self, arena: std.mem.Allocator, storage: mod.Storage, task: CoreTask) ![]std.json.Value {
-        const path = try std.fs.path.join(arena, &.{ self.dir, "eval_data", task.dataset_uri });
+        const path = try std.Io.Dir.path.join(arena, &.{ self.dir, "eval_data", task.dataset_uri });
         const text = try storage.read(path);
         defer storage.allocator.free(text);
         var examples: std.ArrayList(std.json.Value) = .empty;
@@ -173,7 +173,7 @@ pub const EvalBundle = struct {
                 return yamlError("inline item");
             }
             const f = if (current) |*c| c else return yamlError("field outside an item");
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse return yamlError("line without a key");
+            const colon = std.mem.findScalar(u8, line, ':') orelse return yamlError("line without a key");
             const key = line[0..colon];
             const value = try scalar(a, std.mem.trim(u8, line[colon + 1 ..], " "));
             if (std.mem.eql(u8, key, "label")) {
@@ -303,7 +303,7 @@ test "eval bundle extracts a deflated zip and reads core.yaml and the baselines"
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
     try EvalBundle.extract(allocator, std.testing.io, mod.build_options.source_root ++ "/testdata/eval_bundle.zip", root);
     const config = mod.Config{ .allocator = allocator, .base_dir = root, .nanochat_dir = "/nonexistent-nanochat", .data_url = "http://unused" };

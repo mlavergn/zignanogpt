@@ -96,10 +96,10 @@ test "repackage writes a dataset that train's shard listing finds" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
     const storage = mod.Storage.init(allocator, std.testing.io);
-    const corpus = try std.fs.path.join(allocator, &.{ root, "corpus.txt" });
+    const corpus = try std.Io.Dir.path.join(allocator, &.{ root, "corpus.txt" });
     defer allocator.free(corpus);
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);

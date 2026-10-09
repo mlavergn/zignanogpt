@@ -161,15 +161,15 @@ pub const Args = struct {
     ///
     /// Return: nothing; `error.InvalidValue`, `error.MissingValue`.
     pub fn fill(self: *Self, comptime T: type, options: *T) !void {
-        inline for (@typeInfo(T).@"struct".fields) |field| {
+        inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |field_name, FieldType| {
             const name_flag = comptime blk: {
-                var name: [field.name.len]u8 = undefined;
-                for (field.name, 0..) |c, i| name[i] = if (c == '_') '-' else c;
+                var name: [field_name.len]u8 = undefined;
+                for (field_name, 0..) |c, i| name[i] = if (c == '_') '-' else c;
                 const final = name;
                 break :blk &final;
             };
-            const target = &@field(options, field.name);
-            switch (field.type) {
+            const target = &@field(options, field_name);
+            switch (FieldType) {
                 usize => {
                     const v = try self.int(i64, name_flag, @intCast(target.*));
                     target.* = if (v < 0) 0 else @intCast(v);
@@ -191,7 +191,7 @@ pub const Args = struct {
                     target.* = if (v < 0) null else v;
                 },
                 ?[]const u8 => target.* = try self.string(name_flag),
-                else => @compileError("unhandled option type for " ++ field.name),
+                else => @compileError("unhandled option type for " ++ field_name),
             }
         }
     }

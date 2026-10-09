@@ -127,7 +127,7 @@ pub const MetalBackend = struct {
     cpu: mod.CpuBackend,
     device: Id,
     queue: Id,
-    pipelines: [@typeInfo(Kernel).@"enum".fields.len]Id,
+    pipelines: [@typeInfo(Kernel).@"enum".field_names.len]Id,
     /// `MPSMatrixMultiplication` kernels by shape, transposes, alpha, beta.
     gemms: std.AutoHashMapUnmanaged(GemmKey, Id) = .empty,
     /// The open command buffer and encoder, with their autorelease pool.
@@ -177,18 +177,18 @@ pub const MetalBackend = struct {
             return error.MetalCompileFailed;
         };
         defer Objc.release(reduce_library);
-        var pipelines: [@typeInfo(Kernel).@"enum".fields.len]Id = undefined;
+        var pipelines: [@typeInfo(Kernel).@"enum".field_names.len]Id = undefined;
         var made: usize = 0;
         errdefer for (pipelines[0..made]) |p| Objc.release(p);
-        inline for (@typeInfo(Kernel).@"enum".fields, 0..) |f, i| {
-            const source = if (comptime isStrict(f.name)) reduce_library else library;
-            const function = Objc.call1(?Id, Id, source, "newFunctionWithName:", try Objc.string(f.name)) orelse {
-                log.warn("Metal kernel {s} missing", .{f.name});
+        inline for (@typeInfo(Kernel).@"enum".field_names, 0..) |tag, i| {
+            const source = if (comptime isStrict(tag)) reduce_library else library;
+            const function = Objc.call1(?Id, Id, source, "newFunctionWithName:", try Objc.string(tag)) orelse {
+                log.warn("Metal kernel {s} missing", .{tag});
                 return error.MetalCompileFailed;
             };
             defer Objc.release(function);
             pipelines[i] = Objc.call2(?Id, Id, *?Id, device, "newComputePipelineStateWithFunction:error:", function, &err) orelse {
-                log.warn("Metal pipeline {s} failed: {s}", .{ f.name, Objc.errorText(err) });
+                log.warn("Metal pipeline {s} failed: {s}", .{ tag, Objc.errorText(err) });
                 return error.MetalCompileFailed;
             };
             made += 1;
@@ -1090,7 +1090,7 @@ pub const MetalBackend = struct {
             self.encoder = Objc.call0(?Id, command, "computeCommandEncoder") orelse return error.MetalCommandFailed;
         }
         const e = self.encoder.?;
-        Objc.call1(void, Id, e, "setComputePipelineState:", self.pipelines[@intFromEnum(kernel)]);
+        Objc.call1(void, Id, e, "setComputePipelineState:", self.pipelines[@backingInt(kernel)]);
         return e;
     }
 

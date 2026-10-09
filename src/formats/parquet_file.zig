@@ -222,7 +222,7 @@ pub const ParquetFile = struct {
     ///
     /// Return: nothing; storage, decoding and unsupported-feature errors.
     pub fn readStrings(self: *Self, row_group: usize, col: usize, out: *ParquetStrings) !void {
-        if (@as(PhysicalType, @enumFromInt(self.columns[col].physical_type)) != .byte_array) return unsupported("non byte-array column");
+        if (@as(PhysicalType, @fromBackingInt(@intCast(self.columns[col].physical_type))) != .byte_array) return unsupported("non byte-array column");
         var values = ParquetValues{ .strings = out.* };
         defer {
             out.* = values.strings;
@@ -243,7 +243,7 @@ pub const ParquetFile = struct {
     /// Return: nothing; storage, decoding and unsupported-feature errors.
     pub fn readColumn(self: *Self, row_group: usize, col: usize, out: *ParquetValues) !void {
         const info = self.columns[col];
-        switch (@as(PhysicalType, @enumFromInt(info.physical_type))) {
+        switch (@as(PhysicalType, @fromBackingInt(@intCast(info.physical_type)))) {
             .byte_array, .int32, .int64 => {},
             _ => return unsupported("physical type"),
         }
@@ -265,11 +265,11 @@ pub const ParquetFile = struct {
             pos += header.compressed_size;
             switch (header.type) {
                 .dictionary => {
-                    const page = try self.decompress(@enumFromInt(chunk.codec), body, header.uncompressed_size);
+                    const page = try self.decompress(@fromBackingInt(@intCast(chunk.codec)), body, header.uncompressed_size);
                     try readPlain(self.allocator, info, page, std.math.cast(usize, header.num_values) orelse return error.InvalidParquet, &dictionary);
                 },
                 .data, .data_v2 => {
-                    try self.decodeDataPage(info, @enumFromInt(chunk.codec), header, body, &dictionary, out);
+                    try self.decodeDataPage(info, @fromBackingInt(@intCast(chunk.codec)), header, body, &dictionary, out);
                     values_left -= header.num_values;
                 },
                 else => {}, // index pages carry nothing we need
@@ -323,7 +323,7 @@ pub const ParquetFile = struct {
                 const indices = try self.allocator.alloc(u32, count);
                 defer self.allocator.free(indices);
                 try decodeHybrid(values[1..], width, indices);
-                const strings = @as(PhysicalType, @enumFromInt(info.physical_type)) == .byte_array;
+                const strings = @as(PhysicalType, @fromBackingInt(@intCast(info.physical_type))) == .byte_array;
                 for (indices) |i| {
                     if (strings) {
                         if (i >= dictionary.strings.len()) return error.InvalidParquet;
@@ -543,7 +543,7 @@ pub const ParquetFile = struct {
             const f = try r.field();
             if (f.type == .stop) break;
             switch (f.id) {
-                1 => h.type = @enumFromInt(try r.readI32()),
+                1 => h.type = @fromBackingInt(@intCast(try r.readI32())),
                 2 => h.uncompressed_size = try toUsize(try r.readI32()),
                 3 => h.compressed_size = try toUsize(try r.readI32()),
                 5, 7, 8 => {
@@ -556,12 +556,12 @@ pub const ParquetFile = struct {
                         switch (f.id) {
                             5, 7 => switch (g.id) {
                                 1 => h.num_values = try r.readI32(),
-                                2 => h.encoding = @enumFromInt(try r.readI32()),
+                                2 => h.encoding = @fromBackingInt(@intCast(try r.readI32())),
                                 else => try r.skip(g.type),
                             },
                             else => switch (g.id) {
                                 1 => h.num_values = try r.readI32(),
-                                4 => h.encoding = @enumFromInt(try r.readI32()),
+                                4 => h.encoding = @fromBackingInt(@intCast(try r.readI32())),
                                 5 => h.def_bytes = try toUsize(try r.readI32()),
                                 6 => h.rep_bytes = try toUsize(try r.readI32()),
                                 7 => h.is_compressed = try mod.ThriftReader.boolOf(g.type),
@@ -579,7 +579,7 @@ pub const ParquetFile = struct {
     /// PLAIN values: byte arrays with a 4-byte little-endian length before
     /// each, or little-endian int32/int64.
     fn readPlain(allocator: std.mem.Allocator, info: ParquetColumn, data: []const u8, count: usize, out: *ParquetValues) !void {
-        switch (@as(PhysicalType, @enumFromInt(info.physical_type))) {
+        switch (@as(PhysicalType, @fromBackingInt(@intCast(info.physical_type)))) {
             .byte_array => {
                 var pos: usize = 0;
                 for (0..count) |_| {

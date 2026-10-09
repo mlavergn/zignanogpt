@@ -130,7 +130,7 @@ pub const SftTrainer = struct {
             return error.InvalidBatchSize;
         }
         var tag_buf: [32]u8 = undefined;
-        const tag = options.model_tag orelse try std.fmt.bufPrint(&tag_buf, "d{d}", .{config.n_layer});
+        const tag = options.model_tag orelse try std.mem.print(&tag_buf, "d{d}", .{config.n_layer});
 
         self.* = .{
             .allocator = allocator,
@@ -163,7 +163,7 @@ pub const SftTrainer = struct {
             .row_losses = undefined,
         };
         errdefer self.checkpoint.deinit();
-        self.metrics_path = try std.fs.path.join(allocator, &.{ self.checkpoint.dir, "metrics.jsonl" });
+        self.metrics_path = try std.Io.Dir.path.join(allocator, &.{ self.checkpoint.dir, "metrics.jsonl" });
         errdefer allocator.free(self.metrics_path);
         self.grads = try mod.GptWeights.init(allocator, backend, config);
         errdefer self.grads.deinit();
@@ -471,7 +471,7 @@ test "sft trainer reproduces chat_sft.py's losses, val bpb and weights" {
     const root = mod.build_options.source_root ++ "/testdata";
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const base = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
     const storage = mod.Storage.init(allocator, std.testing.io);
     var backend = try mod.Backend.init(allocator, std.testing.io, .{});
@@ -514,12 +514,12 @@ test "sft trainer reproduces chat_sft.py's losses, val bpb and weights" {
     var lines = std.mem.splitScalar(u8, log_text.written(), '\n');
     while (lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "step ")) {
-            const at = std.mem.indexOf(u8, line, "loss: ").? + 6;
-            const end = std.mem.indexOfScalarPos(u8, line, at, ' ').?;
+            const at = std.mem.find(u8, line, "loss: ").? + 6;
+            const end = std.mem.findScalarPos(u8, line, at, ' ').?;
             try losses.append(a, try std.fmt.parseFloat(f64, line[at..end]));
-        } else if (std.mem.startsWith(u8, line, "Step ") and std.mem.indexOf(u8, line, "Validation bpb: ") != null) {
+        } else if (std.mem.startsWith(u8, line, "Step ") and std.mem.find(u8, line, "Validation bpb: ") != null) {
             const step = try std.fmt.parseFloat(f64, line[5..10]);
-            const at = std.mem.indexOf(u8, line, "bpb: ").? + 5;
+            const at = std.mem.find(u8, line, "bpb: ").? + 5;
             try bpbs.append(a, .{ step, try std.fmt.parseFloat(f64, line[at..]) });
         }
     }

@@ -309,7 +309,7 @@ pub const Conformance = struct {
                     max = @max(max, dotAt(hq, hk, c, b, t, h, j, kh) * scale);
                 }
                 var sum: f64 = 0;
-                var acc = [_]f64{0} ** 8;
+                var acc: [8]f64 = @splat(0);
                 for (0..pos + 1) |j| {
                     if (pos - j > c.window) continue;
                     const p = @exp(dotAt(hq, hk, c, b, t, h, j, kh) * scale - max);

@@ -40,7 +40,7 @@ pub const Checkpoint = struct {
     ///
     /// Return: the checkpoint; allocation errors.
     pub fn init(allocator: std.mem.Allocator, storage: mod.Storage, root: []const u8, kind: CheckpointKind, tag: []const u8) !Self {
-        return Self{ .allocator = allocator, .storage = storage, .dir = try std.fs.path.join(allocator, &.{ root, kind.dirName(), tag }) };
+        return Self{ .allocator = allocator, .storage = storage, .dir = try std.Io.Dir.path.join(allocator, &.{ root, kind.dirName(), tag }) };
     }
 
     pub fn deinit(self: *Self) void {
@@ -49,7 +49,7 @@ pub const Checkpoint = struct {
 
     /// `<dir>/<prefix>_<step:06>.<ext>`, owned by the caller.
     pub fn path(self: *const Self, prefix: []const u8, step: usize, ext: []const u8) ![]u8 {
-        return std.fmt.allocPrint(self.allocator, "{s}/{s}_{d:0>6}.{s}", .{ self.dir, prefix, step, ext });
+        return self.allocator.print("{s}/{s}_{d:0>6}.{s}", .{ self.dir, prefix, step, ext });
     }
 
     /// Writes `model_<step>.safetensors`.
@@ -175,7 +175,7 @@ pub const Checkpoint = struct {
     ///
     /// Return: the tag; `error.NoCheckpoint`.
     pub fn largestTag(allocator: std.mem.Allocator, storage: mod.Storage, root: []const u8, kind: CheckpointKind) ![]u8 {
-        const dir = try std.fs.path.join(allocator, &.{ root, kind.dirName() });
+        const dir = try std.Io.Dir.path.join(allocator, &.{ root, kind.dirName() });
         defer allocator.free(dir);
         var it = listDir(allocator, storage, dir) catch |err| switch (err) {
             error.NotFound => {
@@ -226,7 +226,7 @@ pub const Checkpoint = struct {
     ///
     /// Return: the tags (empty when there is no checkpoint directory).
     pub fn listTags(allocator: std.mem.Allocator, storage: mod.Storage, root: []const u8, kind: CheckpointKind) ![][]u8 {
-        const dir = try std.fs.path.join(allocator, &.{ root, kind.dirName() });
+        const dir = try std.Io.Dir.path.join(allocator, &.{ root, kind.dirName() });
         defer allocator.free(dir);
         var tags: std.ArrayList([]u8) = .empty;
         errdefer {
@@ -257,6 +257,6 @@ pub const Checkpoint = struct {
     }
 
     fn basename(url: []const u8) []const u8 {
-        return url[(std.mem.lastIndexOfScalar(u8, url, '/') orelse return url) + 1 ..];
+        return url[(std.mem.findScalarLast(u8, url, '/') orelse return url) + 1 ..];
     }
 };

@@ -49,7 +49,7 @@ pub const ThriftReader = struct {
     /// Return: the header; `error.EndOfStream` on truncated input.
     pub fn field(self: *Self) !ThriftField {
         const byte = try self.readByte();
-        const kind: ThriftType = @enumFromInt(@as(u4, @truncate(byte)));
+        const kind: ThriftType = @fromBackingInt(@intCast(@as(u4, @truncate(byte))));
         if (kind == .stop) return .{ .id = 0, .type = .stop };
         const delta: i16 = @intCast(byte >> 4);
         self.last_field = if (delta == 0) try self.readI16() else self.last_field + delta;
@@ -106,7 +106,7 @@ pub const ThriftReader = struct {
         const byte = try self.readByte();
         var len: usize = byte >> 4;
         if (len == 15) len = std.math.cast(usize, try self.varint()) orelse return error.InvalidThrift;
-        return .{ .len = len, .type = @enumFromInt(@as(u4, @truncate(byte))) };
+        return .{ .len = len, .type = @fromBackingInt(@intCast(@as(u4, @truncate(byte)))) };
     }
 
     /// Skips a value of type `t` (and everything nested in it).
@@ -142,8 +142,8 @@ pub const ThriftReader = struct {
                 if (len == 0) return;
                 const types = try self.readByte();
                 for (0..len) |_| {
-                    try self.skip(@enumFromInt(@as(u4, @truncate(types >> 4))));
-                    try self.skip(@enumFromInt(@as(u4, @truncate(types))));
+                    try self.skip(@fromBackingInt(@intCast(@as(u4, @truncate(types >> 4)))));
+                    try self.skip(@fromBackingInt(@intCast(@as(u4, @truncate(types)))));
                 }
             },
             .@"struct" => {
@@ -156,7 +156,7 @@ pub const ThriftReader = struct {
                 self.endStruct(saved);
             },
             .stop, _ => {
-                log.debug("cannot skip thrift type {d}", .{@intFromEnum(t)});
+                log.debug("cannot skip thrift type {d}", .{@backingInt(t)});
                 return error.InvalidThrift;
             },
         }

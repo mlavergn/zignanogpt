@@ -69,9 +69,9 @@ pub const Dataset = struct {
             log.warn("invalid dataset name '{s}': use 1-64 letters, digits, '_' or '-'", .{name});
             return error.InvalidDatasetName;
         }
-        const leaf = try std.fmt.allocPrint(allocator, "base_data_{s}", .{name});
+        const leaf = try allocator.print("base_data_{s}", .{name});
         defer allocator.free(leaf);
-        return std.fs.path.join(allocator, &.{ base, leaf });
+        return std.Io.Dir.path.join(allocator, &.{ base, leaf });
     }
 
     /// The datasets under a base directory (`base_data_<name>` directories).
@@ -98,7 +98,7 @@ pub const Dataset = struct {
         }
         for (entries) |e| {
             if (!std.mem.endsWith(u8, e, "/")) continue;
-            const leaf = std.fs.path.basename(std.mem.trimEnd(u8, e, "/"));
+            const leaf = std.Io.Dir.path.basename(std.mem.trimEnd(u8, e, "/"));
             if (!std.mem.startsWith(u8, leaf, "base_data_") or !validName(leaf["base_data_".len..])) continue;
             try out.append(allocator, try allocator.dupe(u8, leaf["base_data_".len..]));
         }
@@ -107,7 +107,7 @@ pub const Dataset = struct {
 
     /// `shard_NNNNN.parquet`.
     pub fn shardName(buf: []u8, index: usize) ![]const u8 {
-        return std.fmt.bufPrint(buf, "shard_{d:0>5}.parquet", .{index});
+        return std.mem.print(buf, "shard_{d:0>5}.parquet", .{index});
     }
 
     /// Every local shard, sorted by name, from both directories (this port's
@@ -133,17 +133,17 @@ pub const Dataset = struct {
             };
             defer it.close();
             while (try it.next()) |url| {
-                const name = url[(std.mem.lastIndexOfScalar(u8, url, '/') orelse continue) + 1 ..];
+                const name = url[(std.mem.findScalarLast(u8, url, '/') orelse continue) + 1 ..];
                 if (!std.mem.endsWith(u8, name, ".parquet")) continue;
                 var duplicate = false;
-                for (paths.items) |p| duplicate = duplicate or std.mem.eql(u8, std.fs.path.basename(p), name);
+                for (paths.items) |p| duplicate = duplicate or std.mem.eql(u8, std.Io.Dir.path.basename(p), name);
                 if (duplicate) continue;
-                try paths.append(allocator, try std.fs.path.join(allocator, &.{ dir, name }));
+                try paths.append(allocator, try std.Io.Dir.path.join(allocator, &.{ dir, name }));
             }
         }
         std.mem.sort([]const u8, paths.items, {}, struct {
             fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-                return std.mem.lessThan(u8, std.fs.path.basename(a), std.fs.path.basename(b));
+                return std.mem.lessThan(u8, std.Io.Dir.path.basename(a), std.Io.Dir.path.basename(b));
             }
         }.lessThan);
         return paths.toOwnedSlice(allocator);
@@ -161,15 +161,15 @@ pub const Dataset = struct {
     pub fn download(self: *const Self, index: usize, out: *std.Io.Writer) !bool {
         var name_buf: [32]u8 = undefined;
         const name = try shardName(&name_buf, index);
-        const path = try std.fs.path.join(self.allocator, &.{ self.dir, name });
+        const path = try std.Io.Dir.path.join(self.allocator, &.{ self.dir, name });
         defer self.allocator.free(path);
-        const existing = try std.fs.path.join(self.allocator, &.{ self.nanochat_dir, name });
+        const existing = try std.Io.Dir.path.join(self.allocator, &.{ self.nanochat_dir, name });
         defer self.allocator.free(existing);
         if (try self.storage.exists(path) or try self.storage.exists(existing)) {
             try out.print("Skipping {s} (already exists)\n", .{name});
             return false;
         }
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.url, name });
+        const url = try self.allocator.print("{s}/{s}", .{ self.url, name });
         defer self.allocator.free(url);
         var attempt: u6 = 1;
         while (true) : (attempt += 1) {
@@ -205,18 +205,18 @@ test "dataset lists shards from both directories, sorted, without duplicates" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
     const storage = mod.Storage.init(allocator, std.testing.io);
     const files = [_][]const u8{ "zig/base_data_climbmix/shard_00002.parquet", "zig/base_data_climbmix/shard_00000.parquet", "py/base_data_climbmix/shard_00001.parquet", "py/base_data_climbmix/shard_00002.parquet", "py/base_data_climbmix/notes.txt" };
     for (files) |f| {
-        const p = try std.fs.path.join(allocator, &.{ root, f });
+        const p = try std.Io.Dir.path.join(allocator, &.{ root, f });
         defer allocator.free(p);
         try storage.write(p, "PAR1");
     }
-    const zig_dir = try std.fs.path.join(allocator, &.{ root, "zig" });
+    const zig_dir = try std.Io.Dir.path.join(allocator, &.{ root, "zig" });
     defer allocator.free(zig_dir);
-    const py_dir = try std.fs.path.join(allocator, &.{ root, "py" });
+    const py_dir = try std.Io.Dir.path.join(allocator, &.{ root, "py" });
     defer allocator.free(py_dir);
     const config = mod.Config{ .allocator = allocator, .base_dir = zig_dir, .nanochat_dir = py_dir, .data_url = "http://unused" };
     try std.testing.expectError(error.InvalidDatasetName, mod.Dataset.init(allocator, std.testing.io, &config, "../up"));
@@ -228,7 +228,7 @@ test "dataset lists shards from both directories, sorted, without duplicates" {
         allocator.free(paths);
     }
     try std.testing.expectEqual(@as(usize, 3), paths.len);
-    try std.testing.expectEqualStrings("shard_00000.parquet", std.fs.path.basename(paths[0]));
-    try std.testing.expect(std.mem.indexOf(u8, paths[1], "/py/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, paths[2], "/zig/") != null); // this port's copy wins
+    try std.testing.expectEqualStrings("shard_00000.parquet", std.Io.Dir.path.basename(paths[0]));
+    try std.testing.expect(std.mem.find(u8, paths[1], "/py/") != null);
+    try std.testing.expect(std.mem.find(u8, paths[2], "/zig/") != null); // this port's copy wins
 }

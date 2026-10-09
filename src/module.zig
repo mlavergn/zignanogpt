@@ -10,7 +10,7 @@ const builtin = @import("builtin");
 // Compile-time invariants
 
 /// Whether this is a debug build.
-pub const is_debug: bool = builtin.mode == .Debug;
+pub const is_debug: bool = builtin.mode == .debug;
 
 /// Constants supplied by `build.zig`: `backend`, `test_filter`, `version`, `source_root`.
 pub const build_options = @import("config");

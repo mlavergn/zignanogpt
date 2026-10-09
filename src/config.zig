@@ -113,7 +113,7 @@ pub const Config = struct {
     fn resolve(allocator: std.mem.Allocator, override: ?[]const u8, home: ?[]const u8, leaf: []const u8) ![]const u8 {
         if (override) |path| return allocator.dupe(u8, path);
         const home_dir = home orelse return error.HomeNotFound;
-        return std.fs.path.join(allocator, &.{ home_dir, ".cache", leaf });
+        return std.Io.Dir.path.join(allocator, &.{ home_dir, ".cache", leaf });
     }
 
     /// Treats an empty value as absent.

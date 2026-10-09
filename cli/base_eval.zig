@@ -90,7 +90,7 @@ pub const BaseEval = struct {
     }
 
     fn banner(out: *std.Io.Writer, title: []const u8) !void {
-        try out.print("\n{s}\n{s}\n{s}\n", .{ "=" ** 80, title, "=" ** 80 });
+        try out.print("\n{s}\n{s}\n{s}\n", .{ &@as([80]u8, @splat('=')), title, &@as([80]u8, @splat('=')) });
     }
 
     /// Greedy completions of the prompts, then 8 unconditioned samples at temperature 1.
@@ -109,7 +109,7 @@ pub const BaseEval = struct {
             defer batch.deinit();
             const text = try tok.decode(allocator, batch.results[0]);
             defer allocator.free(text);
-            try out.print("{s}\n{s}\n", .{ "-" ** 80, text });
+            try out.print("{s}\n{s}\n", .{ &@as([80]u8, @splat('-')), text });
             try out.flush();
         }
         try out.writeAll("\nUnconditioned samples:\n");
@@ -118,7 +118,7 @@ pub const BaseEval = struct {
         for (batch.results) |r| {
             const text = try tok.decode(allocator, r);
             defer allocator.free(text);
-            try out.print("{s}\n{s}\n", .{ "-" ** 80, text });
+            try out.print("{s}\n{s}\n", .{ &@as([80]u8, @splat('-')), text });
         }
         try out.flush();
     }
@@ -225,7 +225,7 @@ pub const BaseEval = struct {
         }
         const metric = sum / @as(f64, @floatFromInt(@max(bundle.tasks.len, 1)));
         try csv.print(allocator, "{s:<35}, {s:<10}, {d:<10.6}\n", .{ "CORE", "", metric });
-        const path = try std.fmt.allocPrint(allocator, "{s}/base_eval/base_model_{d:0>6}.csv", .{ config.base_dir, loaded.step });
+        const path = try allocator.print("{s}/base_eval/base_model_{d:0>6}.csv", .{ config.base_dir, loaded.step });
         defer allocator.free(path);
         try storage.write(path, csv.items);
         try out.print("\nResults written to: {s}\nCORE metric: {d:.4}\n", .{ path, metric });

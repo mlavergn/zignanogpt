@@ -89,9 +89,9 @@ pub const TorchImport = struct {
         if (root != .call or !root.call.func.isGlobal("tiktoken.core", "Encoding")) return invalid("not a tiktoken Encoding");
         const state = root.call.state orelse return invalid("Encoding without state");
         const pattern = (state.get("pat_str") orelse return invalid("no pat_str")).string;
-        const max_digits: usize = if (std.mem.indexOf(u8, pattern, "\\p{N}{1,2}") != null)
+        const max_digits: usize = if (std.mem.find(u8, pattern, "\\p{N}{1,2}") != null)
             2
-        else if (std.mem.indexOf(u8, pattern, "\\p{N}{1,3}") != null)
+        else if (std.mem.find(u8, pattern, "\\p{N}{1,3}") != null)
             3
         else {
             log.warn("unsupported tokenizer split pattern: {s}", .{pattern});
@@ -205,7 +205,7 @@ pub const TorchImport = struct {
         const meta_json = try std.json.Stringify.valueAlloc(arena.allocator(), meta.value, .{ .whitespace = .indent_2 });
         try target.saveMeta(at, meta_json);
 
-        const pkl = try std.fs.path.join(allocator, &.{ from, "tokenizer", "tokenizer.pkl" });
+        const pkl = try std.Io.Dir.path.join(allocator, &.{ from, "tokenizer", "tokenizer.pkl" });
         defer allocator.free(pkl);
         var tokenizer = try loadTokenizer(allocator, storage, pkl);
         defer tokenizer.deinit();
@@ -213,7 +213,7 @@ pub const TorchImport = struct {
             log.err("tokenizer vocab {d} does not match the model's {d}", .{ tokenizer.vocabSize(), config.vocab_size });
             return error.TokenizerMismatch;
         }
-        const tok_dir = try std.fs.path.join(allocator, &.{ to, "tokenizer" });
+        const tok_dir = try std.Io.Dir.path.join(allocator, &.{ to, "tokenizer" });
         defer allocator.free(tok_dir);
         try tokenizer.save(storage, tok_dir);
         return .{ .tag = model_tag, .step = at };
@@ -250,7 +250,7 @@ pub const TorchImport = struct {
         }
         const shape = try mod.Shape.init(dims[0..sizes.len]);
 
-        const member = try std.fmt.allocPrint(arena, "{s}data/{s}", .{ archive, pid[2].string });
+        const member = try arena.print("{s}data/{s}", .{ archive, pid[2].string });
         const raw = try zip.read(try zip.find(member));
         defer zip.allocator.free(raw);
         const elem: usize = switch (storage_dtype) {
@@ -311,7 +311,7 @@ test "torch import converts python checkpoints that reproduce pytorch's logits" 
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const to = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
     const storage = mod.Storage.init(allocator, std.testing.io);
     var backend = try mod.Backend.init(allocator, std.testing.io, .{});
@@ -353,12 +353,12 @@ test "torch import converts python checkpoints that reproduce pytorch's logits" 
         defer allocator.free(got);
         try backend.download(acts.logits, f32, got);
         var name_buf: [16]u8 = undefined;
-        const want = try expected.readAlloc(allocator, try std.fmt.bufPrint(&name_buf, "logits.{s}", .{tag}), f32);
+        const want = try expected.readAlloc(allocator, try std.mem.print(&name_buf, "logits.{s}", .{tag}), f32);
         defer allocator.free(want);
         for (want, got) |w, g| try std.testing.expectApproxEqAbs(w, g, 5e-5);
     }
 
-    const tok_dir = try std.fs.path.join(allocator, &.{ to, "tokenizer" });
+    const tok_dir = try std.Io.Dir.path.join(allocator, &.{ to, "tokenizer" });
     defer allocator.free(tok_dir);
     var tok = try mod.Tokenizer.load(allocator, storage, tok_dir);
     defer tok.deinit();

@@ -108,7 +108,7 @@ pub const SafeTensorsWriter = struct {
         try w.writeByte('}');
         while (header.written().len % 8 != 0) try w.writeByte(' ');
 
-        if (std.fs.path.dirname(path)) |dir| try storage.makeDir(dir);
+        if (std.Io.Dir.path.dirname(path)) |dir| try storage.makeDir(dir);
         var node = try mod.zigstorage.Node.init(self.allocator, storage.io, .empty, path);
         defer node.deinit();
         try node.open();
@@ -140,9 +140,9 @@ test "safetensors writer round-trips through the reader" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
-    const path = try std.fs.path.join(allocator, &.{ root, "sub", "x.safetensors" });
+    const path = try std.Io.Dir.path.join(allocator, &.{ root, "sub", "x.safetensors" });
     defer allocator.free(path);
 
     var backend = try mod.Backend.init(allocator, std.testing.io, .{ .threads = 1 });

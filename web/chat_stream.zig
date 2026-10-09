@@ -88,7 +88,7 @@ pub const ChatStream = struct {
             const complete = completeUtf8(pending.items);
             if (complete == 0) continue;
             // Invalid bytes become U+FFFD so the event stays valid JSON.
-            const text = try std.fmt.allocPrint(allocator, "{f}", .{std.unicode.fmtUtf8(pending.items[0..complete])});
+            const text = try allocator.print("{f}", .{std.unicode.fmtUtf8(pending.items[0..complete])});
             defer allocator.free(text);
             try event(out, .{ .token = text });
             const rest = pending.items.len - complete;
@@ -166,11 +166,11 @@ test "chat stream sends the greedy reply as server-sent events" {
     var want: std.Io.Writer.Allocating = .init(allocator);
     defer want.deinit();
     try session.reply("Hi", &want.writer, null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena.allocator(), "{f}", .{std.unicode.fmtUtf8(want.written())}), text.items);
+    try std.testing.expectEqualStrings(try arena.allocator().print("{f}", .{std.unicode.fmtUtf8(want.written())}), text.items);
 
     // A malformed request becomes an error event.
     var bad: std.Io.Writer.Allocating = .init(allocator);
     defer bad.deinit();
     try ChatStream.run(allocator, &model, &tok, "{\"messages\":[{\"role\":\"assistant\",\"content\":\"x\"}]}", 1, &bad.writer);
-    try std.testing.expect(std.mem.indexOf(u8, bad.written(), "\"error\"") != null);
+    try std.testing.expect(std.mem.find(u8, bad.written(), "\"error\"") != null);
 }

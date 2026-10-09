@@ -63,7 +63,7 @@ pub const Train = struct {
         const storage = mod.Storage.init(allocator, init.io);
         var config = try mod.Config.load(allocator, init.environ_map, storage);
         defer config.deinit();
-        const tok_dir = try std.fs.path.join(allocator, &.{ config.base_dir, "tokenizer" });
+        const tok_dir = try std.Io.Dir.path.join(allocator, &.{ config.base_dir, "tokenizer" });
         defer allocator.free(tok_dir);
         var tokenizer = try mod.Tokenizer.load(allocator, storage, tok_dir);
         defer tokenizer.deinit();
@@ -93,7 +93,7 @@ pub const Train = struct {
         };
 
         var tag_buf: [32]u8 = undefined;
-        const tag = tag_arg orelse try std.fmt.bufPrint(&tag_buf, "d{d}", .{options.depth});
+        const tag = tag_arg orelse try std.mem.print(&tag_buf, "d{d}", .{options.depth});
         var backend = try mod.Backend.init(allocator, init.io, .{ .threads = threads });
         defer backend.deinit();
         const trainer = try allocator.create(mod.Trainer);

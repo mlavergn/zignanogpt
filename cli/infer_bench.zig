@@ -104,9 +104,9 @@ pub const InferBench = struct {
         const context_mid = prompt_len + settings.decode_tokens / 2;
         const kv_read = model_config.kvReadBytes(context_mid);
         const decode_flops = model_config.decodeFlops(context_mid);
-        const bar = "=" ** 100;
+        const bar = &@as([100]u8, @splat('='));
         try out.print("{s}\nModel: {t} {s} (step {d}) | depth {d}, dim {d}, heads {d}, kv heads {d} (GQA)\n", .{ bar, settings.source, loaded.tag, loaded.step, model_config.n_layer, model_config.n_embd, model_config.n_head, model_config.n_kv_head });
-        try out.print("Device: {s} backend | peak bandwidth {s} | peak compute {s}\n{s}\n", .{ mod.Backend.name, try peakText(allocator, settings.peak_bandwidth, 1e12, "TB/s"), try peakText(allocator, settings.peak_flops, 1e12, "TFLOPS"), "-" ** 100 });
+        try out.print("Device: {s} backend | peak bandwidth {s} | peak compute {s}\n{s}\n", .{ mod.Backend.name, try peakText(allocator, settings.peak_bandwidth, 1e12, "TB/s"), try peakText(allocator, settings.peak_flops, 1e12, "TFLOPS"), &@as([100]u8, @splat('-')) });
         try out.print("Parameters: {d} (f32) | weight bytes as stored: {d} MiB\n", .{ num_params, w_bytes / (1 << 20) });
         try out.print("KV cache: {d} bytes/token stored | {d} bytes read/step at context {d} (window pattern {s})\n", .{ kv_store, kv_read, context_mid, model_config.window_pattern });
         const ceiling: ?f64 = if (settings.peak_bandwidth) |bw| bw / @as(f64, @floatFromInt(w_bytes + kv_read)) else null;
@@ -153,7 +153,7 @@ pub const InferBench = struct {
         // The sweep: decode reads every weight and the KV cache each step (MBU
         // binds at small batch); FLOPs grow with the batch (MFU at large batch).
         const header = "  batch   TTFT ms   TPOT ms      tok/s   MBU %   MFU %  steps";
-        try out.print("{s}\n{s}\n", .{ header, "-" ** header.len });
+        try out.print("{s}\n{s}\n", .{ header, &@as([header.len]u8, @splat('-')) });
         try out.flush();
         try jw.objectField("sweep");
         try jw.beginArray();
@@ -190,7 +190,7 @@ pub const InferBench = struct {
         try jw.endArray();
         try jw.endObject();
         // The last line of stdout is the machine-readable version of the whole run.
-        try out.print("{s}\n{s}\n", .{ "-" ** header.len, json.written() });
+        try out.print("{s}\n{s}\n", .{ &@as([header.len]u8, @splat('-')), json.written() });
         try out.flush();
         return 0;
     }
@@ -280,12 +280,12 @@ pub const InferBench = struct {
 
     fn peakText(allocator: std.mem.Allocator, value: ?f64, unit: f64, label: []const u8) ![]const u8 {
         const v = value orelse return "unknown (--peak-*)";
-        return std.fmt.allocPrint(allocator, "{d:.2} {s}", .{ v / unit, label });
+        return allocator.print("{d:.2} {s}", .{ v / unit, label });
     }
 
     fn percent(allocator: std.mem.Allocator, value: ?f64) ![]const u8 {
         const v = value orelse return "-";
-        return std.fmt.allocPrint(allocator, "{d:.1}", .{v});
+        return allocator.print("{d:.1}", .{v});
     }
 
     fn either(args: *cli.Args, long: []const u8, short: []const u8) !?[]const u8 {

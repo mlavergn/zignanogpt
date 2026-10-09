@@ -65,10 +65,10 @@ pub const Storage = struct {
     ///
     /// Return: the absolute form, owned by the caller.
     pub fn absolute(self: Self, path: []const u8) ![]u8 {
-        if (std.fs.path.isAbsolute(path) or std.mem.indexOf(u8, path, "://") != null) return self.allocator.dupe(u8, path);
+        if (std.Io.Dir.path.isAbsolute(path) or std.mem.find(u8, path, "://") != null) return self.allocator.dupe(u8, path);
         const cwd = try std.process.currentPathAlloc(self.io, self.allocator);
         defer self.allocator.free(cwd);
-        return std.fs.path.resolve(self.allocator, &.{ cwd, path });
+        return std.Io.Dir.path.resolveAlloc(self.allocator, &.{ cwd, path });
     }
 
     /// Reads a whole file.
@@ -101,7 +101,7 @@ pub const Storage = struct {
         const path = try self.absolute(path_in);
         defer self.allocator.free(path);
         log.debug("writing {d} bytes to {s}", .{ bytes.len, path });
-        if (std.fs.path.dirname(path)) |dir| try self.makeDir(dir);
+        if (std.Io.Dir.path.dirname(path)) |dir| try self.makeDir(dir);
         var node = try mod.zigstorage.Node.init(self.allocator, self.io, .empty, path);
         defer node.deinit();
         try node.open();
@@ -138,7 +138,7 @@ pub const Storage = struct {
     pub fn create(self: Self, path_in: []const u8) !StorageSession {
         const path = try self.absolute(path_in);
         defer self.allocator.free(path);
-        if (std.fs.path.dirname(path)) |dir| try self.makeDir(dir);
+        if (std.Io.Dir.path.dirname(path)) |dir| try self.makeDir(dir);
         var node = try mod.zigstorage.Node.init(self.allocator, self.io, .empty, path);
         errdefer node.deinit();
         try node.open();
@@ -233,7 +233,7 @@ pub const Storage = struct {
         defer it.close();
         while (try it.next()) |url| {
             const trimmed = std.mem.trimEnd(u8, url, "/");
-            const name = trimmed[(std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse continue) + 1 ..];
+            const name = trimmed[(std.mem.findScalarLast(u8, trimmed, '/') orelse continue) + 1 ..];
             const suffix: []const u8 = if (trimmed.len < url.len) "/" else "";
             try paths.append(allocator, try std.mem.concat(allocator, u8, &.{ std.mem.trimEnd(u8, dir, "/"), "/", name, suffix }));
         }
@@ -283,9 +283,9 @@ test "storage writes atomically into a new directory and reads back" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
-    const path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "a", "b", "file.txt" });
+    const path = try std.Io.Dir.path.join(allocator, &.{ root_buf[0..root_len], "a", "b", "file.txt" });
     defer allocator.free(path);
 
     const storage = mod.Storage.init(allocator, std.testing.io);
@@ -299,7 +299,7 @@ test "storage writes atomically into a new directory and reads back" {
     try std.testing.expectEqualStrings("replaced+more", bytes);
     const rel = try storage.absolute("x/../y.txt");
     defer allocator.free(rel);
-    try std.testing.expect(std.fs.path.isAbsolute(rel) and std.mem.endsWith(u8, rel, "/y.txt"));
+    try std.testing.expect(std.Io.Dir.path.isAbsolute(rel) and std.mem.endsWith(u8, rel, "/y.txt"));
     const url = try storage.absolute("https://h/p");
     defer allocator.free(url);
     try std.testing.expectEqualStrings("https://h/p", url);
@@ -309,10 +309,10 @@ test "storage sessions stage until saved; ranges, sizes, listings and removal" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
     const storage = mod.Storage.init(allocator, std.testing.io);
-    const path = try std.fs.path.join(allocator, &.{ root, "d", "staged.bin" });
+    const path = try std.Io.Dir.path.join(allocator, &.{ root, "d", "staged.bin" });
     defer allocator.free(path);
 
     var dropped = try storage.create(path);
@@ -334,13 +334,13 @@ test "storage sessions stage until saved; ranges, sizes, listings and removal" {
     defer allocator.free(tail);
     try std.testing.expectEqualStrings("89", tail);
 
-    const other = try std.fs.path.join(allocator, &.{ root, "d", "a.txt" });
+    const other = try std.Io.Dir.path.join(allocator, &.{ root, "d", "a.txt" });
     defer allocator.free(other);
     try storage.write(other, "a");
-    const sub = try std.fs.path.join(allocator, &.{ root, "d", "sub" });
+    const sub = try std.Io.Dir.path.join(allocator, &.{ root, "d", "sub" });
     defer allocator.free(sub);
     try storage.makeDir(sub);
-    const dir = try std.fs.path.join(allocator, &.{ root, "d" });
+    const dir = try std.Io.Dir.path.join(allocator, &.{ root, "d" });
     defer allocator.free(dir);
     const entries = try storage.list(allocator, dir);
     defer {

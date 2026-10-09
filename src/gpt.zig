@@ -356,7 +356,7 @@ pub const Gpt = struct {
         var out: std.ArrayList(u32) = .empty;
         errdefer out.deinit(allocator);
         while (true) {
-            const next: u32 = @intCast(std.mem.indexOfMax(f32, row));
+            const next: u32 = @intCast(std.mem.findMax(f32, row));
             if (stop != null and next == stop.?) break;
             try out.append(allocator, next);
             if (prompt.len + out.items.len >= len) break;
@@ -567,7 +567,7 @@ test "gpt forward matches pytorch on the fixture" {
 
     for (acts.layers, 0..) |la, i| {
         var name_buf: [32]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "debug.block.{d}", .{i});
+        const name = try std.mem.print(&name_buf, "debug.block.{d}", .{i});
         const want = try file.readAlloc(allocator, name, f32);
         defer allocator.free(want);
         const got = try downloadAlloc(allocator, &backend, la.x_out);
@@ -619,7 +619,7 @@ test "gpt loss and every parameter gradient match pytorch" {
     try model.backward(&acts, &bufs, &grads, idx, targets, 1);
     for (grads.params) |p| {
         var name_buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "grad.{s}", .{p.name});
+        const name = try std.mem.print(&name_buf, "grad.{s}", .{p.name});
         const want = try file.readAlloc(allocator, name, f32);
         defer allocator.free(want);
         const got = try downloadAlloc(allocator, &backend, p.tensor);

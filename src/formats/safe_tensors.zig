@@ -21,7 +21,7 @@ pub const SafeTensors = struct {
     /// The whole file; entries borrow from it.
     data: []u8,
     header: std.json.Parsed(std.json.Value),
-    entries: std.StringArrayHashMapUnmanaged(SafeTensorEntry),
+    entries: std.array_hash_map.String(SafeTensorEntry),
 
     /// Reads and parses a file through zigstorage.
     ///
@@ -62,7 +62,7 @@ pub const SafeTensors = struct {
         errdefer header.deinit();
         if (header.value != .object) return error.InvalidSafeTensors;
 
-        var entries: std.StringArrayHashMapUnmanaged(SafeTensorEntry) = .empty;
+        var entries: std.array_hash_map.String(SafeTensorEntry) = .empty;
         errdefer entries.deinit(allocator);
         var it = header.value.object.iterator();
         while (it.next()) |kv| {

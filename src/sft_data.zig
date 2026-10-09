@@ -173,10 +173,10 @@ test "your conversations join the training mixture and render for training" {
     const root = mod.build_options.source_root ++ "/testdata";
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const base = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
     const storage = mod.Storage.init(allocator, std.testing.io);
-    const path = try std.fs.path.join(allocator, &.{ base, "identity.jsonl" });
+    const path = try std.Io.Dir.path.join(allocator, &.{ base, "identity.jsonl" });
     defer allocator.free(path);
     try storage.write(path,
         \\[{"role": "user", "content": "What is your name?"}, {"role": "assistant", "content": "I am zignanogpt."}]

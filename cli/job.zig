@@ -174,7 +174,7 @@ pub const Job = struct {
         var end = self.text.items.len;
         while (end > 0 and self.text.items[end - 1] == '\n') end -= 1;
         while (lines.items.len < max_lines and end > 0) {
-            const from = if (std.mem.lastIndexOfScalar(u8, self.text.items[0..end], '\n')) |i| i + 1 else 0;
+            const from = if (std.mem.findScalarLast(u8, self.text.items[0..end], '\n')) |i| i + 1 else 0;
             try lines.append(allocator, try allocator.dupe(u8, self.text.items[from..end]));
             end = if (from > 0) from - 1 else 0;
         }
@@ -296,7 +296,7 @@ pub const Job = struct {
         if (self.text.items.len + bytes.len > log_capacity) {
             // Keep the newer half (from a line start).
             const keep_from = self.text.items.len / 2;
-            const cut = if (std.mem.indexOfScalarPos(u8, self.text.items, keep_from, '\n')) |i| i + 1 else keep_from;
+            const cut = if (std.mem.findScalarPos(u8, self.text.items, keep_from, '\n')) |i| i + 1 else keep_from;
             std.mem.copyForwards(u8, self.text.items[0 .. self.text.items.len - cut], self.text.items[cut..]);
             self.text.shrinkRetainingCapacity(self.text.items.len - cut);
         }

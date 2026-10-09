@@ -90,7 +90,7 @@ pub const RlTrainer = struct {
         errdefer val.deinit();
         const num_steps = train.len() / @max(options.examples_per_step, 1) * options.num_epochs;
         var tag_buf: [32]u8 = undefined;
-        const tag = options.model_tag orelse try std.fmt.bufPrint(&tag_buf, "d{d}", .{model.model.config.n_layer});
+        const tag = options.model_tag orelse try std.mem.print(&tag_buf, "d{d}", .{model.model.config.n_layer});
         var grads = try mod.GptWeights.init(allocator, backend, model.model.config);
         errdefer grads.deinit();
         var optimizer = try mod.MuonAdamW.init(allocator, backend, &model.model.weights, model.model.config.n_embd, .{
@@ -117,7 +117,7 @@ pub const RlTrainer = struct {
             .metrics_path = undefined,
             .num_steps = num_steps,
         };
-        self.metrics_path = try std.fs.path.join(allocator, &.{ self.checkpoint.dir, "metrics.jsonl" });
+        self.metrics_path = try std.Io.Dir.path.join(allocator, &.{ self.checkpoint.dir, "metrics.jsonl" });
         try out.print("Calculated number of steps: {d}\nTotal sequences per step: {d}\n", .{ num_steps, options.examples_per_step * options.num_samples });
         try out.flush();
     }
@@ -418,7 +418,7 @@ test "rl policy gradient matches chat_rl.py's loss and gradients" {
     for (want_losses, losses.items) |w, g| try std.testing.expectApproxEqAbs(w, g, 1e-5);
     for (grads.params) |p| {
         var name_buf: [64]u8 = undefined;
-        const want = try expected.readAlloc(allocator, try std.fmt.bufPrint(&name_buf, "grad.{s}", .{p.name}), f32);
+        const want = try expected.readAlloc(allocator, try std.mem.print(&name_buf, "grad.{s}", .{p.name}), f32);
         defer allocator.free(want);
         const got = try allocator.alloc(f32, p.tensor.numel());
         defer allocator.free(got);
@@ -464,7 +464,7 @@ test "rl stops on request mid-eval and mid-step, saving the last completed step"
     for ([_]usize{ 1, 0 }) |eval_every| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const base = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
         // The fixture base model stands in for the sft checkpoint RL starts from.
         const imported = try mod.TorchImport.importCheckpoint(allocator, &backend, storage, root ++ "/nanochat_base", base, .base, "d2", null);
@@ -491,11 +491,11 @@ test "rl stops on request mid-eval and mid-step, saving the last completed step"
 
         const text = log_text.written();
         try std.testing.expectEqual(@as(usize, 3), stopper.calls);
-        try std.testing.expect(std.mem.indexOf(u8, text, "Stopping at step 0 on request") != null);
+        try std.testing.expect(std.mem.find(u8, text, "Stopping at step 0 on request") != null);
         // Neither the eval nor the step completed.
-        try std.testing.expect(std.mem.indexOf(u8, text, "Pass@1") == null);
-        try std.testing.expect(std.mem.indexOf(u8, text, "Average sequence length") == null);
-        if (eval_every == 0) try std.testing.expect(std.mem.indexOf(u8, text, "Example step 0") != null);
+        try std.testing.expect(std.mem.find(u8, text, "Pass@1") == null);
+        try std.testing.expect(std.mem.find(u8, text, "Average sequence length") == null);
+        if (eval_every == 0) try std.testing.expect(std.mem.find(u8, text, "Example step 0") != null);
 
         // The saved model is the starting one: the partial step's gradients were dropped.
         var rl: mod.LoadedModel = undefined;

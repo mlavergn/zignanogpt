@@ -44,7 +44,7 @@ pub const ZipArchive = struct {
         const tail_len = @min(size, 22 + 0xffff + 20);
         const tail = try node.read(.{ .offset = size - tail_len, .length = tail_len });
         defer allocator.free(tail);
-        const eocd = std.mem.lastIndexOf(u8, tail, "PK\x05\x06") orelse return error.InvalidZip;
+        const eocd = std.mem.findLast(u8, tail, "PK\x05\x06") orelse return error.InvalidZip;
         if (tail.len - eocd < 22) return error.InvalidZip;
         var count: u64 = std.mem.readInt(u16, tail[eocd + 10 ..][0..2], .little);
         var dir_size: u64 = std.mem.readInt(u32, tail[eocd + 12 ..][0..4], .little);

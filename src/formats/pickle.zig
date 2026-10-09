@@ -272,7 +272,7 @@ pub const Pickle = struct {
 
         fn line(r: *Reader) ![]const u8 {
             const rest = r.data[r.pos..];
-            const end = std.mem.indexOfScalar(u8, rest, '\n') orelse return error.InvalidPickle;
+            const end = std.mem.findScalar(u8, rest, '\n') orelse return error.InvalidPickle;
             r.pos += end + 1;
             return rest[0..end];
         }

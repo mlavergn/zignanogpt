@@ -70,7 +70,7 @@ pub const TokTrain = struct {
         const seconds = @as(f64, @floatFromInt(start.durationTo(std.Io.Clock.awake.now(init.io)).nanoseconds)) / 1e9;
         try out.print("Training time: {d:.2}s\n", .{seconds});
 
-        const dir = try std.fs.path.join(allocator, &.{ config.base_dir, "tokenizer" });
+        const dir = try std.Io.Dir.path.join(allocator, &.{ config.base_dir, "tokenizer" });
         defer allocator.free(dir);
         try tokenizer.save(storage, dir);
         try out.print("Saved tokenizer ({d} tokens) to {s}/{s}\n", .{ tokenizer.vocabSize(), dir, mod.Tokenizer.file_name });

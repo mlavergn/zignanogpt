@@ -124,7 +124,7 @@ pub const TokenizerTrainer = struct {
         // Initial pair counts and the words each pair occurs in.
         var pair_counts: std.AutoHashMapUnmanaged(Pair, i64) = .empty;
         defer pair_counts.deinit(gpa);
-        var where: std.AutoArrayHashMapUnmanaged(Pair, std.ArrayList(u32)) = .empty;
+        var where: std.array_hash_map.Auto(Pair, std.ArrayList(u32)) = .empty;
         defer where.deinit(gpa);
         for (words, word_counts, 0..) |w, count, i| {
             if (w.items.len < 2 or count == 0) continue;
@@ -163,7 +163,7 @@ pub const TokenizerTrainer = struct {
         }
         for (0..256) |b| try tokens.append(allocator, try allocator.dupe(u8, &.{@intCast(b)}));
 
-        var updates: std.AutoArrayHashMapUnmanaged(Pair, std.ArrayList(u32)) = .empty;
+        var updates: std.array_hash_map.Auto(Pair, std.ArrayList(u32)) = .empty;
         defer updates.deinit(gpa);
         var deltas: std.ArrayList(Delta) = .empty;
         defer deltas.deinit(gpa);

@@ -297,7 +297,7 @@ test "gpt config round-trips nanochat's model_config json" {
     try std.testing.expectEqualStrings("L", config.window_pattern); // legacy default
     const text = try std.json.Stringify.valueAlloc(allocator, config, .{});
     defer allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\"window_pattern\":\"L\"") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\"window_pattern\":\"L\"") != null);
 }
 
 test "gpt config rejects inconsistent shapes" {

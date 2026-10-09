@@ -89,7 +89,7 @@ pub const MuonAdamW = struct {
         const scale = std.math.pow(f64, @as(f64, @floatFromInt(model_dim)) / 768.0, -0.5);
         log.info("scaling the AdamW LRs by 1/sqrt({d}/768) = {d:.6}", .{ model_dim, scale });
         const Bucket = enum { lm_head, embedding, value_embeds, resid, x0, smear, matrix };
-        var buckets: [@typeInfo(Bucket).@"enum".fields.len]std.ArrayList(usize) = @splat(.empty);
+        var buckets: [@typeInfo(Bucket).@"enum".field_names.len]std.ArrayList(usize) = @splat(.empty);
         for (weights.params, 0..) |p, i| {
             const bucket: Bucket = if (std.mem.eql(u8, p.name, "lm_head.weight"))
                 .lm_head
@@ -109,7 +109,7 @@ pub const MuonAdamW = struct {
                 log.err("no optimizer group for parameter {s}", .{p.name});
                 return error.UnknownParam;
             };
-            try buckets[@intFromEnum(bucket)].append(arena, i);
+            try buckets[@backingInt(bucket)].append(arena, i);
         }
 
         var groups: std.ArrayList(ParamGroup) = .empty;
@@ -118,17 +118,17 @@ pub const MuonAdamW = struct {
                 return .{ .kind = .adamw, .indices = indices, .initial_lr = lr, .lr = lr, .beta1 = beta1, .beta2 = beta2, .eps = 1e-10, .weight_decay = wd };
             }
         };
-        try groups.append(arena, adamw.group(buckets[@intFromEnum(Bucket.lm_head)].items, config.unembedding_lr * scale, 0.8, 0.96, 0.01));
-        try groups.append(arena, adamw.group(buckets[@intFromEnum(Bucket.embedding)].items, config.embedding_lr * scale, 0.8, 0.995, 0.001));
-        try groups.append(arena, adamw.group(buckets[@intFromEnum(Bucket.value_embeds)].items, config.embedding_lr * scale * 0.5, 0.8, 0.995, 0.01));
-        try groups.append(arena, adamw.group(buckets[@intFromEnum(Bucket.resid)].items, config.scalar_lr * 0.01, 0.8, 0.95, 0.05));
-        try groups.append(arena, adamw.group(buckets[@intFromEnum(Bucket.x0)].items, config.scalar_lr, 0.96, 0.95, 0.0));
-        try groups.append(arena, adamw.group(buckets[@intFromEnum(Bucket.smear)].items, 0.2, 0.8, 0.95, 0.0));
+        try groups.append(arena, adamw.group(buckets[@backingInt(Bucket.lm_head)].items, config.unembedding_lr * scale, 0.8, 0.96, 0.01));
+        try groups.append(arena, adamw.group(buckets[@backingInt(Bucket.embedding)].items, config.embedding_lr * scale, 0.8, 0.995, 0.001));
+        try groups.append(arena, adamw.group(buckets[@backingInt(Bucket.value_embeds)].items, config.embedding_lr * scale * 0.5, 0.8, 0.995, 0.01));
+        try groups.append(arena, adamw.group(buckets[@backingInt(Bucket.resid)].items, config.scalar_lr * 0.01, 0.8, 0.95, 0.05));
+        try groups.append(arena, adamw.group(buckets[@backingInt(Bucket.x0)].items, config.scalar_lr, 0.96, 0.95, 0.0));
+        try groups.append(arena, adamw.group(buckets[@backingInt(Bucket.smear)].items, 0.2, 0.8, 0.95, 0.0));
         // Muon groups are per shape in nanochat only so params can be stacked;
         // the update is per matrix, so one group serves.
         try groups.append(arena, .{
             .kind = .muon,
-            .indices = buckets[@intFromEnum(Bucket.matrix)].items,
+            .indices = buckets[@backingInt(Bucket.matrix)].items,
             .initial_lr = config.matrix_lr,
             .lr = config.matrix_lr,
             .beta2 = 0.9,
@@ -288,13 +288,13 @@ pub const MuonAdamW = struct {
         var name_buf: [128]u8 = undefined;
         for (self.states, weights.params) |state, p| {
             if (state.m) |m| {
-                try writer.addTensor(try std.fmt.bufPrint(&name_buf, "adamw.m.{s}", .{p.name}), m);
-                try writer.addTensor(try std.fmt.bufPrint(&name_buf, "adamw.v.{s}", .{p.name}), state.v.?);
-                try writer.addHost(try std.fmt.bufPrint(&name_buf, "adamw.step.{s}", .{p.name}), i32, &.{1}, &.{@intCast(state.step)});
+                try writer.addTensor(try std.mem.print(&name_buf, "adamw.m.{s}", .{p.name}), m);
+                try writer.addTensor(try std.mem.print(&name_buf, "adamw.v.{s}", .{p.name}), state.v.?);
+                try writer.addHost(try std.mem.print(&name_buf, "adamw.step.{s}", .{p.name}), i32, &.{1}, &.{@intCast(state.step)});
             }
             if (state.momentum) |b| {
-                try writer.addTensor(try std.fmt.bufPrint(&name_buf, "muon.momentum.{s}", .{p.name}), b);
-                try writer.addTensor(try std.fmt.bufPrint(&name_buf, "muon.second.{s}", .{p.name}), state.second.?);
+                try writer.addTensor(try std.mem.print(&name_buf, "muon.momentum.{s}", .{p.name}), b);
+                try writer.addTensor(try std.mem.print(&name_buf, "muon.second.{s}", .{p.name}), state.second.?);
             }
         }
     }
@@ -312,15 +312,15 @@ pub const MuonAdamW = struct {
         var name_buf: [128]u8 = undefined;
         for (self.states, weights.params) |*state, p| {
             if (state.m) |m| {
-                try self.loadTensor(file, try std.fmt.bufPrint(&name_buf, "adamw.m.{s}", .{p.name}), m);
-                try self.loadTensor(file, try std.fmt.bufPrint(&name_buf, "adamw.v.{s}", .{p.name}), state.v.?);
+                try self.loadTensor(file, try std.mem.print(&name_buf, "adamw.m.{s}", .{p.name}), m);
+                try self.loadTensor(file, try std.mem.print(&name_buf, "adamw.v.{s}", .{p.name}), state.v.?);
                 var step_value: [1]i32 = undefined;
-                try file.read(try std.fmt.bufPrint(&name_buf, "adamw.step.{s}", .{p.name}), i32, &step_value);
+                try file.read(try std.mem.print(&name_buf, "adamw.step.{s}", .{p.name}), i32, &step_value);
                 state.step = std.math.cast(u32, step_value[0]) orelse return error.InvalidCheckpoint;
             }
             if (state.momentum) |b| {
-                try self.loadTensor(file, try std.fmt.bufPrint(&name_buf, "muon.momentum.{s}", .{p.name}), b);
-                try self.loadTensor(file, try std.fmt.bufPrint(&name_buf, "muon.second.{s}", .{p.name}), state.second.?);
+                try self.loadTensor(file, try std.mem.print(&name_buf, "muon.momentum.{s}", .{p.name}), b);
+                try self.loadTensor(file, try std.mem.print(&name_buf, "muon.second.{s}", .{p.name}), state.second.?);
             }
         }
     }
@@ -455,13 +455,13 @@ test "muon adamw steps match pytorch on the fixture" {
         const momentum = try std.fmt.parseFloat(f64, fields.next().?);
         const wd = try std.fmt.parseFloat(f64, fields.next().?);
         var prefix_buf: [16]u8 = undefined;
-        try grads.load(allocator, &file, try std.fmt.bufPrint(&prefix_buf, "grad{d}.", .{step}));
+        try grads.load(allocator, &file, try std.mem.print(&prefix_buf, "grad{d}.", .{step}));
         optimizer.setSchedule(lrm, momentum, wd);
         try optimizer.step(&weights, &grads);
 
         for (weights.params) |p| {
             var name_buf: [64]u8 = undefined;
-            const name = try std.fmt.bufPrint(&name_buf, "step{d}.{s}", .{ step, p.name });
+            const name = try std.mem.print(&name_buf, "step{d}.{s}", .{ step, p.name });
             const want = try file.readAlloc(allocator, name, f32);
             defer allocator.free(want);
             const got = try allocator.alloc(f32, p.tensor.numel());
@@ -511,7 +511,7 @@ test "muon adamw state survives a checkpoint round trip" {
     // Save weights + optimizer, restore into fresh copies.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
     const storage = mod.Storage.init(allocator, std.testing.io);
     var ckpt = try mod.Checkpoint.init(allocator, storage, root, .base, "d2");

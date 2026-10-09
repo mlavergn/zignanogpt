@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A port of Karpathy's **nanochat** (tokenizer, pretraining, SFT/RL, eval, inference for a
-GPT-2-class chat model) to Zig 0.16. The port is complete, and so is the first work beyond it
+GPT-2-class chat model) to Zig 0.17. The port is complete, and so is the first work beyond it
 (console progress, `infer-bench`, `repackage` and named datasets, custom SFT conversations).
 There is no active plan: a new `PLAN.md`, when written, is the source of truth for its scope
 and phases (a command not built yet prints its phase, `Command.phase`). The port's plan
@@ -43,14 +43,15 @@ every git operation. Finish a phase at a green `make validate` and report.
 | `cli/` | The `zignanogpt` executable: `main.zig` (entry), `module.zig` (barrel + test root), `command.zig` (subcommands) |
 | `web/` | `zignanogpt-web`: one embedded page (chat over SSE, training dashboard), `make web` |
 | `bench/main.zig` | `zig build bench`: matmul GFLOP/s at 1 thread and all threads, always ReleaseFast |
-| `tools/` | Build-time host tools (`nvptx_fixup.zig`: makes Zig's nvptx IR loadable as PTX) |
 | `dev/fixtures.py` | Dev-only parity fixtures from the Python reference → `testdata/` (safetensors layout) |
 | `testdata/` | Committed fixtures (created as phases add fixture groups) |
 
 ## Dependencies
 
 All declared in `build.zig.zon`; `zigstorage` and `zigtui` are local checkouts at
-`../../inferise/` (the build's `Git.cloneDeps` clones them if missing, then asks for a re-run).
+`../../inferise/` (the build's `zigbuildx.Deps.cloneMissing` clones them if missing, then asks for a
+re-run). `zigbuildx` is build-only — imported by `build.zig` (`Deps`, `Xcode`) and never by the
+module, pinned by `.url` + `.hash`, never `.path`.
 
 - `zigstorage` → library only. All disk and HTTP I/O goes through its `Node` (`file://`, `https://`).
 - `zigtui` → `cli/` only (`cli.tui`): the shared Inferise TUI components (`Theme`, `ProgressBar`, ...)
@@ -73,7 +74,7 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
   Metal/CUDA types only in their own builds (`void` elsewhere), so CPU builds never reference them.
 - The `config` options module (imported as `mod.build_options`) carries `backend`, `test_filter`,
   `version`, and `source_root` (absolute repo root, for tests reading `testdata/`).
-- `zig build test` runs four test binaries: `src/module.zig`, `cli/module.zig`, `web/module.zig`, `tools/nvptx_fixup.zig`.
+- `zig build test` runs three test binaries: `src/module.zig`, `cli/module.zig`, `web/module.zig`.
   A public type not re-exported from its directory's `module.zig` has its tests silently skipped.
 
 ## Backend layer
@@ -90,7 +91,7 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
 - CPU internals: `CpuMatmul` (packed GotoBLAS-style tiles, 6x16 FMA kernel) and
   `Parallel` (work items on the `std.Io` thread pool via `Io.Group.async`; worker index
   is unique among concurrent workers, so per-worker scratch needs no lock). Elementwise
-  ops run in 64K-element chunks. No `std.Thread.Pool` in 0.16.
+  ops run in 64K-element chunks. No `std.Thread.Pool` in 0.17.
 - GPU backends keep the CPU kernels as their fallback: `MetalBuffer`/`CudaBuffer` carry a
   `bytes` slice over unified memory, so `CpuBackend` ops run on GPU tensors after a `sync`
   (`onCpu`). A new op can start there and move to a kernel later; each `onCpu` stalls the GPU

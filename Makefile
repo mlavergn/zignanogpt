@@ -19,7 +19,7 @@ VERSION := $(shell sed -n -E 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"
 
 # The Zig sources to format and lint. Named explicitly rather than `.`: the
 # nanochat/ submodule and .zig-cache/ are not ours to rewrite or gate on.
-ZIG_SOURCES := build.zig $(wildcard src/*.zig) $(wildcard src/*/*.zig) $(wildcard cli/*.zig) $(wildcard web/*.zig) $(wildcard bench/*.zig) $(wildcard tools/*.zig)
+ZIG_SOURCES := build.zig $(wildcard src/*.zig) $(wildcard src/*/*.zig) $(wildcard cli/*.zig) $(wildcard web/*.zig) $(wildcard bench/*.zig)
 
 # The styleguide checkout lint reads its zlint.json from. Override to lint
 # against another checkout: `make lint STYLEGUIDE=../zigmicrogpt/styleguide`.

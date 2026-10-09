@@ -193,7 +193,7 @@ pub const Repackager = struct {
     fn collect(self: *Self, path: []const u8, named: bool) !void {
         const entries = self.storage.list(self.allocator, path) catch |err| switch (err) {
             error.NotADirectory => {
-                const name = std.fs.path.basename(path);
+                const name = std.Io.Dir.path.basename(path);
                 const kind = kindOf(name) orelse if (named) InputKind.text else return;
                 if (std.mem.startsWith(u8, path, self.out_dir) and path.len > self.out_dir.len and path[self.out_dir.len] == '/') {
                     log.warn("{s} is inside the output directory", .{path});
@@ -220,14 +220,14 @@ pub const Repackager = struct {
             return error.InputInOutput;
         }
         for (entries) |entry| {
-            const name = std.fs.path.basename(std.mem.trimEnd(u8, entry, "/"));
+            const name = std.Io.Dir.path.basename(std.mem.trimEnd(u8, entry, "/"));
             if (name.len == 0 or name[0] == '.') continue;
             try self.collect(std.mem.trimEnd(u8, entry, "/"), false);
         }
     }
 
     fn kindOf(name: []const u8) ?InputKind {
-        const ext = std.fs.path.extension(name);
+        const ext = std.Io.Dir.path.extension(name);
         if (std.ascii.eqlIgnoreCase(ext, ".parquet")) return .parquet;
         if (std.ascii.eqlIgnoreCase(ext, ".jsonl") or std.ascii.eqlIgnoreCase(ext, ".ndjson")) return .jsonl;
         for ([_][]const u8{ ".txt", ".md", ".text" }) |t| if (std.ascii.eqlIgnoreCase(ext, t)) return .text;
@@ -255,7 +255,7 @@ pub const Repackager = struct {
     }
 
     fn isShard(path: []const u8) bool {
-        const name = std.fs.path.basename(path);
+        const name = std.Io.Dir.path.basename(path);
         return std.mem.startsWith(u8, name, "shard_") and std.mem.endsWith(u8, name, ".parquet");
     }
 
@@ -368,7 +368,7 @@ pub const Repackager = struct {
     fn openBuckets(self: *Self, count: usize) !void {
         for (0..count) |i| {
             var name: [32]u8 = undefined;
-            const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}/{s}", .{ self.out_dir, bucket_dir, try std.fmt.bufPrint(&name, "bucket_{d:0>5}.bin", .{i}) });
+            const path = try self.allocator.print("{s}/{s}/{s}", .{ self.out_dir, bucket_dir, try std.mem.print(&name, "bucket_{d:0>5}.bin", .{i}) });
             errdefer self.allocator.free(path);
             var session = try self.storage.create(path);
             errdefer session.deinit();
@@ -377,7 +377,7 @@ pub const Repackager = struct {
     }
 
     fn removeBuckets(self: *Self) !void {
-        const dir = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.out_dir, bucket_dir });
+        const dir = try self.allocator.print("{s}/{s}", .{ self.out_dir, bucket_dir });
         defer self.allocator.free(dir);
         try self.storage.removeTree(dir);
     }
@@ -426,7 +426,7 @@ pub const Repackager = struct {
             }
             if (self.writer == null) {
                 var name: [32]u8 = undefined;
-                const path = try std.fmt.allocPrint(o.allocator, "{s}/{s}", .{ o.out_dir, try mod.Dataset.shardName(&name, self.index) });
+                const path = try o.allocator.print("{s}/{s}", .{ o.out_dir, try mod.Dataset.shardName(&name, self.index) });
                 defer o.allocator.free(path);
                 self.writer = try mod.ParquetWriter.create(o.allocator, o.storage, path, "text", o.options.row_group);
             }
@@ -501,10 +501,10 @@ test "repackage shuffles text, JSONL and Parquet into shards with a validation s
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
     const storage = mod.Storage.init(allocator, std.testing.io);
-    const in_dir = try std.fs.path.join(allocator, &.{ root, "corpus" });
+    const in_dir = try std.Io.Dir.path.join(allocator, &.{ root, "corpus" });
     defer allocator.free(in_dir);
 
     // 60 text docs (one with a stray third newline), 40 JSONL rows (+2 bad lines), 50 Parquet rows.
@@ -513,43 +513,43 @@ test "repackage shuffles text, JSONL and Parquet into shards with a validation s
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
     for (0..60) |i| {
-        const doc = try std.fmt.allocPrint(allocator, "text document {d}\nsecond line, ünïcode", .{i});
+        const doc = try allocator.print("text document {d}\nsecond line, ünïcode", .{i});
         try expected.append(allocator, doc);
         try text.appendSlice(allocator, doc);
         try text.appendSlice(allocator, "\n\n");
     }
-    const text_path = try std.fs.path.join(allocator, &.{ in_dir, "a.txt" });
+    const text_path = try std.Io.Dir.path.join(allocator, &.{ in_dir, "a.txt" });
     defer allocator.free(text_path);
     try storage.write(text_path, text.items);
     var jsonl: std.ArrayList(u8) = .empty;
     defer jsonl.deinit(allocator);
     for (0..40) |i| {
-        const doc = try std.fmt.allocPrint(allocator, "json \"document\" {d}", .{i});
+        const doc = try allocator.print("json \"document\" {d}", .{i});
         try expected.append(allocator, doc);
         try jsonl.print(allocator, "{{\"id\": {d}, \"text\": {f}}}\n", .{ i, std.json.fmt(doc, .{}) });
     }
     try jsonl.appendSlice(allocator, "not json\n{\"id\": 1}\n\n");
-    const jsonl_path = try std.fs.path.join(allocator, &.{ in_dir, "sub", "b.jsonl" });
+    const jsonl_path = try std.Io.Dir.path.join(allocator, &.{ in_dir, "sub", "b.jsonl" });
     defer allocator.free(jsonl_path);
     try storage.write(jsonl_path, jsonl.items);
-    const parquet_path = try std.fs.path.join(allocator, &.{ in_dir, "c.parquet" });
+    const parquet_path = try std.Io.Dir.path.join(allocator, &.{ in_dir, "c.parquet" });
     defer allocator.free(parquet_path);
     {
         var w = try mod.ParquetWriter.create(allocator, storage, parquet_path, "text", 16);
         defer w.deinit();
         for (0..50) |i| {
-            const doc = try std.fmt.allocPrint(allocator, "parquet document {d}", .{i});
+            const doc = try allocator.print("parquet document {d}", .{i});
             try expected.append(allocator, doc);
             try w.append(doc);
         }
         _ = try w.finish();
     }
-    const ignored = try std.fs.path.join(allocator, &.{ in_dir, "notes.bin" });
+    const ignored = try std.Io.Dir.path.join(allocator, &.{ in_dir, "notes.bin" });
     defer allocator.free(ignored);
     try storage.write(ignored, "not a corpus file");
 
     var discard: std.Io.Writer.Discarding = .init(&.{});
-    const out_dir = try std.fs.path.join(allocator, &.{ root, "base_data_mine" });
+    const out_dir = try std.Io.Dir.path.join(allocator, &.{ root, "base_data_mine" });
     defer allocator.free(out_dir);
     // Tiny buckets (several on disk) and shards of ~600 characters in row groups of 4.
     const options: RepackageOptions = .{ .chars_per_shard = 600, .row_group = 4, .bucket_bytes = 1500 };
@@ -580,7 +580,7 @@ test "repackage shuffles text, JSONL and Parquet into shards with a validation s
     for (expected.items, sorted) |e, g| try std.testing.expectEqualStrings(e, g);
 
     // The bucket files are gone; a second run refuses, then overwrites the same way (same seed).
-    const buckets = try std.fs.path.join(allocator, &.{ out_dir, Repackager.bucket_dir });
+    const buckets = try std.Io.Dir.path.join(allocator, &.{ out_dir, Repackager.bucket_dir });
     defer allocator.free(buckets);
     try std.testing.expectError(error.NotFound, storage.list(allocator, buckets));
     try std.testing.expectError(error.DatasetExists, Repackager.run(allocator, std.testing.io, &.{in_dir}, out_dir, options, &discard.writer));
@@ -598,7 +598,7 @@ test "repackage shuffles text, JSONL and Parquet into shards with a validation s
     memory.chars_per_shard = 1 << 40;
     const one = try Repackager.run(allocator, std.testing.io, &.{in_dir}, out_dir, memory, &discard.writer);
     try std.testing.expectEqual(@as(usize, 2), one.shards);
-    var file = try mod.ParquetFile.open(allocator, std.testing.io, try std.fmt.bufPrint(&root_buf, "{s}/shard_00001.parquet", .{out_dir}));
+    var file = try mod.ParquetFile.open(allocator, std.testing.io, try std.mem.print(&root_buf, "{s}/shard_00001.parquet", .{out_dir}));
     defer file.deinit();
     var val_rows: usize = 0;
     for (file.row_groups) |rg| val_rows += @intCast(rg.num_rows);
@@ -606,7 +606,7 @@ test "repackage shuffles text, JSONL and Parquet into shards with a validation s
 
     // The output directory cannot be an input; a lone document has no split.
     try std.testing.expectError(error.InputInOutput, Repackager.run(allocator, std.testing.io, &.{out_dir}, out_dir, overwrite, &discard.writer));
-    const lone = try std.fs.path.join(allocator, &.{ root, "lone.txt" });
+    const lone = try std.Io.Dir.path.join(allocator, &.{ root, "lone.txt" });
     defer allocator.free(lone);
     try storage.write(lone, "just one document");
     try std.testing.expectError(error.TooFewDocuments, Repackager.run(allocator, std.testing.io, &.{lone}, out_dir, overwrite, &discard.writer));

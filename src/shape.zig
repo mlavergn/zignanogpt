@@ -124,6 +124,6 @@ test "shape compares and formats" {
     try std.testing.expectError(error.RankTooHigh, mod.Shape.init(&.{ 1, 1, 1, 1, 1 }));
 
     var buffer: [32]u8 = undefined;
-    const text = try std.fmt.bufPrint(&buffer, "{f}", .{a});
+    const text = try std.mem.print(&buffer, "{f}", .{a});
     try std.testing.expectEqualStrings("[2, 3]", text);
 }

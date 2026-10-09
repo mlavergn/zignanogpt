@@ -270,7 +270,7 @@ pub const Generation = struct {
     /// Draws use this port's generator, not PyTorch's.
     fn sample(self: *Self, logits: []const f32) u32 {
         const temperature = self.options.temperature;
-        if (temperature == 0) return @intCast(std.mem.indexOfMax(f32, logits));
+        if (temperature == 0) return @intCast(std.mem.findMax(f32, logits));
         var n = logits.len;
         for (self.order, 0..) |*o, i| o.* = @intCast(i);
         if (self.options.top_k) |k| {

@@ -207,9 +207,9 @@ test "parquet writer output reads back by row group, pages and long values inclu
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
-    const path = try std.fs.path.join(allocator, &.{ root, "shard_00000.parquet" });
+    const path = try std.Io.Dir.path.join(allocator, &.{ root, "shard_00000.parquet" });
     defer allocator.free(path);
     const storage = mod.Storage.init(allocator, std.testing.io);
 
@@ -221,7 +221,7 @@ test "parquet writer output reads back by row group, pages and long values inclu
     defer writer.deinit();
     var buf: [64]u8 = undefined;
     for (0..2500) |i| {
-        if (i == 1500) try writer.append(long) else try writer.append(try std.fmt.bufPrint(&buf, "document {d} — ünïcode", .{i}));
+        if (i == 1500) try writer.append(long) else try writer.append(try std.mem.print(&buf, "document {d} — ünïcode", .{i}));
     }
     try std.testing.expect(!try storage.exists(path));
     _ = try writer.finish();
@@ -240,7 +240,7 @@ test "parquet writer output reads back by row group, pages and long values inclu
             if (row == 1500) {
                 try std.testing.expectEqualSlices(u8, long, strings.get(i));
             } else {
-                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "document {d} — ünïcode", .{row}), strings.get(i));
+                try std.testing.expectEqualStrings(try std.mem.print(&buf, "document {d} — ünïcode", .{row}), strings.get(i));
             }
             row += 1;
         }
