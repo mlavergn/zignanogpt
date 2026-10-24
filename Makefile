@@ -6,9 +6,12 @@
 #
 ###############################################
 
+# Optional include to extend the makefile targets
+-include ../styleguide/Makefile.in
+
 .DEFAULT_GOAL := all
 
-.PHONY: all validate build dist run cli web test-cpu cuda train-bench demo linux windows targets test bench format lint fixtures docs tag st open github clone claude clean
+.PHONY: all build dist run cli web test-cpu cuda train-bench demo linux windows targets test bench fixtures docs tag st open github clone claude clean
 
 # ---------------------------------------------
 # Configuration
@@ -17,13 +20,9 @@
 # The released version, read from build.zig.zon (the source of truth).
 VERSION := $(shell sed -n -E 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' build.zig.zon)
 
-# The Zig sources to format and lint. Named explicitly rather than `.`: the
-# nanochat/ submodule and .zig-cache/ are not ours to rewrite or gate on.
-ZIG_SOURCES := build.zig $(wildcard src/*.zig) $(wildcard src/*/*.zig) $(wildcard cli/*.zig) $(wildcard web/*.zig) $(wildcard bench/*.zig)
-
-# The styleguide checkout lint reads its zlint.json from. Override to lint
-# against another checkout: `make lint STYLEGUIDE=../zigmicrogpt/styleguide`.
-STYLEGUIDE ?= styleguide
+# The Zig sources to format and lint, bench/ included. The nanochat/
+# submodule is not ours to rewrite or gate on.
+ZIG_DIRS := src cli web bench
 
 # The Python reference's environment, kept out of the nanochat/ submodule so
 # the submodule's working tree stays clean.
@@ -45,9 +44,8 @@ VALIDATE_EXTRA := $(if $(filter Darwin,$(shell uname -s)),cuda,)
 all: build format test
 	@echo "done"
 
-# Full pre-commit gate: clean, format, lint, build, then test.
-validate: clean format lint build test test-cpu $(VALIDATE_EXTRA)
-	@echo "validate done"
+# Extend the canonical pre-commit gate with the CPU tests (and CUDA on macOS).
+validate: test-cpu $(VALIDATE_EXTRA)
 
 # ---------------------------------------------
 # Build
@@ -127,23 +125,6 @@ train-bench:
 		--device-batch-size 32 --total-batch-size 16384 --model-tag train-bench --num-iterations 40 \
 		--eval-every 0 --sample-every 0 --save-every 1000 | grep -E "^step 000[123]"
 	rm -rf "$${ZIGNANOGPT_BASE_DIR:-$$HOME/.cache/zignanogpt}/base_checkpoints/train-bench"
-
-# ---------------------------------------------
-# Format & lint
-# ---------------------------------------------
-
-# Format the Zig sources.
-format:
-	zig fmt $(ZIG_SOURCES)
-
-# Token-level style, then the rule set in the styleguide. zlintpre exits 0
-# whatever it finds, so its summary line is what gates. zlint gets its files on
-# stdin: walking the tree on its own, it would also lint nanochat/ and caches.
-lint:
-	@test -f $(STYLEGUIDE)/zlint.json || { echo "lint: $(STYLEGUIDE)/zlint.json missing; add the styleguide or pass STYLEGUIDE=<path>"; exit 1; }
-	@output=$$(zlintpre $(ZIG_SOURCES) 2>&1); echo "$$output"; \
-	echo "$$output" | grep -q 'found 0 failures' || { echo "lint: zlintpre findings above"; exit 1; }
-	printf '%s\n' $(ZIG_SOURCES) | zlint -c $(STYLEGUIDE) --deny-warnings --stdin
 
 # ---------------------------------------------
 # Parity fixtures

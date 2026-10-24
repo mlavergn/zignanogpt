@@ -260,15 +260,18 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
 
 ## Commands
 
-- `make validate`: clean, format, lint, build, test (the gate). `make test`: tests only.
+- `make validate`: clean, format, lint, build, test, then the CPU tests and on macOS `make cuda`
+  (the gate). `make test`: tests only.
 - Single test: `zig build test -Dtest-filter="<test name substring>"`.
-- `make lint` reads `styleguide/zlint.json` (the `styleguide` submodule; `git submodule update
-  --init` after a fresh clone). zlint warnings are errors, and it
+- `make lint` runs zlintpre (its summary is checked, so findings fail), then `zlint -c
+  ../styleguide -S --deny-warnings` against `../styleguide/zlint.json` (the shared sibling
+  checkout, its own repo; never edit it from here). zlint warnings are errors, and it
   rejects `catch {}` and `catch unreachable` (flush explicitly; write `(a + b - 1) / b`, not
   `divCeil(...) catch unreachable`). It also fails on an unused `log`: a file with only hot
   functions logs on a cold path (an error branch) instead.
-- `make format` / `make lint` cover `ZIG_SOURCES` (`build.zig`, `src/`, `cli/`, `web/`, `bench/`); add new
-  source directories there, never `.` (that sweeps in `nanochat/`).
+- `make format` / `make lint` / `make validate` come from `../styleguide/Makefile.in`; format and
+  lint cover `build.zig` plus `ZIG_DIRS` (`src/`, `cli/`, `web/`, `bench/`); add new source
+  directories to `ZIG_DIRS` in the Makefile, never `.` (that sweeps in `nanochat/`).
 - `make linux`: cross-compiles x86_64 and aarch64 (CPU backend). `make cuda`: the DGX OS CUDA
   build plus compiled tests. `make docs`: autodoc on :8080.
 - `make cli`: ReleaseFast build, then the console (TUI). `make run ARGS="config"` or
@@ -298,7 +301,7 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
 
 ## Style
 
-`styleguide/ZIGSTYLE.md` (see `../zigmicrogpt/styleguide/` until the submodule exists):
+`../styleguide/ZIGSTYLE.md`:
 one primary type per file named for its role (no prefix), import siblings only through
 `module.zig`, scoped logger `.zignanogpt_<file>`, `log.debug` entry trace on non-hot
 functions, doc comments with Parameters/Return, tests at the bottom under `// Unit Tests`.

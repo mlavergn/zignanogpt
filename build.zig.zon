@@ -1,7 +1,7 @@
 .{
     .name = .zignanogpt,
     .description = "Nanochat in pure Zig",
-    .version = "1.1.0",
+    .version = "1.1.1",
     .fingerprint = 0x40a6373274f306b8,
     .minimum_zig_version = "0.17.0",
     .paths = .{
@@ -21,8 +21,8 @@
             .clone = "git@github.com:inferise/zigtui.git",
         },
         .zigbuildx = .{
-            .url = "git+https://github.com/mlavergn/zigbuildx#v3.0.0",
-            .hash = "zigbuildx-3.0.0-9koPhDyxAwBEwNJ-_Da7QxM1tQ6mXGu2ArjPreKj1vel",
+            .url = "git+https://github.com/mlavergn/zigbuildx?ref=v3.6.0#fba04ba852fc06317207bdc7119b58dc13638ac0",
+            .hash = "zigbuildx-3.6.0-9koPhO6cBAA86_jmOLvms1OJMS50hGL4g_b9EsLZbqBX",
         },
     },
 }
