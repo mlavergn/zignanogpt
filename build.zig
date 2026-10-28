@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 
 const zon = @import("build.zig.zon");
 const zigbuildx = @import("zigbuildx");
+const zigwui_build = @import("zigwui");
 
 /// The compute backend the library is built for: its choice (`-Dbackend=`, or
 /// detected from the target and the host), what it links and the kernels it
@@ -258,6 +259,15 @@ pub fn build(b: *std.Build) !void {
         .backend = backend,
         .kernels = Backend.kernels(b, backend),
     };
+    // zigwui serves the web console's Svelte page in `views/`, whose
+    // `views/dist` (`make views`) is embedded as `assets`. A fresh checkout has
+    // none: the table is empty, the build still succeeds, and the console says
+    // so at startup.
+    const zigwui_module = b.dependency("zigwui", .{
+        .target = cfg.target,
+        .optimize = cfg.optimize,
+    }).module("zigwui");
+    const assets_module = try zigwui_build.webAssetsModule(b, "views/dist", zigwui_module, cfg.target, cfg.optimize);
 
     // -------------------------------------------------------------------------
     // Module
@@ -314,6 +324,8 @@ pub fn build(b: *std.Build) !void {
         .optimize = cfg.optimize,
     });
     addAppImports(web_module, options, cfg.mod_name, module);
+    web_module.addImport("zigwui", zigwui_module);
+    web_module.addImport("assets", assets_module);
 
     const web = b.addExecutable(.{
         .name = cfg.web_name,
@@ -413,6 +425,8 @@ pub fn build(b: *std.Build) !void {
         .optimize = cfg.optimize,
     });
     addAppImports(web_tests_module, options, cfg.mod_name, module);
+    web_tests_module.addImport("zigwui", zigwui_module);
+    web_tests_module.addImport("assets", assets_module);
 
     const web_tests = b.addTest(.{
         .root_module = web_tests_module,

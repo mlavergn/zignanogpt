@@ -2,3 +2,5 @@
 zig-out
 zig-pkg
 .venv
+views/node_modules/
+views/dist/

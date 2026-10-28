@@ -11,7 +11,7 @@
 
 .DEFAULT_GOAL := all
 
-.PHONY: all build dist run cli web test-cpu cuda train-bench demo linux windows targets test bench fixtures docs tag st open github clone claude clean
+.PHONY: all build dist run cli web views test-cpu cuda train-bench demo linux windows targets test bench fixtures docs tag st open github clone claude clean
 
 # ---------------------------------------------
 # Configuration
@@ -69,11 +69,19 @@ cli:
 	zig build --release=fast
 	./zig-out/bin/zignanogpt tui
 
+# Run the web console on 127.0.0.1:8000; it opens a browser itself.
 web:
 	zig build --release=fast
 	./zig-out/bin/zignanogpt-web $(ARGS)
 
-# Build and run the web console on a random port; it opens a browser itself.
+# Build the web console's Svelte page (views/ -> views/dist, which the build
+# embeds), then rebuild. Needed once after a fresh checkout and after any change
+# under views/. There is no dev server: the console refuses Vite's proxied Host.
+views:
+	cd views && npm install --no-audit --no-fund && npx vite build
+	zig build
+
+# Build and run the web console (Debug) on 127.0.0.1:8000; it opens a browser itself.
 demo:
 	zig build serve
 
@@ -193,19 +201,6 @@ clean:
 # Package
 # ---------------------------------------------
 
-.PHONY: pkg
-
-# zigpkg's `zpkg` (../zigpkg) packages the CLI as its recipe in zigpkg's store
-# says (the name and version come from build.zig.zon), then signs, notarizes
-# and publishes it as the recipe says.
-ZPKG ?= zpkg
-
-# What the package installs (the recipe's .pkg root).
-PKG_ROOT := zig-out/pkg/root
-
-# Build the CLI into zig-out/pkg/root, then the package with zpkg.
-pkg:
-	@command -v $(ZPKG) >/dev/null || { echo "❌ $(ZPKG) not found: build ../zigpkg, or set ZPKG"; exit 1; }
-	rm -rf $(PKG_ROOT)
-	zig build cli --release=fast --prefix $(PKG_ROOT)
-	$(ZPKG) --package
+# `make pkg` (DRY_RUN=1 stops before Apple and R2) and `make pkginstall` come
+# from ../styleguide/Makefile.in: the CLI as a .pkg, built by zigpkg's zpkg
+# from this project's recipe in zigpkg's store.

@@ -41,19 +41,23 @@ every git operation. Finish a phase at a green `make validate` and report.
 | `src/metal/` | The Metal backend: `backend.zig`, `objc.zig` (Objective-C runtime), MSL `kernels.metal` and `reduce.metal` |
 | `src/cuda/` | The CUDA backend: `backend.zig` and `kernels.zig` (Zig compiled to PTX by `build.zig`) |
 | `cli/` | The `zignanogpt` executable: `main.zig` (entry), `module.zig` (barrel + test root), `command.zig` (subcommands) |
-| `web/` | `zignanogpt-web`: one embedded page (chat over SSE, training dashboard), `make web` |
+| `web/` | `zignanogpt-web`: a zigwui server (`handler.zig`: chat over SSE, runs and metrics), loopback only, `make web` |
+| `views/` | The web console's Svelte page (zigwui viewkit): Chat and Training. `make views` builds `views/dist`, which `zig build` embeds; without it the console says the UI is not built |
 | `bench/main.zig` | `zig build bench`: matmul GFLOP/s at 1 thread and all threads, always ReleaseFast |
 | `dev/fixtures.py` | Dev-only parity fixtures from the Python reference → `testdata/` (safetensors layout) |
 | `testdata/` | Committed fixtures (created as phases add fixture groups) |
 
 ## Dependencies
 
-All declared in `build.zig.zon`; `zigstorage` and `zigtui` are local checkouts at
+All declared in `build.zig.zon`; `zigstorage`, `zigtui` and `zigwui` are local checkouts at
 `../` (the build's `zigbuildx.Deps.cloneMissing` clones them if missing, then asks for a
 re-run). `zigbuildx` is build-only — imported by `build.zig` (`Deps`, `Xcode`) and never by the
 module, pinned by `.url` + `.hash`, never `.path`.
 
 - `zigstorage` → library only. All disk and HTTP I/O goes through its `Node` (`file://`, `https://`).
+- `zigwui` → `web/` only: the loopback server, the embedded `views/dist` bundle (`assets`), and
+  the viewkit the Svelte page builds on (`views/package.json`). The handler checks `Host` (and
+  `Origin` on POST) itself, against DNS rebinding.
 - `zigtui` → `cli/` only (`cli.tui`): the shared TUI components (`Theme`, `ProgressBar`, ...)
   and the whole vaxis API re-exported (`tui.vxfw`, `tui.Key`). Never import or declare zigvaxis.
   zigtui is shared across projects: add a component or role there only when it is generic.
