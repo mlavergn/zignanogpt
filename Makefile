@@ -28,8 +28,8 @@ ZIG_DIRS := src cli web bench
 # the submodule's working tree stays clean.
 PY_ENV := $(CURDIR)/.venv
 
-# uv, invoked by absolute path like the other inferise tools.
-UV ?= /usr/local/inferise/uv/bin/uv
+# uv, found on PATH like the other tools.
+UV ?= uv
 
 # On macOS the gate also cross-compiles the DGX OS (Linux ARM64) CUDA build and
 # its tests, so both supported platforms stay compiling; on the Spark itself
@@ -170,11 +170,11 @@ open:
 
 # Open the repository on GitHub.
 github:
-	open "https://github.com/inferise/zignanogpt"
+	open "https://github.com/mlavergn/zignanogpt"
 
 # Clone a fresh working copy.
 clone:
-	git clone git@github.com:inferise/zignanogpt.git
+	git clone git@github.com:mlavergn/zignanogpt.git
 
 # Start Claude Code here.
 claude:

@@ -49,12 +49,12 @@ every git operation. Finish a phase at a green `make validate` and report.
 ## Dependencies
 
 All declared in `build.zig.zon`; `zigstorage` and `zigtui` are local checkouts at
-`../../inferise/` (the build's `zigbuildx.Deps.cloneMissing` clones them if missing, then asks for a
+`../` (the build's `zigbuildx.Deps.cloneMissing` clones them if missing, then asks for a
 re-run). `zigbuildx` is build-only — imported by `build.zig` (`Deps`, `Xcode`) and never by the
 module, pinned by `.url` + `.hash`, never `.path`.
 
 - `zigstorage` → library only. All disk and HTTP I/O goes through its `Node` (`file://`, `https://`).
-- `zigtui` → `cli/` only (`cli.tui`): the shared Inferise TUI components (`Theme`, `ProgressBar`, ...)
+- `zigtui` → `cli/` only (`cli.tui`): the shared TUI components (`Theme`, `ProgressBar`, ...)
   and the whole vaxis API re-exported (`tui.vxfw`, `tui.Key`). Never import or declare zigvaxis.
   zigtui is shared across projects: add a component or role there only when it is generic.
 - `uucode` → library (tokenizer `general_category`), taken from zigtui (`tui_dep.module("uucode")`).
@@ -224,7 +224,7 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
 
 - `zignanogpt` with no arguments on a terminal (or `zignanogpt tui`) opens the console;
   piped, it prints usage. `zignanogpt train` on a terminal opens the console on the Train
-  page and starts the run there (`--no-tui` for plain logs). Layout after `../../inferise/zigprompt/cli`:
+  page and starts the run there (`--no-tui` for plain logs). Layout after `../zigprompt/cli`:
   operations left, the selected one's form + output (or live training view) right, a status
   line of live keys. Built on zigtui components (`cli.tui`): `SplitPane` (titles, rules, the
   draggable divider), `StatusLine`, `StatusMark` (job/chat state), `Form` + `LineInput` (the
@@ -277,7 +277,7 @@ Changing the package `.name` invalidates `.fingerprint`; `zig build` prints the 
 - `make cli`: ReleaseFast build, then the console (TUI). `make run ARGS="config"` or
   `./zig-out/bin/zignanogpt <command>` for a single command.
 - `make fixtures` (or `make fixtures ONLY=gpt`): runs `dev/fixtures.py` with
-  `/usr/local/inferise/uv/bin/uv` (`UV=` to override), `--frozen`, venv at `./.venv` (kept out
+  `uv` on `PATH` (`UV=` to override), `--frozen`, venv at `./.venv` (kept out
   of the submodule). Regenerate only when a fixture group changes; the files are committed.
 
 ## Parity testing
