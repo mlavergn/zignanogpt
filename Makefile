@@ -188,3 +188,24 @@ claude:
 clean:
 	rm -rf .zig-cache
 	rm -rf zig-out
+
+# ---------------------------------------------
+# Package
+# ---------------------------------------------
+
+.PHONY: pkg
+
+# zigpkg's `zpkg` (../zigpkg) packages the CLI as its recipe in zigpkg's store
+# says (the name and version come from build.zig.zon), then signs, notarizes
+# and publishes it as the recipe says.
+ZPKG ?= zpkg
+
+# What the package installs (the recipe's .pkg root).
+PKG_ROOT := zig-out/pkg/root
+
+# Build the CLI into zig-out/pkg/root, then the package with zpkg.
+pkg:
+	@command -v $(ZPKG) >/dev/null || { echo "❌ $(ZPKG) not found: build ../zigpkg, or set ZPKG"; exit 1; }
+	rm -rf $(PKG_ROOT)
+	zig build cli --release=fast --prefix $(PKG_ROOT)
+	$(ZPKG) --package
